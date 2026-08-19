@@ -1,0 +1,507 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["skyrl*"]
+
+[project]
+name = "skyrl"
+dynamic = ["version"]
+description = "Unified API for training and inference"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=4.0.0",
+    "pillow>=11.3.0",
+    "rich>=14.1.0",
+    "safetensors>=0.6.2",
+    "tokenizers>=0.21.2",
+    "transformers>=5.6.1,<=5.8.0",
+    "typer>=0.17.4",
+    "peft==0.18.1",
+    "hf_transfer",
+    "cloudpathlib>=0.23.0",
+]
+
+# SkyRL-IsoExec: vLLM calls `load_general_plugins()` in EVERY worker process (v1/worker/worker_base.py),
+# which is the only hook that reaches vLLM's TP>1 worker subprocesses. The IsoExec engine stack --
+# GPTModel registration, the num_splits=1 CUSTOM varlen backend, batch-invariant matmuls, the
+# sampler's aten log_softmax, the GDN pins -- must be installed there, not just in the engine actor.
+# No-op unless SKYRL_ISOEXEC=1.
+[project.entry-points."vllm.general_plugins"]
+skyrl_isoexec = "skyrl.backends.skyrl_train.isoexec.runtimes.vllm.vllm_plugin:register"
+
+[project.optional-dependencies]
+gpu = [
+    "jax[cuda12]>=0.7.2; sys_platform == 'linux'",
+]
+
+tpu = [
+    "jax[tpu]>=0.7.2; sys_platform == 'linux'",
+]
+
+tinker = [
+    "tinker>=0.3.0",
+    "fastapi[standard]",
+    "sqlmodel",
+    "sqlalchemy[asyncio]",
+    "aiosqlite",
+    "asyncpg",
+    "psycopg2-binary",
+]
+
+ray = [
+    "ray[default]==2.51.1",
+]
+
+aws = [
+    "cloudpathlib[s3]",
+]
+
+gcp = [
+    "cloudpathlib[gs]",
+]
+
+azure = [
+    "cloudpathlib[azure]",
+]
+
+# The extras "jax", "fsdp", and "megatron" are the dependencies the
+# engine needs for --backend="jax", --backend="fsdp", and --backend="megatron",
+# respectively.
+
+jax = [
+    "jax>=0.8,<1.0",
+    "flax>=0.12.2",
+    "optax>=0.2.5",
+]
+
+skyrl-train = [
+    "loguru",
+    "tqdm",
+    "ninja",
+    "tensorboard",
+    "func_timeout",
+    "hydra-core==1.3.2",
+    "accelerate",
+    "torchdata",
+    "omegaconf",
+    "ray==2.51.1",
+    "peft==0.18.1",
+    "debugpy==1.8.0",
+    "hf_transfer",
+    "wandb",
+    "datasets>=4.0.0",
+    "tensordict",
+    "jaxtyping",
+    "skyrl-gym",
+    "flash-attn==2.8.3; sys_platform == 'linux'",
+    "polars",
+    "s3fs",
+    "fastapi",
+    "uvicorn",
+    "vllm-router; sys_platform == 'linux'",
+    "pybind11",
+    "setuptools",
+    # The `nixl` shim provides that namespace and dispatches to `nixl_cu12`.
+    # `nixl-cu12` ships the `nixl_cu12` module, but vLLM imports `nixl._api`.
+    # Its metadata hard-depends on `nixl-cu13` too; that variant is overridden
+    # out below (it would drag in the CUDA-13 stack and break the cu12 torch pin).
+    "nixl; sys_platform == 'linux'",
+]
+
+fsdp = [
+    "skyrl[skyrl-train]",
+    "vllm==0.23.0; sys_platform == 'linux'",
+    "vllm-router; sys_platform == 'linux'",
+    # The `nixl` shim provides that namespace and dispatches to `nixl_cu12`.
+    # `nixl-cu12` ships the `nixl_cu12` module, but vLLM imports `nixl._api`.
+    # Its metadata hard-depends on `nixl-cu13` too; that variant is overridden
+    # out below (it would drag in the CUDA-13 stack and break the cu12 torch pin).
+    "nixl; sys_platform == 'linux'",
+    "flash-linear-attention; sys_platform == 'linux'",
+    "causal-conv1d; sys_platform == 'linux'",
+    "flash-attn==2.8.3; sys_platform == 'linux'",
+    "torch==2.11.0; sys_platform == 'linux'",
+    "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flashinfer-jit-cache==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flashinfer-cubin==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision; sys_platform == 'linux'",
+]
+
+megatron = [
+    "skyrl[skyrl-train]",
+    "transformer-engine[pytorch]==2.11.0; sys_platform == 'linux'",
+    "flash-attn==2.8.3; sys_platform == 'linux'",
+    "flash-linear-attention; sys_platform == 'linux'",
+    "causal-conv1d; sys_platform == 'linux'",
+    "mamba-ssm>=2.3.0; sys_platform == 'linux'",
+    "vllm==0.23.0; sys_platform == 'linux'",
+    "vllm-router; sys_platform == 'linux'",
+    # The `nixl` shim provides that namespace and dispatches to `nixl_cu12`.
+    # `nixl-cu12` ships the `nixl_cu12` module, but vLLM imports `nixl._api`.
+    # Its metadata hard-depends on `nixl-cu13` too; that variant is overridden
+    # out below (it would drag in the CUDA-13 stack and break the cu12 torch pin).
+    "nixl; sys_platform == 'linux'",
+    "torch==2.11.0; sys_platform == 'linux'",
+    "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision; sys_platform == 'linux'",
+    # megatron-bridge requires Python 3.12+; pin megatron-core to the same
+    # constraint so both packages are consistently available (or absent).
+    "megatron-bridge; sys_platform == 'linux' and python_version >= '3.12'",
+    "megatron-core; sys_platform == 'linux' and python_version >= '3.12'",
+    "flashinfer-jit-cache==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flashinfer-cubin==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-modelopt; sys_platform == 'linux'",
+]
+
+# IsoExec nightly stack: SkyRL orchestration layer + the proven nightly torch/vLLM/triton binaries
+# (resolved from local reconstructed wheels via [tool.uv.sources] below -- they are GC'd from public
+# indexes; see pinned-wheels/README.md for how to obtain or rebuild each one). NO transformer-engine /
+# flash-attn / mamba-ssm / causal-conv1d: the bitwise IsoExec path uses torch.nn.attention.varlen.
+isoexec = [
+    "loguru",
+    "tqdm",
+    "ninja",
+    "tensorboard",
+    "func_timeout",
+    "hydra-core==1.3.2",
+    "accelerate",
+    "torchdata",
+    "omegaconf",
+    "ray==2.51.1",
+    "peft==0.18.1",
+    "hf_transfer",
+    "wandb",
+    "datasets>=4.0.0",
+    "tensordict",
+    "jaxtyping",
+    "skyrl-gym",
+    "polars",
+    "s3fs",
+    "fastapi",
+    "uvicorn",
+    "vllm-router; sys_platform == 'linux'",
+    "pybind11",
+    "setuptools",
+    "torch==2.14.0.dev20260620; sys_platform == 'linux'",
+    "triton==3.7.1; sys_platform == 'linux'",
+    "vllm==1.0.0.dev20260620; sys_platform == 'linux'",
+    # FA3: provides `flash_attn_interface`, which torch's FA3 activation imports for the CUSTOM
+    # varlen num_splits=1 backend. Reconstructed local wheel (compiled, ~1.5GB; not on a usable index).
+    "flash-attn-3==3.0.0; sys_platform == 'linux'",
+    # nvidia-modelopt onnx-export deps (present in the proven venv; modelopt pulls them).
+    "onnx; sys_platform == 'linux'",
+    "onnxscript; sys_platform == 'linux'",
+    "nvdlfw-inspect; sys_platform == 'linux'",
+    "megatron-core; sys_platform == 'linux' and python_version >= '3.12'",
+    "megatron-bridge; sys_platform == 'linux' and python_version >= '3.12'",
+    "nvidia-modelopt; sys_platform == 'linux'",
+    "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+flashrl = [
+    "skyrl[skyrl-train]",
+    # NOTE: Custom vLLM wheel must be installed separately.
+    # See examples/train/flash_rl/README.md for installation instructions.
+    "flash-attn==2.8.3; sys_platform == 'linux'",
+    "torch==2.7.0; sys_platform == 'linux'",
+    "flashinfer-python; sys_platform == 'linux'",
+    "torchvision; sys_platform == 'linux'",
+]
+miniswe = [
+    "skyrl[skyrl-train]",
+    # NOTE (sumanthrh): Needs to be a commit after https://github.com/SWE-agent/mini-swe-agent/commit/4f5d445e99d13b5482478c23508bf2fbf7c0670c
+    "mini-swe-agent>=1.12.0",
+    "litellm",
+]
+harbor = [
+    "harbor[daytona,modal]; python_version >= '3.12'",
+]
+
+dev = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]>=0.24.0",
+    "pymdown-extensions>=10.7",
+    "pytest",
+    "pytest-forked",
+    "pytest-asyncio",
+    "pre-commit",
+    "litellm",
+    "torch",
+    "ty",
+    "cloudpathlib[s3]",
+    "alembic",
+    "griffe2md",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "skyrl.__version__"}
+
+[project.scripts]
+# The following is for supporting the skyrl-train dependency
+
+[tool.uv]
+# Resolve for both Linux (production) and macOS (dev)
+required-environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+# each backend should have separate dependencies that can potentially clash
+# megatron also clashes with the jax dependency from gpu and tpu extras
+conflicts = [
+    [
+        { extra = "jax" },
+        { extra = "megatron" },
+        { extra = "fsdp" },
+        { extra = "flashrl" },
+        { extra = "isoexec" },
+    ],
+    [
+        { extra = "megatron" },
+        { extra = "gpu" },
+        { extra = "tpu" },
+        { extra = "flashrl" },
+        { extra = "miniswe" },
+        { extra = "isoexec" },
+    ]
+]
+# disable build isolation for megatron related dependencies
+no-build-isolation-package = [
+    "transformer-engine-torch",
+    "transformer-engine",
+    "nv-grouped-gemm",
+]
+# override unnecessary dependencies and pin versions to override Megatron-Bridge
+# unpinned dependencies.
+override-dependencies = [
+    "nvidia-resiliency-ext; sys_platform == 'never'",
+    "transformer-engine[pytorch]==2.11.0; sys_platform == 'linux'",
+    "transformers>=5.6.1,<=5.8.0; sys_platform == 'linux'",
+    "megatron-core>=0.16.0; sys_platform == 'linux' and python_version >= '3.12'",
+    "ml_dtypes>=0.5.0; sys_platform == 'linux'",
+    "transformer-engine-cu13; sys_platform == 'never'",
+    # nvidia-cutlass-dsl pulls BOTH -libs-base and -libs-cu13, and the two wheels ship the same
+    # cutlass python tree with 97 differing files (incl. __init__.py and _cutlass_ir.so) -- under
+    # uv's parallel installer the per-file winner is arbitrary, so fresh envs randomly mix the two
+    # builds and `import cutlass` dies on whatever symbol straddled the mix (seen: CopyOp, unwrap,
+    # normalize_field_to_ir_name, TmaTrait). This import is load-bearing: torch._native routes
+    # F.rms_norm through the vendored quack cute-DSL kernel (the pinned IsoExec rms backend).
+    # cu13 is a strict superset of base (base adds only a LICENSE) and this is a CUDA-13 stack,
+    # so drop base and let cu13 own the tree.
+    "nvidia-cutlass-dsl-libs-base; sys_platform == 'never'",
+    # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu13 variant
+    # so it doesn't pull the CUDA-13 stack and bump torch off the cu12 pin.
+    "nixl-cu13; sys_platform == 'never'",
+    # Megatron-Bridge pins flashinfer-python==0.6.8.post1, which conflicts with
+    # our exact 0.6.12 pin (the version vLLM 0.23.0 requires). Override it to our version.
+    "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flashinfer-jit-cache==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flashinfer-cubin==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# IsoExec: megatron-bridge 0.5.0 hard-requires optional vision/diffusion/logging integrations
+# (open-clip-torch, timm, qwen-vl-utils, diffusers, comet-ml, mlflow, nvidia-resiliency-ext,
+# flash-linear-attention) that the proven nightly venv runs WITHOUT. open-clip-torch + timm pull
+# torchvision, which (a) has no torch-2.14 wheel and (b) makes transformers eagerly import
+# torchvision.io -- breaking the text-only DAPO path. Drop them so the isoexec env matches the
+# proven venv. (uv replaces the whole requires-dist; megatron-core/torch/etc. are also pinned
+# explicitly in the isoexec extra, so nothing real is lost.)
+[[tool.uv.dependency-metadata]]
+name = "megatron-bridge"
+version = "0.5.0"
+requires-dist = [
+    "accelerate",
+    "datasets>=2.20.0",
+    "einops",
+    "flashinfer-python",
+    "hydra-core<=1.3.2,>1.3",
+    "megatron-core",
+    "mistral-common>=1.10.0",
+    "omegaconf>=2.3.0",
+    "peft>=0.18.1",
+    "pyyaml>=6.0.2",
+    "regex>=2024.11.6",
+    "rich",
+    "six>=1.17.0",
+    "tensorboard>=2.19.0",
+    "torch>=2.6.0",
+    "tqdm>=4.67.1",
+    "transformers",
+    "typing-extensions",
+    "wandb>=0.25.0",
+]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{requirement = "torch", match-runtime = true}]
+transformer-engine = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
+transformer-engine-torch = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
+
+[tool.uv.extra-build-variables]
+flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "jax-tpu"
+url = "https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+
+[[tool.uv.index]]
+name = "flashinfer-cu128"
+url = "https://flashinfer.ai/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu129"
+url = "https://flashinfer.ai/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-cu129"
+url = "https://wheels.vllm.ai/0.23.0/cu129"
+explicit = true
+
+# IsoExec nightly stack: torch 2.14 cu130 pulls nvidia-*-cu13 transitive deps. Kept as a safety net
+# (explicit=true -> never auto-consulted; the local wheels + PyPI cover everything in practice).
+[[tool.uv.index]]
+name = "pytorch-nightly-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true
+
+[tool.uv.sources]
+skyrl-gym = { path = "./skyrl-gym", editable = true }
+# Match torch's CUDA variant (cu128).
+flashinfer-jit-cache = { index = "flashinfer-cu128", marker = "sys_platform == 'linux'" }
+# vllm 0.23.0's PyPI wheel needs CUDA 13 (libcudart.so.13); the cu129 wheel
+# links libcudart.so.12, which torch+cu128 supplies.
+vllm = [
+    # IsoExec: never published to any index under this name. Rebuilt from source at the validated
+    # commit 6f573f486 (compat.VALIDATED_VLLM_VERSION); setuptools_scm reproduces
+    # 0.22.1rc1.dev436+g6f573f486, which is what vllm.__version__ still self-reports. The
+    # 1.0.0.dev20260620+cu130 label lives only in the dist-info, exactly as the original alias did.
+    # See pinned-wheels/README.md for the build recipe.
+    { path = "pinned-wheels/vllm-1.0.0.dev20260620+cu130-cp312-cp312-linux_x86_64.whl", extra = "isoexec" },
+    { index = "vllm-cu129", marker = "sys_platform == 'linux'" },
+]
+# IsoExec: triton 3.7.1+git5d6048aa (matches torch 2.14's pin). Still published on the pytorch
+# nightly cu130 index -- see pinned-wheels/README.md to re-fetch.
+triton = [
+    { path = "pinned-wheels/triton-3.7.1+git5d6048aa-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", extra = "isoexec" },
+]
+# IsoExec: FA3 wheel (provides flash_attn_interface for the varlen backend). Never published to
+# any index -- rebuilt from Dao-AILab/flash-attention hopper/ (__version__ 3.0.0) against this
+# torch, sm90a only. See pinned-wheels/README.md for the build recipe.
+flash-attn-3 = [
+    { path = "pinned-wheels/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl", extra = "isoexec" },
+]
+# torch-2.11 wheels for these three aren't published upstream; built locally
+# on erictang000 forks (cu128 / cxx11abiTRUE / py3.12). flash-attn has its
+# +cu12torch2.11cxx11abiTRUE local-version stripped from METADATA — PEP 440
+# treats 2.8.3+local > 2.8.3, so TE's get_attention_backend (max_version=
+# "2.8.3") rejected it and silently fell back to broken unfused attention.
+flash-attn = { url = "https://github.com/erictang000/flash-attention/releases/download/v2.8.3-torch2.11-clean/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
+causal-conv1d = { url = "https://github.com/erictang000/causal-conv1d/releases/download/v1.6.1.post4-torch2.11/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
+mamba-ssm = { url = "https://github.com/erictang000/mamba/releases/download/v2.3.1-torch2.11/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
+# CUDA torch on Linux, CPU torch on macOS (must match skyrl-train).
+# Pinned to cu128: flashrl extra needs torch 2.7, only on cu128.
+torch = [
+    # IsoExec: torch 2.14.0.dev20260620+cu130, isoexec extra only. Kept as a local wheel because a
+    # second *index* for torch collides with the cu128 entry below on the py3.14 split. NOT lost
+    # if this node is replaced: the pytorch nightly cu130 index still carries this exact build --
+    # re-fetch as described in pinned-wheels/README.md.
+    { path = "pinned-wheels/torch-2.14.0.dev20260620+cu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = "isoexec" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+]
+harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
+megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "91a15142a4b4442a8d46ab539d1b923bd08570d0", marker = "sys_platform == 'linux'"}
+# megatron-core main branch: https://github.com/NVIDIA/Megatron-LM/tree/main latest as of 6/8/26
+megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "71e418ea7d7b3a6c9a53238c543c3e0b43e11026", marker = "sys_platform == 'linux'"}
+# NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
+# TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
+vllm-router = [
+    { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }
+]
+
+
+[tool.black]
+line-length = 120
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.flake8]
+max-line-length = 120
+max-doc-length = 120
+extend-ignore = [
+    # Default ignored errors by flake8
+    "E121", "E123", "E126", "E226", "E24", "E704",
+    # F401 module imported but unused
+    "F401",
+    # E203 whitespace before ':' (conflict with black)
+    "E203",
+    # E231 missing whitespace after ',' (conflict with black)
+    "E231",
+    # E501 line too long (conflict with black)
+    "E501",
+    # E741 do not use variables named 'l', 'O', or 'I'
+    "E741",
+    # W503 line break before binary operator (conflict with black)
+    "W503",
+    # W504 line break after binary operator (conflict with black)
+    "W504",
+    # W505 doc line too long (conflict with black)
+    "W505",
+    # W605 invalid escape sequence 'x' (conflict with latex within docs)
+    "W605",
+]
+
+[tool.ruff]
+exclude = [
+    "skyrl-agent/",
+    "examples/",
+]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+ignore = [
+    "F722" # Syntax error in annotation - ignored because this doesn't play well with jaxtyping
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["skyrl", "skyrl_gym"]

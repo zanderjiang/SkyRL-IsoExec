@@ -1,0 +1,58 @@
+---
+title: "Switching Training Backends"
+---
+
+<Callout type="info">
+This page covers the `fsdp` and `megatron` backends.
+</Callout>
+
+In SkyRL, you can switch between different training backends with minimal changes to your training script.
+
+Currently, we support the following training backends:
+
+- FSDP (PyTorch's composable `fully_shard` / FSDP2 API)
+- Megatron
+
+To switch to a different backend, simply set the `trainer.strategy` parameter to the desired backend. We use the `fsdp` backend by default.
+
+## Prerequisites
+
+First, make sure you are familiar with the standard setup process for running GRPO training. See [Quick Start Guide](../getting-started/quickstart) for more details.
+
+## Running the Examples
+
+We provide baseline examples for GRPO training on GSM8K for each of these backends starting from the basic quickstart example. The quickstart script is available at `examples/train/gsm8k/run_gsm8k.sh`.
+
+```bash
+uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
+    trainer.algorithm.advantage_estimator="grpo" \
+    data.train_data="['$HOME/data/gsm8k/train.parquet']" \
+    data.val_data="['$HOME/data/gsm8k/validation.parquet']" \
+    trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
+    ... # Other parameters (see `examples/train/gsm8k/run_gsm8k.sh` for more)
+
+```
+
+### FSDP
+
+To use FSDP, set the `trainer.strategy` parameter to `fsdp` (this is the default).
+
+```bash
+# bash examples/train/training_backends/fsdp/run_fsdp.sh (or just)
+bash examples/train/gsm8k/run_gsm8k.sh trainer.strategy=fsdp
+
+```
+
+Additionally, you can tune [FSDP specific configurations](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) as shown below:
+
+```bash
+# enable offloading of model parameters to CPU during the forward pass for the ref model
+trainer.ref.fsdp_config.cpu_offload=true \
+
+```
+
+Note that `cpu_offload` is distinct from worker state offloading with model colocation. You can find details on this, as well as the full set of FSDP configurations at [fsdp-configurations](#fsdp-configurations).
+
+### Megatron
+
+Switching to the megatron backend is more involved, requiring additional dependencies and configuration. For more details, see the docs on Megatron [megatron-installation](#megatron-installation).
