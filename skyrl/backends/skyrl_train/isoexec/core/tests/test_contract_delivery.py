@@ -2,7 +2,6 @@ import os
 import tempfile
 
 from skyrl.backends.skyrl_train.isoexec.contract import to_canonical_json
-from skyrl.backends.skyrl_train.isoexec.core.composition import CompositionError
 from skyrl.backends.skyrl_train.isoexec.core.contract_build import (
     build_execution_contract,
 )
@@ -16,12 +15,13 @@ from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import (
 )
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
+from skyrl.backends.skyrl_train.isoexec.models.policy import build_selections
 
 
 def _build():
     reg = build_registry(strict=True)
-    m = qwen3_5.build(reg, arch="sm90").freeze()
-    return reg, m, build_execution_contract(reg, m, profile=qwen3_5.PROFILE)
+    sel = build_selections(qwen3_5.PROFILE, qwen3_5.EXCEPTIONS)
+    return reg, sel, build_execution_contract(reg, sel, arch="sm90", model=qwen3_5.MODEL)
 
 
 def _no_env():
@@ -56,7 +56,7 @@ def test_hash_env_cross_check():
                 pass
         finally:
             _no_env()
-        load_contract(path)  # absent env: self-consistency only, like load_manifest
+        load_contract(path)  # absent env: self-consistency only
 
 
 def test_tampered_file_refuses():
@@ -76,30 +76,24 @@ def test_tampered_file_refuses():
             pass  # decodes cleanly; the identity recompute is what catches it
 
 
-def test_installed_validation_parity():
-    reg, m, c = _build()
-    exact = set(m.keys())
+def test_installed_validation():
+    reg, sel, c = _build()
+    exact = set(sel.keys())
     dropped = exact - {sorted(exact)[0]}
     foreign = exact | {("moe.router", "bogus_site")}
 
-    def verdicts(keys):
-        try:
-            m.validate_against_installed(keys)
-            mv = True
-        except CompositionError:
-            mv = False
+    def verdict(keys):
         try:
             validate_contract_against_installed(c, reg, keys)
-            cv = True
+            return True
         except ContractDeliveryError:
-            cv = False
-        return mv, cv
+            return False
 
-    assert verdicts(exact) == (True, True)
-    assert verdicts(dropped) == (False, False)
-    assert verdicts(foreign) == (False, False)
+    assert verdict(exact) is True
+    assert verdict(dropped) is False
+    assert verdict(foreign) is False
 
 
-def test_expected_keys_match_manifest_keys():
-    reg, m, c = _build()
-    assert expected_installed_keys(c, reg) == frozenset(m.keys())
+def test_expected_keys_match_selection_keys():
+    reg, sel, c = _build()
+    assert expected_installed_keys(c, reg) == frozenset(sel.keys())

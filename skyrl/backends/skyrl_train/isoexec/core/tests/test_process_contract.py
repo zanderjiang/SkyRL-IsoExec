@@ -4,53 +4,48 @@ import tempfile
 from types import SimpleNamespace
 
 from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
-from skyrl.backends.skyrl_train.isoexec.core import process_manifest as pm
 from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import load_contract
-from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
-from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
 
 # torch-first, as in production: engine workers load torch long before any isoexec module.
 from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
 
 STRICT_ENV = "SKYRL_ISOEXEC_MANIFEST_STRICT"
 
+# Resolves to models/qwen3_5.py by name pattern; no config.json needed.
+MODEL_PATH = "qwen3.5-35b-a3b"
+
 
 def _clear():
-    pm._MANIFEST, pm._HASH = None, None
-    pc._CONTRACT = None
+    pc._CONTRACT, pc._VIEW = None, None
     for var in (STRICT_ENV, "ISOEXEC_CONTRACT_PATH", "ISOEXEC_CONTRACT_HASH"):
         os.environ.pop(var, None)
 
 
 def _seed():
     _clear()
-    reg = build_registry(strict=True)
-    m = qwen3_5.build(reg, arch="sm90").freeze()
-    pm._MANIFEST, pm._HASH = m, m.hash()
-    return reg, m
+    return pc.get_process_contract(MODEL_PATH, arch="sm90")
 
 
 def test_caching_idempotent():
-    _seed()
-    c1 = pc.get_process_contract()
+    c1 = _seed()
     c2 = pc.get_process_contract()
     assert c1 is not None and c1 is c2 and pc.cached_contract() is c1
+    assert pc.cached_contract_view(), "the (op, site) view is built alongside the contract"
 
 
 def test_hash_is_composite_of_numerical_policy():
-    _seed()
-    saved = dict(pm._EXTENSIONS)
-    pm._EXTENSIONS.clear()
+    c = _seed()
+    saved = dict(pc._EXTENSIONS)
+    pc._EXTENSIONS.clear()
     try:
-        c = pc.get_process_contract()
         h = pc.contract_hash()
         assert h == c.identities.numerical_policy  # no extensions: the identity, byte-for-byte
-        pm.register_manifest_extension("dummy", lambda: "digest-1")
+        pc.register_contract_extension("dummy", lambda: "digest-1")
         h2 = pc.contract_hash()
-        assert h2 != h  # an extension folds into the contract handshake exactly as the manifest's
+        assert h2 != h  # an extension folds into the handshake hash
     finally:
-        pm._EXTENSIONS.clear()
-        pm._EXTENSIONS.update(saved)
+        pc._EXTENSIONS.clear()
+        pc._EXTENSIONS.update(saved)
 
 
 def test_agreement_match_mismatch_and_warn_only():
@@ -77,10 +72,10 @@ def test_agreement_skips_when_not_built():
 def test_contract_path_write_and_round_trip():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "contract.json")
-        _seed()
+        _clear()
         os.environ["ISOEXEC_CONTRACT_PATH"] = path
         try:
-            c = pc.get_process_contract()
+            c = pc.get_process_contract(MODEL_PATH, arch="sm90")
             assert os.path.exists(path)
             loaded = load_contract(path)
             assert loaded.identities == c.identities

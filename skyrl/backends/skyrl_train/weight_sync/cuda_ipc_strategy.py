@@ -50,11 +50,10 @@ class CudaIpcInitInfo(WeightSyncInitInfo):
 
     model_dtype_str: str
 
-    # IsoExec composition handshake: the trainer stamps its per-process manifest and contract
-    # hashes here so the engine can assert the two runtimes resolved the SAME composition on
-    # receipt. Must be trailing, real dataclass fields so deepcopy()/pickle carry them across
-    # the collective_rpc fan-out. Default to None (fail-soft when not built).
-    manifest_hash: Optional[str] = None
+    # IsoExec composition handshake: the trainer stamps its per-process contract hash here so
+    # the engine can assert the two runtimes resolved the SAME composition on receipt. Must be a
+    # trailing, real dataclass field so deepcopy()/pickle carry it across the collective_rpc
+    # fan-out. Default to None (fail-soft when not built).
     contract_hash: Optional[str] = None
 
     @staticmethod

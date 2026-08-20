@@ -42,12 +42,11 @@ class BroadcastInitInfo(WeightSyncInitInfo):
     backend: str
     model_dtype_str: str
 
-    # IsoExec composition handshake: the trainer stamps its per-process manifest and contract
-    # hashes here so the engine can assert the two runtimes resolved the SAME composition on
-    # receipt. Must be trailing, real dataclass fields: for_engine()/for_servers() use
-    # dataclasses.replace(), which would SILENTLY DROP a non-field instance attribute. Default
-    # to None (fail-soft when the manifest/contract was not built).
-    manifest_hash: Optional[str] = None
+    # IsoExec composition handshake: the trainer stamps its per-process contract hash here so
+    # the engine can assert the two runtimes resolved the SAME composition on receipt. Must be a
+    # trailing, real dataclass field: for_engine()/for_servers() use dataclasses.replace(), which
+    # would SILENTLY DROP a non-field instance attribute. Default to None (fail-soft when the
+    # contract was not built).
     contract_hash: Optional[str] = None
 
     @staticmethod

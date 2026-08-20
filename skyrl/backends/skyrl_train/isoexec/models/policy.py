@@ -1,4 +1,4 @@
-"""The derivation: ``ModelProfile`` -> ``{(op, site) -> ManifestEntry}``. Model-independent.
+"""The derivation: ``ModelProfile`` -> ``{(op, site) -> Selection}``. Model-independent.
 
 The site policy, stated once: the trainer runs the grad-capable reference at both of its sites, and
 the engine runs the fused twin wherever one exists and declares
@@ -10,10 +10,48 @@ re-derives that rule from the registry so the two cannot drift.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
-from ..core.composition import DEPLOYMENT, FUNCTION, Key, ManifestEntry
+from ..core.contract_build import DEPLOYMENT, FUNCTION, ContractBuildError
 from .profile import SCORE_SOFTMAX, ModelProfile, ProfileError, RouterProfile
+
+Key = Tuple[str, str]  # (op, site)
+
+
+@dataclass(frozen=True)
+class Selection:
+    """One resolved (op, site) selection; identity is impl@version x arch.
+
+    ``pinned_constants`` (autotune index, boundary dtypes, block sizes, leaf counts) move bits, so
+    they are hashed into the contract's function half. ``neutrality_proof`` is mandatory for a
+    DEPLOYMENT selection: it points at the gate run that proved this selection bitwise-neutral.
+    """
+
+    impl_id: str
+    version: int = 1
+    pinned_constants: Dict[str, object] = field(default_factory=dict)
+    classification: str = FUNCTION
+    neutrality_proof: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.classification not in (FUNCTION, DEPLOYMENT):
+            raise ContractBuildError(
+                f"unknown classification {self.classification!r}; must be one of "
+                f"['{DEPLOYMENT}', '{FUNCTION}']"
+            )
+        if self.classification == DEPLOYMENT and not self.neutrality_proof:
+            raise ContractBuildError(
+                "deployment classification requires a recorded neutrality_proof (a run id / gate "
+                "result pointer). A neutrality proof licenses exactly the entry it was measured "
+                "on; refusing to classify without one."
+            )
+        if self.classification == FUNCTION and self.neutrality_proof:
+            # A function-half selection is hashed regardless, so carrying a proof is a classification bug.
+            raise ContractBuildError(
+                "a function-half entry must not carry a neutrality_proof; either it is proven "
+                "neutral (classify it deployment) or it is not (leave it function)."
+            )
 
 # Site vocabulary.
 TRAINER = ("trainer_fwd", "trainer_score")
@@ -29,9 +67,9 @@ NCCL_ENGINE_UNPIN_PROOF = "engine-unpin measured bitwise-neutral (perf-attributi
 DROP = object()
 
 
-def entry(impl: str, version: int = 1, pinned: Optional[dict] = None, cls: str = FUNCTION, proof=None) -> ManifestEntry:
-    """Build one ``ManifestEntry``. Public: model files spell their exceptions with it."""
-    return ManifestEntry(
+def entry(impl: str, version: int = 1, pinned: Optional[dict] = None, cls: str = FUNCTION, proof=None) -> Selection:
+    """Build one ``Selection``. Public: model files spell their exceptions with it."""
+    return Selection(
         impl_id=impl, version=version, pinned_constants=pinned or {}, classification=cls, neutrality_proof=proof
     )
 
@@ -46,7 +84,7 @@ def router_is_fusable(router: RouterProfile) -> bool:
     """Is the engine's fused ``moe.router`` (``fused_o2``) eligible for this router shape?
 
     The kernel carries the same guard internally and declines when it fails; consulting it here keeps
-    the manifest from naming an impl that will decline at install time. There is no fused sigmoid twin
+    the contract from naming an impl that will decline at install time. There is no fused sigmoid twin
     at the same bits, and there cannot be one.
     """
     return router.score_function == SCORE_SOFTMAX and not router.expert_bias
@@ -56,19 +94,19 @@ def mm_impl_for_process() -> str:
     """Which global GEMM provider this process will install.
 
     Flag-conditional on purpose: if only one process enables ``SKYRL_ISOEXEC_MM_CUBLASLT`` the two
-    manifest hashes diverge and the weight-sync handshake refuses to run, rather than silently
+    contract hashes diverge and the weight-sync handshake refuses to run, rather than silently
     mixing GEMM providers across the two forwards.
     """
     return "cublaslt_pinned" if os.environ.get("SKYRL_ISOEXEC_MM_CUBLASLT", "0") == "1" else "triton_batch_invariant"
 
 
-def derive_selections(profile: ModelProfile) -> Dict[Key, ManifestEntry]:
-    """``ModelProfile`` -> the complete ``{(op, site): ManifestEntry}`` selection set.
+def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
+    """``ModelProfile`` -> the complete ``{(op, site): Selection}`` selection set.
 
     Every ``(op, site)`` this architecture installs gets an explicit entry, and an op the architecture
     does not run gets no key at all -- absence means "no such site", never "default".
     """
-    s: Dict[Key, ManifestEntry] = {}
+    s: Dict[Key, Selection] = {}
 
     def put(op: str, sites: Tuple[str, ...], **kw) -> None:
         for site in sites:
@@ -184,7 +222,7 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, ManifestEntry]:
         put("collectives.tree_all_reduce", ALL_SITES, impl="pik_tree", pinned=_pik(profile))
         put("collectives.row_parallel", ALL_SITES, impl="pik_tree")
         # Trainer pinning is an explicit FUNCTION composition choice. Read the same flag as the
-        # runtime installer so an unpinned arm is represented in the manifest rather than tolerated
+        # runtime installer so an unpinned arm is represented in the contract rather than tolerated
         # as a fingerprint mismatch; the default stays pinned. The engine entry is DEPLOYMENT-neutral.
         from ..ops.collectives.nccl_identity import (
             PINNED,
@@ -242,12 +280,12 @@ def _pik(profile: ModelProfile) -> dict:
     return {"leaves": profile.pik_leaves, "leaf_dtype": profile.pik_leaf_dtype}
 
 
-def apply_exceptions(selections: Dict[Key, ManifestEntry], exceptions: Optional[dict]) -> Dict[Key, ManifestEntry]:
+def apply_exceptions(selections: Dict[Key, Selection], exceptions: Optional[dict]) -> Dict[Key, Selection]:
     """Apply a model file's exception list on top of the derived selections.
 
     An exception key is ``(op, site)`` or ``(op, "*")`` (all sites the derivation produced for that
-    op); the value is a ``ManifestEntry``, or ``DROP`` to delete the key. Every exception changes the
-    manifest hash, and therefore the gate signature key.
+    op); the value is a ``Selection``, or ``DROP`` to delete the key. Every exception changes the
+    contract's numerical_policy identity, and therefore the gate signature key.
     """
     if not exceptions:
         return selections
@@ -261,7 +299,7 @@ def apply_exceptions(selections: Dict[Key, ManifestEntry], exceptions: Optional[
             raise ValueError(
                 f"exception names ({op!r}, {site!r}) but the derivation produced no such key. An "
                 f"exception may only override or drop something policy actually derived -- if the "
-                f"model needs a key policy does not derive, the PROFILE is wrong, not the manifest."
+                f"model needs a key policy does not derive, the PROFILE is wrong, not the contract."
             )
         for t in targets:
             if val is DROP:
@@ -271,7 +309,7 @@ def apply_exceptions(selections: Dict[Key, ManifestEntry], exceptions: Optional[
     return out
 
 
-def build_selections(profile: ModelProfile, exceptions: Optional[dict] = None) -> Dict[Key, ManifestEntry]:
+def build_selections(profile: ModelProfile, exceptions: Optional[dict] = None) -> Dict[Key, Selection]:
     """The one call a ``models/*.py`` file makes: derive from the profile, then apply its exceptions."""
     return apply_exceptions(derive_selections(profile), exceptions)
 

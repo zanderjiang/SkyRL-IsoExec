@@ -679,12 +679,12 @@ class GPTModelVLLMWrapper(nn.Module):
         else:
             _logprob_patched = False
         # The install sequence is finished: record what each family actually bound and compare it
-        # against this process's manifest once. Always build the worker's manifest (idempotent,
-        # cached) -- the contract handshake at create_receiver derives from it, and a worker without
-        # one silently skips the check.
-        from ...core.process_manifest import get_process_manifest
+        # against this process's contract once. Always build the worker's contract (idempotent,
+        # cached) -- the handshake at create_receiver reads it, and a worker without one silently
+        # skips the check.
+        from ...core.process_contract import get_process_contract
 
-        get_process_manifest(model_path)
+        get_process_contract(model_path)
         if (
             os.environ.get("SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN", "0") == "1"
             and self._tp_size > 1
@@ -826,18 +826,18 @@ def _engine_nccl_runtime_identity():
 
 
 def _assert_engine_nccl_manifest(model_path: str) -> None:
-    """Build and validate the active engine process's cap-aware manifest.
+    """Build and validate the active engine process's cap-aware contract.
 
-    vLLM Ray workers are distinct processes, so a manifest cached by the engine actor or EngineCore
+    vLLM Ray workers are distinct processes, so a contract cached by the engine actor or EngineCore
     is not visible here -- build it idempotently from the model path rather than relying on
-    ``cached_manifest()``, which fails in every nested worker.
+    ``cached_contract_view()``, which fails in every nested worker.
     """
-    from ...core.process_manifest import get_process_manifest
-    from ...ops.collectives.nccl_identity import assert_manifest_matches
+    from ...core.process_contract import cached_contract_view, get_process_contract
+    from ...ops.collectives.nccl_identity import assert_contract_matches
 
     impl_id, constants = _engine_nccl_runtime_identity()
-    manifest = get_process_manifest(model_path)
-    assert_manifest_matches(manifest, ("engine_prefill", "engine_decode"), impl_id, constants)
+    get_process_contract(model_path)
+    assert_contract_matches(cached_contract_view(), ("engine_prefill", "engine_decode"), impl_id, constants)
 
 
 def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -> None:
@@ -857,7 +857,7 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
             log_fingerprint_once,
             record_installs,
         )
-        from ...core.process_manifest import cached_manifest
+        from ...core.process_contract import cached_contract_view
         from ...ops.mm.mm_cublaslt import mm_cublaslt_enabled
 
         record_installs("mm", ENGINE_SITES, "cublaslt_pinned" if mm_cublaslt_enabled() else "triton_batch_invariant")
@@ -930,7 +930,7 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
 
         # gdn.* records itself where it binds: its state core is built at the first
         # metadata-bearing forward, after this point, and that is when the pool becomes a fact.
-        log_fingerprint_once(cached_manifest(), tag="engine_install")
+        log_fingerprint_once(cached_contract_view(), tag="engine_install")
     except Exception as e:  # pragma: no cover - never fatal
         logger.warning(f"[ISOEXEC-FINGERPRINT] engine install fingerprint skipped: {e}")
 

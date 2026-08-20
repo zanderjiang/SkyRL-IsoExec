@@ -1,9 +1,12 @@
-"""Project a frozen Manifest into an ExecutionContract.
+"""Build the ExecutionContract directly from a registry and per-(op, site) selections.
 
-Pure projection, no selection: sites whose resolved entry is identical merge into one entry, a
-region is the op plus the impls it subsumes, and float pins encode as fp64 bit patterns. A
-DEPLOYMENT entry is discharged by its neutrality proof; a FUNCTION op that resolves to different
-impls across sites needs a declared ``bitwise_equal_to`` or ``equivalence_proof`` or it refuses.
+The one composition object: ``models/policy.build_selections`` emits the selections, this validates
+them against the registry (unknown op / undeclared site / unregistered impl / contradicted pins all
+refuse), then projects them into contract entries -- sites whose resolved selection is identical
+merge into one entry, a region is the op plus the impls it subsumes, and float pins encode as fp64
+bit patterns. A DEPLOYMENT selection is discharged by its neutrality proof; a FUNCTION op that
+resolves to different impls across sites needs a declared ``bitwise_equal_to`` or
+``equivalence_proof`` or it refuses.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import struct
+from collections.abc import Mapping
 from typing import Dict, Optional
 
 from ..contract import (
@@ -26,8 +30,13 @@ from ..contract import (
     compute_identities,
     validate_or_raise,
 )
-from .composition import DEPLOYMENT, Manifest
+from .arch import ARCH, is_accelerator_arch
 from .registry import Registry
+
+# Per-selection classification vocabulary: FUNCTION halves are hashed, DEPLOYMENT halves are
+# proven bitwise-neutral and logged but not hashed.
+FUNCTION = "function"
+DEPLOYMENT = "deployment"
 
 CASES = (
     ExecutionCase(
@@ -46,6 +55,107 @@ CASES = (
 
 class ContractBuildError(ValueError):
     pass
+
+
+class PinValidationError(ContractBuildError):
+    """Raised when a selection's pinned constants disagree with the selected impl's declared
+    ``machine_assertable`` rounding schedule (``validate_pins``)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Sel:
+    """Normalized selection value; identity is impl@version x arch."""
+
+    impl_id: str
+    version: int
+    pinned_constants: dict
+    classification: str
+    neutrality_proof: Optional[str]
+
+
+def _norm_selection(op: str, site: str, val) -> _Sel:
+    # Accepts the derivation's Selection record (duck-typed) or a plain mapping.
+    if isinstance(val, Mapping):
+        sel = _Sel(
+            impl_id=val["impl_id"],
+            version=val.get("version", 1),
+            pinned_constants=dict(val.get("pinned_constants") or {}),
+            classification=val.get("classification", FUNCTION),
+            neutrality_proof=val.get("neutrality_proof"),
+        )
+    else:
+        sel = _Sel(
+            impl_id=val.impl_id,
+            version=val.version,
+            pinned_constants=dict(val.pinned_constants or {}),
+            classification=val.classification,
+            neutrality_proof=val.neutrality_proof,
+        )
+    # Same refusals as the record's construction time, re-checked for mapping inputs.
+    if sel.classification not in (FUNCTION, DEPLOYMENT):
+        raise ContractBuildError(
+            f"({op}, {site}): unknown classification {sel.classification!r}; "
+            f"must be one of ['{DEPLOYMENT}', '{FUNCTION}']"
+        )
+    if sel.classification == DEPLOYMENT and not sel.neutrality_proof:
+        raise ContractBuildError(
+            f"({op}, {site}): deployment classification requires a recorded neutrality_proof (a run "
+            "id / gate result pointer). A neutrality proof licenses exactly the entry it was "
+            "measured on; refusing to classify without one."
+        )
+    if sel.classification == FUNCTION and sel.neutrality_proof:
+        raise ContractBuildError(
+            f"({op}, {site}): a function-half entry must not carry a neutrality_proof; either it "
+            "is proven neutral (classify it deployment) or it is not (leave it function)."
+        )
+    return sel
+
+
+def validate_pins(registry: Registry, selections: Dict, model: Optional[str] = None) -> None:
+    """Refuse any pinned constant the selected impl does not declare, or contradicts.
+
+    Every other check compares the composition against itself or against the other runtime, so none
+    of them can see a composition that is internally consistent, delivered intact, identical on both
+    sides -- and names the wrong function. An unchecked pin is exactly that: it hashes, it matches
+    across runtimes, and it constrains nothing, so the gate goes green on the wrong model. The
+    impl's schedule is the authority, since it is a claim about the code while the profile is a
+    claim about the model. A failure means the profile or the declaration is wrong, never that the
+    pin should be dropped or the schedule loosened.
+
+    Raises ``PinValidationError`` naming every offending pin at once.
+    """
+    problems = []
+    who = f"model {model!r}" if model else "selections"
+    for (op, site), val in sorted(selections.items()):
+        e = _norm_selection(op, site, val)
+        if not registry.has_op(op):
+            if e.pinned_constants:
+                problems.append(f"({op}, {site}): op is not registered, so its pins cannot be checked")
+            continue
+        impl = registry.get_op(op).impls.get(e.impl_id)
+        if impl is None:
+            if e.pinned_constants:
+                problems.append(f"({op}, {site}): impl {e.impl_id!r} is not registered on the op")
+            continue
+        for key in sorted(e.pinned_constants, key=str):
+            value = e.pinned_constants[key]
+            reason = impl.rounding.check_pin(key, value)
+            if reason:
+                problems.append(f"({op}, {site}) impl {e.impl_id}@v{impl.version}: pin {key}={value!r} -- {reason}")
+    if problems:
+        raise PinValidationError(
+            f"{who}: pinned constants disagree with the selected impls' declared rounding "
+            f"schedules:\n  " + "\n  ".join(problems) + "\n\n"
+            "A pinned constant is a claim about the FUNCTION the composition names. An unchecked "
+            "claim hashes identically on both runtimes, so the IsoExec gate stays GREEN while "
+            "the composition names the wrong function -- the failure mode this check exists "
+            "for. Fix the profile (it describes a model this impl does not implement) or fix "
+            "the impl's machine_assertable schedule (it is stale); do not delete the pin and "
+            "do not weaken the schedule to make this pass."
+        )
+
+
+_validate_pins = validate_pins  # keep callable under the same-named keyword below
 
 
 def _encode_pin(op: str, key: str, value):
@@ -84,20 +194,65 @@ def _group_discharge(registry: Registry, op: str, entries: dict) -> Optional[Equ
     )
 
 
-def build_execution_contract(registry: Registry, manifest: Manifest, profile=None) -> ExecutionContract:
-    """Derive the contract from a frozen manifest. Pure projection: no selection, no behavior."""
-    if not manifest.frozen:
-        raise ContractBuildError("refusing to project an unfrozen manifest")
+def build_execution_contract(
+    registry: Registry,
+    selections: Dict,
+    arch: str = ARCH,
+    model: Optional[str] = None,
+    profile=None,
+    validate_pins: bool = True,
+    allow_non_accelerator_arch: bool = False,
+) -> ExecutionContract:
+    """Derive the contract from ``{(op, site) -> selection}``. The single build path.
 
-    by_op: Dict[str, Dict[str, object]] = {}
-    for (op, site), e in manifest.entries().items():
+    Every selection key must name a site the registry's op declares. ``validate_pins=True`` is the
+    derivation-time gate on pins and the only supported production setting -- turning it off
+    re-opens the hole where a composition hashes and cross-matches while naming the wrong function.
+    Completeness against what was actually installed is a separate, adapter-time check
+    (``contract_delivery.validate_contract_against_installed``).
+    """
+    if not allow_non_accelerator_arch and not is_accelerator_arch(arch):
+        raise ContractBuildError(
+            f"refusing to build a contract whose arch is {arch!r}: that is the non-accelerator "
+            f"sentinel (core/arch.NON_ACCELERATOR_ARCH), not a real accelerator key. Folding it "
+            f"into the contract identity silently mis-keys every gate signature away from the "
+            f"real accelerator table (e.g. sm90), and the file/env hash cross-check would still "
+            f"PASS -- the exact split-brain this contract exists to prevent. This usually means "
+            f"the contract was built in a process with no visible CUDA device (a launcher/driver); "
+            f"build it where the accelerator is visible, or pass an explicit arch. CPU-only tests "
+            f"that intentionally build a sentinel contract must pass allow_non_accelerator_arch=True."
+        )
+
+    normalized: Dict = {}
+    for key, val in selections.items():
+        op, site = key
+        if not registry.has_op(op):
+            raise ContractBuildError(f"selection names unknown op {op!r} (not in registry)")
+        op_spec = registry.get_op(op)
+        if site not in op_spec.sites:
+            raise ContractBuildError(
+                f"selection names site {site!r} for op {op!r}, but that op declares only "
+                f"{sorted(op_spec.sites)} (absence means 'no such site')"
+            )
+        sel = _norm_selection(op, site, val)
+        if sel.impl_id not in op_spec.impls:
+            raise ContractBuildError(
+                f"selection for ({op!r}, {site!r}) names impl {sel.impl_id!r} not registered "
+                f"on the op (known: {sorted(op_spec.impls)})"
+            )
+        normalized[(op, site)] = sel
+    if validate_pins:
+        _validate_pins(registry, normalized, model=model)
+
+    by_op: Dict[str, Dict[str, _Sel]] = {}
+    for (op, site), e in normalized.items():
         by_op.setdefault(op, {})[site] = e
 
     composition = []
     for op in sorted(by_op):
         sites = by_op[op]
         group_proof = _group_discharge(registry, op, sites)
-        # Merge sites whose resolved entry is identical into one CompositionEntry.
+        # Merge sites whose resolved selection is identical into one CompositionEntry.
         buckets: Dict[str, list] = {}
         for site, e in sites.items():
             k = json.dumps(
@@ -117,7 +272,7 @@ def build_execution_contract(registry: Registry, manifest: Manifest, profile=Non
                 CompositionEntry(
                     region=region,
                     cases=merged_sites,
-                    impl=ImplRef(e.impl_id, e.version, manifest.arch),
+                    impl=ImplRef(e.impl_id, e.version, arch),
                     route=spec.route if spec else "protected",
                     constants={key: _encode_pin(op, key, v) for key, v in e.pinned_constants.items()},
                     discharge=discharge,
@@ -126,12 +281,12 @@ def build_execution_contract(registry: Registry, manifest: Manifest, profile=Non
             )
     composition.sort(key=lambda c: (c.region, c.cases, c.impl.id))
 
-    case_ids = {s for _, s in manifest.keys()}
+    case_ids = {site for _, site in normalized}
     cases = tuple(c for c in CASES if c.id in case_ids)
     archs = tuple(getattr(profile, "architectures", ()) or ())
     contract = ExecutionContract(
         schema_version="1",
-        model=ModelRef(manifest.model or "", archs, f"models/{manifest.model or 'unknown'}"),
+        model=ModelRef(model or "", archs, f"models/{model or 'unknown'}"),
         identities=Identities("", "", ""),
         cases=cases,
         composition=tuple(composition),

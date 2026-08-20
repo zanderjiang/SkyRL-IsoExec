@@ -1,8 +1,8 @@
 """Construction-time scaffolding for the isoexec op abstraction.
 
-Registers ops and impls (``registry``), composes them into an (op, site) -> impl@version manifest
-(``composition``) that is delivered as a hashed ExecutionContract (``contract_delivery``), and
-carries the supporting arch target, flag table, test contracts and gate-signature table.
+Registers ops and impls (``registry``), builds the per-(op, site) selections into the hashed
+ExecutionContract (``contract_build``) delivered by ``contract_delivery``, and carries the
+supporting arch target, flag table, test contracts and gate-signature table.
 """
 
 from __future__ import annotations
@@ -14,22 +14,17 @@ from .arch import (
     assert_homogeneous,
     detect_arch,
 )
-from .composition import (
+from .contract_build import (
     DEPLOYMENT as ENTRY_DEPLOYMENT,
 )
-from .composition import (
+from .contract_build import (
     FUNCTION as ENTRY_FUNCTION,
 )
-from .composition import (
-    MANIFEST_HASH_ENV,
-    CompositionError,
-    FrozenManifestError,
-    Manifest,
-    ManifestEntry,
+from .contract_build import (
+    ContractBuildError,
     PinValidationError,
-    ResolvedFingerprint,
-    build_manifest,
-    load_manifest,
+    build_execution_contract,
+    validate_pins,
 )
 from .contract_delivery import (
     CONTRACT_HASH_ENV,
@@ -50,6 +45,7 @@ from .contracts import (
     check_hazard_coverage,
     collect_grad_set,
 )
+from .fingerprint import ResolvedFingerprint
 from .flags import (
     FLAGS,
     Flag,
@@ -83,18 +79,14 @@ __all__ = [
     "HardwareTarget",
     "assert_homogeneous",
     "detect_arch",
-    # composition
-    "Manifest",
-    "ManifestEntry",
+    # contract build
     "ResolvedFingerprint",
-    "CompositionError",
-    "FrozenManifestError",
+    "ContractBuildError",
     "PinValidationError",
-    "MANIFEST_HASH_ENV",
     "ENTRY_FUNCTION",
     "ENTRY_DEPLOYMENT",
-    "build_manifest",
-    "load_manifest",
+    "build_execution_contract",
+    "validate_pins",
     # contract delivery
     "CONTRACT_HASH_ENV",
     "ContractDeliveryError",

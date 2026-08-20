@@ -1,6 +1,6 @@
 """Qwen3.5-35B-A3B (hybrid GDN + MoE) composition, declared as a ``ModelProfile``.
 
-The six structural facts here are what ``policy.derive_selections`` turns into the manifest; there
+The six structural facts here are what ``policy.derive_selections`` turns into the contract; there
 are no exceptions to policy for this model. Sites are TF=trainer_fwd, TS=trainer_score,
 EP=engine_prefill, ED=engine_decode.
 """
@@ -53,7 +53,7 @@ EXCEPTIONS: dict = {}
 # The second live variant. ``gdn_kernel`` decides TWO ops: the ``gdn.core`` kernel pin, and the
 # ``gdn.state`` impl -- chunk_synced owns its own pools and the engine refuses ``GDN_NATIVE_STATE=1``
 # under it, so ``native_kv_cache`` is not selectable there. Declaring the variant here gives it a
-# frozen-manifest entry and a hash of its own.
+# contract entry and an identity of its own.
 #
 # Nothing reads ``SKYRL_ISOEXEC_GDN_KERNEL`` back into the profile, so a live chunk_synced process
 # still derives from ``PROFILE``; both runtimes read the same env var, so the handshake stays green
@@ -101,12 +101,14 @@ def gemm_census(*, tp: int, etp: int) -> list:
 
 
 def build(registry, *, arch=None, profile=None):
-    """Build (unfrozen) the Qwen3.5 manifest against a registry; the caller freezes it.
+    """Build the Qwen3.5 ExecutionContract against a registry.
 
     ``profile`` selects the variant -- ``PROFILE`` (recurrent) by default, or
     ``CHUNK_SYNCED_PROFILE``. Same derivation, different hash, so a one-sided flip refuses to run.
     """
     from ..core.arch import ARCH
-    from ..core.composition import build_manifest
+    from ..core.contract_build import build_execution_contract
 
-    return build_manifest(registry, build_selections(profile or PROFILE, EXCEPTIONS), arch=arch or ARCH, model=MODEL)
+    return build_execution_contract(
+        registry, build_selections(profile or PROFILE, EXCEPTIONS), arch=arch or ARCH, model=MODEL
+    )

@@ -1,8 +1,8 @@
-"""Per-model composition manifests.
+"""Per-model compositions.
 
 A model file declares structural facts (``profile.ModelProfile``); ``policy.derive_selections`` turns
-those into the ``{(op, site) -> impl}`` manifest, and a model that departs from policy declares an
-EXCEPTION list. No kernels live here -- only selections.
+those into the ``{(op, site) -> impl}`` selection set, and a model that departs from policy declares
+an EXCEPTION list. No kernels live here -- only selections.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 def build_for(model_path: str, registry, *, arch=None):
-    """Dispatch a HF model path / id to its composition manifest builder (unfrozen).
+    """Dispatch a HF model path / id to its ExecutionContract builder.
 
-    Both runtimes build the same complete manifest from this one function, so their hashes match by
-    construction. Unknown models raise rather than silently running unmanaged.
+    Both runtimes build the same complete contract from this one function, so their identities match
+    by construction. Unknown models raise rather than silently running unmanaged.
     """
     from .resolve import resolve_model_module
 
@@ -26,7 +26,7 @@ def build_for(model_path: str, registry, *, arch=None):
 
 
 def profile_for(model_path: str):
-    """The ``ModelProfile`` for a model path/id, without building a manifest."""
+    """The ``ModelProfile`` for a model path/id, without building a contract."""
     from .resolve import resolve_profile
 
     return resolve_profile(model_path)

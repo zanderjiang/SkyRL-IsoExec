@@ -1110,11 +1110,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
-        # isoexec Phase 2: build + log the composition manifest hash on the TRAINER side. Both
-        # runtimes build the SAME complete (op,site)->impl manifest from the same code+model+arch,
-        # so their hashes match by construction; a differing [ISOEXEC-MANIFEST] hash across the two
-        # process logs is a composition split-brain (the #1 failure mode). Build+log only; wrapped so
-        # it can never break the run (behavior-preserving). See core/process_manifest.py.
+        # isoexec Phase 2: build + log the composition contract identities on the TRAINER side.
+        # Both runtimes build the SAME complete (op,site)->impl contract from the same
+        # code+model+arch, so their identities match by construction; a differing [ISOEXEC-CONTRACT]
+        # hash across the two process logs is a composition split-brain (the #1 failure mode).
+        # Build+log only; wrapped so it can never break the run. See core/process_contract.py.
         if os.environ.get("SKYRL_ISOEXEC"):
             # NCCL pin A/B EVIDENCE, read from the WORKER's own environment (the ray runtime env is
             # what the driver *asked* for; this is what the process actually got, which is the only
@@ -1131,13 +1131,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 flush=True,
             )
             try:
-                from skyrl.backends.skyrl_train.isoexec.core.process_manifest import (
-                    get_process_manifest,
+                from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+                    get_process_contract,
                 )
 
-                get_process_manifest(model_path)
+                get_process_contract(model_path)
             except Exception as _e:  # pragma: no cover - never fatal
-                logger.warning(f"[ISOEXEC-MANIFEST] trainer manifest build skipped: {_e}")
+                logger.warning(f"[ISOEXEC-CONTRACT] trainer contract build skipped: {_e}")
         # initialize the bridge and provider objects
         self.init_configs(
             model_path,
@@ -1256,17 +1256,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 and int(self.cfg.policy.megatron_config.tensor_model_parallel_size) > 1
                 and os.environ.get("SKYRL_ISOEXEC_NCCL_TRANSPORT_BOUNDARY_REQUIREMENTS", "").strip()
             ):
-                from skyrl.backends.skyrl_train.isoexec.core.process_manifest import (
-                    cached_manifest,
+                from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+                    cached_contract_view,
                 )
                 from skyrl.backends.skyrl_train.isoexec.ops.collectives.nccl_identity import (
-                    assert_manifest_matches,
+                    assert_contract_matches,
                     effective_identity,
                 )
 
                 _nccl_impl, _nccl_constants = effective_identity()
-                assert_manifest_matches(
-                    cached_manifest(),
+                assert_contract_matches(
+                    cached_contract_view(),
                     ("trainer_fwd", "trainer_score"),
                     _nccl_impl,
                     _nccl_constants,
@@ -1479,8 +1479,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 log_fingerprint_once,
                 record_installs,
             )
-            from skyrl.backends.skyrl_train.isoexec.core.process_manifest import (
-                cached_manifest,
+            from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+                cached_contract_view,
             )
 
             cfg = getattr(self.actor_module[0], "config", None) if getattr(self, "actor_module", None) else None
@@ -1564,7 +1564,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
                 record_installs("moe.combine", TRAINER_SITES, "pik_leaf_tree" if _moe_pik_fc2_on() else NOT_INSTALLED)
 
-            log_fingerprint_once(cached_manifest(), tag="trainer_install")
+            log_fingerprint_once(cached_contract_view(), tag="trainer_install")
         except Exception as _e:  # pragma: no cover - never fatal
             logger.warning(f"[ISOEXEC-FINGERPRINT] trainer install fingerprint skipped: {_e}")
 

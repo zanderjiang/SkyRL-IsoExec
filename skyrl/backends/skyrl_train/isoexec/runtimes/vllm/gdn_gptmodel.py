@@ -323,7 +323,7 @@ def state_layer_cls():
                     log_fingerprint_once,
                     record_installs,
                 )
-                from ...core.process_manifest import cached_manifest
+                from ...core.process_contract import cached_contract_view
 
                 if isinstance(self._cc, ChunkSyncedGDN):
                     # Its own fp32 entry states + open-chunk buffers; vLLM's state pages are a
@@ -332,7 +332,7 @@ def state_layer_cls():
                 else:
                     _state_impl = "native_kv_cache" if getattr(self._cc, "_native", False) else "private_pool"
                 record_installs("gdn.state", ENGINE_SITES, _state_impl, self._cc)
-                log_fingerprint_once(cached_manifest(), tag="engine_first_forward")
+                log_fingerprint_once(cached_contract_view(), tag="engine_first_forward")
             except Exception as _e:  # pragma: no cover - never fatal
                 logger.warning(f"[ISOEXEC-FINGERPRINT] gdn.state record skipped: {_e}")
             self._cc.conv_weight, self._cc.conv_bias = conv_weight, conv_bias

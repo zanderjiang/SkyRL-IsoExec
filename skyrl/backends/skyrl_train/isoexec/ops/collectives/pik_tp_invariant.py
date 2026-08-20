@@ -124,7 +124,7 @@ def _record_transport_fingerprint(side: str, state: str, impl_fn) -> None:
             log_fingerprint_once,
             record_installs,
         )
-        from ...core.process_manifest import cached_manifest
+        from ...core.process_contract import cached_contract_view
 
         if side == "ENGINE":
             record_installs("collectives.tree_all_reduce", ENGINE_SITES, "pik_tree", impl_fn)
@@ -132,7 +132,7 @@ def _record_transport_fingerprint(side: str, state: str, impl_fn) -> None:
             record_installs("collectives.tree_all_reduce", TRAINER_SITES, "pik_tree", impl_fn)
         else:
             return  # a harness ("TEST"/"?") has no site vocabulary; the banner is the record
-        log_fingerprint_once(cached_manifest(), tag=f"{side.lower()}_first_collective")
+        log_fingerprint_once(cached_contract_view(), tag=f"{side.lower()}_first_collective")
     except Exception as e:  # pragma: no cover - never fatal
         logger.warning(f"[ISOEXEC-FINGERPRINT] transport record skipped: {e}")
 
@@ -167,25 +167,25 @@ def get_plan():
 
 
 def _assert_plan_matches_manifest(side: str, plan) -> None:
-    """Refuse the install when the plan the env built is not the composition the manifest names.
+    """Refuse the install when the plan the env built is not the composition the contract names.
 
     ``leaves`` and ``leaf_dtype`` are stated by the env vars this module reads and pinned into the hash the
     weight-sync handshake compares. Without this check, flipping an env var on both sides would run a
-    different reduction tree under an unchanged manifest hash and the handshake would still match. With no
-    built manifest (benches, unit harnesses) there is nothing to check against and this is skipped.
+    different reduction tree under an unchanged contract hash and the handshake would still match. With no
+    built contract (benches, unit harnesses) there is nothing to check against and this is skipped.
     """
     try:
-        from ...core.process_manifest import cached_manifest
+        from ...core.process_contract import cached_contract_view
 
-        m = cached_manifest()
+        view = cached_contract_view()
     except Exception:  # noqa: BLE001 -- a status read must never break the install
         return
-    if m is None:
+    if view is None:
         return
     pinned = None
-    for (op, _site), entry in m.entries().items():
+    for (op, _site), entry in view.items():
         if op == "collectives.tree_all_reduce":
-            pinned = getattr(entry, "pinned_constants", None) or {}
+            pinned = entry.get("pinned_constants") or {}
             break
     if not pinned:
         return

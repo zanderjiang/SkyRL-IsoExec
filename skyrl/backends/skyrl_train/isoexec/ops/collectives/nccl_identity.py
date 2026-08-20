@@ -130,23 +130,26 @@ def census(impl_id: str, constants: Mapping[str, str | None]) -> str:
     )
 
 
-def assert_manifest_matches(manifest, sites, impl_id: str, constants: Mapping[str, str | None]) -> None:
-    """Fail closed when an active runtime's exact tuple differs from its manifest entries."""
-    if manifest is None:
-        raise RuntimeError("active NCCL composition cannot be admitted because the process manifest is unavailable")
+def assert_contract_matches(view, sites, impl_id: str, constants: Mapping[str, str | None]) -> None:
+    """Fail closed when an active runtime's exact tuple differs from its contract entries.
+
+    ``view`` is the contract's ``{(op, site) -> {impl_id, pinned_constants, ...}}`` projection
+    (``core.process_contract.cached_contract_view``).
+    """
+    if view is None:
+        raise RuntimeError("active NCCL composition cannot be admitted because the process contract is unavailable")
     actual = dict(constants)
     problems = []
-    entries = manifest.entries()
     for site in sites:
-        entry = entries.get(("collectives.nccl_pin", site))
+        entry = view.get(("collectives.nccl_pin", site))
         if entry is None:
-            problems.append(f"{site}: manifest has no collectives.nccl_pin entry")
-        elif entry.impl_id != impl_id or entry.pinned_constants != actual:
+            problems.append(f"{site}: contract has no collectives.nccl_pin entry")
+        elif entry["impl_id"] != impl_id or entry["pinned_constants"] != actual:
             problems.append(
-                f"{site}: manifest={entry.impl_id!r}/{entry.pinned_constants!r} " f"runtime={impl_id!r}/{actual!r}"
+                f"{site}: contract={entry['impl_id']!r}/{entry['pinned_constants']!r} " f"runtime={impl_id!r}/{actual!r}"
             )
     if problems:
         raise RuntimeError(
-            "[ISOEXEC-NCCL-MANIFEST] effective ALGO/MIN/MAX disagrees with the frozen manifest; "
+            "[ISOEXEC-NCCL-MANIFEST] effective ALGO/MIN/MAX disagrees with the frozen contract; "
             "refusing before forward:\n  " + "\n  ".join(problems)
         )

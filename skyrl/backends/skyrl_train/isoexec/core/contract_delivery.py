@@ -1,8 +1,8 @@
 """Deliver the ExecutionContract as the artifact both runtimes read.
 
-Contract-side mirror of the manifest delivery surface: canonical-bytes file plus a hash carried in
-``ISOEXEC_CONTRACT_HASH`` for cross-check, and installed-key validation with exact accept/reject
-parity against ``Manifest.validate_against_installed``.
+Canonical-bytes file plus a hash carried in ``ISOEXEC_CONTRACT_HASH`` for cross-check, and
+installed-key validation: every installed (op, site) must carry an explicit entry, absence means
+"no such site", never "default".
 """
 
 from __future__ import annotations
@@ -15,13 +15,13 @@ from ..contract import (
     from_canonical_json,
     to_canonical_json,
 )
-from .composition import CompositionError, ResolvedFingerprint
+from .fingerprint import ResolvedFingerprint
 from .registry import Registry
 
 CONTRACT_HASH_ENV = "ISOEXEC_CONTRACT_HASH"
 
 
-class ContractDeliveryError(CompositionError):
+class ContractDeliveryError(ValueError):
     pass
 
 
@@ -76,7 +76,7 @@ def expected_installed_keys(contract: ExecutionContract, registry: Registry) -> 
 
 def validate_contract_against_installed(contract: ExecutionContract, registry: Registry, fingerprint) -> None:
     """Reject any installed (op, site) the contract does not name, and any contract-named key that
-    is not installed -- the same semantics as ``Manifest.validate_against_installed``."""
+    is not installed."""
     if isinstance(fingerprint, ResolvedFingerprint):
         installed = fingerprint.keys()
     elif isinstance(fingerprint, Registry):

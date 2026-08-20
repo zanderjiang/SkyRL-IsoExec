@@ -903,10 +903,10 @@ def install_autofuse_sites(side: str) -> dict[str, tuple[str, str]]:
         _INSTALLED = {s: ("inert", "flag off") for s in specs}
         return _INSTALLED
 
-    from ..core.process_manifest import register_manifest_extension
+    from ..core.process_contract import register_contract_extension
     from .fusion_ledger import FusionLedger, ledger_path
 
-    register_manifest_extension("autofuse", autofuse_pin_digest)
+    register_contract_extension("autofuse", autofuse_pin_digest)
     print(
         f"{BANNER} pid={pid} side={side} install: ledger={ledger_path()} "
         f"digest={FusionLedger().digest()} sites={len(specs)}",

@@ -32,7 +32,7 @@ from .runtimes.megatron.gdn_fla_shim import install_fla_shim  # noqa: E402
 
 install_fla_shim()
 
-# Autofuse manifest-handshake pin, registered at PACKAGE import because every process that computes
+# Autofuse contract-handshake pin, registered at PACKAGE import because every process that computes
 # the handshake hash must carry it -- including the engine actor, which never wires sites. The pin
 # is a pure function of (flag, fusion-ledger digest), so a split-brain flag delivery or a diverged
 # ledger refuses at weight sync. The default literal is spelled out to match
@@ -43,8 +43,8 @@ if _os.environ.get("SKYRL_ISOEXEC_AUTOFUSE", "1") == "1":
     from .autofuse.sites import (
         autofuse_pin_digest as _autofuse_pin_digest,  # noqa: E402
     )
-    from .core.process_manifest import (
-        register_manifest_extension as _register_ext,  # noqa: E402
+    from .core.process_contract import (
+        register_contract_extension as _register_ext,  # noqa: E402
     )
 
     _register_ext("autofuse", _autofuse_pin_digest)

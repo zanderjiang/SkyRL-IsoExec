@@ -411,12 +411,6 @@ class Worker(DistributedTorchRayActor):
         )
 
         try:
-            from skyrl.backends.skyrl_train.isoexec.core.process_manifest import (
-                manifest_hash,
-            )
-
-            init_info.manifest_hash = manifest_hash()
-
             from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
                 contract_hash,
             )
@@ -424,11 +418,11 @@ class Worker(DistributedTorchRayActor):
             # Negative control (admission battery): perturb the TRAINER-side composite only, so
             # the engine's receiver assert must refuse. Proves the handshake detects a mismatch.
             if os.environ.get("SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL") == "1":
-                from skyrl.backends.skyrl_train.isoexec.core.process_manifest import (
-                    register_manifest_extension,
+                from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+                    register_contract_extension,
                 )
 
-                register_manifest_extension("negative_control", lambda: "tampered")
+                register_contract_extension("negative_control", lambda: "tampered")
 
             init_info.contract_hash = contract_hash()
         except Exception:  # pragma: no cover - legacy non-IsoExec compatibility

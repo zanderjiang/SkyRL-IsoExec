@@ -311,25 +311,19 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
         # dispatcher-preserving configuration and the pin itself must both verify, or it raises.
         # NO-OP ON EVERY SHIPPING PATH TODAY (no class is compile-eligible -> "inert").
         assert_compilation_admissible(kwargs)
-        # isoexec Phase 2: build + log the composition manifest + contract hashes on the ENGINE
-        # side. Must equal the trainer's [ISOEXEC-MANIFEST]/[ISOEXEC-CONTRACT] hashes (same
-        # code+model+arch -> same hash); a mismatch across the two logs is a composition
-        # split-brain. Build+log only, never fatal (behavior-preserving); the fatal assert runs
-        # worker-side at weight-sync receiver init.
+        # isoexec Phase 2: build + log the composition contract hashes on the ENGINE side. Must
+        # equal the trainer's [ISOEXEC-CONTRACT] identities (same code+model+arch -> same hash); a
+        # mismatch across the two logs is a composition split-brain. Build+log only, never fatal
+        # (behavior-preserving); the fatal assert runs worker-side at weight-sync receiver init.
         if os.environ.get("SKYRL_ISOEXEC"):
             try:
-                from skyrl.backends.skyrl_train.isoexec.core.process_manifest import (
-                    get_process_manifest,
-                )
-
-                get_process_manifest(kwargs.get("model") or "")
                 from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
                     get_process_contract,
                 )
 
                 get_process_contract(kwargs.get("model") or "")
             except Exception as _e:
-                logger.warning(f"[isoexec] engine manifest/contract build skipped: {_e}")
+                logger.warning(f"[isoexec] engine contract build skipped: {_e}")
         hf_overrides = dict(kwargs.get("hf_overrides") or {})
         hf_overrides["architectures"] = [VLLM_MODEL_NAME]
         kwargs["hf_overrides"] = hf_overrides
