@@ -564,134 +564,157 @@ class GPTModelVLLMWrapper(nn.Module):
             # GEMM/RMSNorm + RoPE patches here.
             apply_megatron_isoexec_patches(skip_aten_registration=True)
 
-        # Engine half of the TP/EP-invariant row-parallel (pik) pair; the trainer applies the
-        # identical patch. It makes the row-parallel K-reduction follow the same fixed leaf tree on
-        # both sides, so the engine may run a different TP than the trainer with KL still exactly 0.
-        if os.environ.get("SKYRL_ISOEXEC_PIK") == "1":
-            from skyrl.backends.skyrl_train.isoexec.ops.collectives.pik_tp_invariant import (
-                apply_pik_tp_invariant,
-            )
-
-            apply_pik_tp_invariant(side="ENGINE")
-
-        # swap attention -> vLLM paged
-        cfg = self.gpt.config
-        head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
-        # Megatron shards attention heads across TP, so core_attention sees per-rank head counts
-        # (including the kv-replication case num_query_groups < TP); vLLM expects local counts too.
-        from skyrl.backends.skyrl_train.isoexec.ops.attention.megatron_varlen_attn import (
-            isoexec_local_head_counts,
-        )
-
-        local_q, local_kv = isoexec_local_head_counts(cfg, self._tp_size)
-        swap_core_attention(
-            self.gpt,
-            num_heads=local_q,
-            num_kv_heads=local_kv,
-            head_dim=head_dim,
-            scale=head_dim**-0.5,
-        )
-
-        # Hybrid models: the GatedDeltaNet layers swap_core_attention skips get a vLLM-registered
-        # mamba state layer and chunk-consistent decode. MUST happen during model construction:
-        # vLLM's KV cache manager enumerates static_forward_context after __init__ and before
-        # allocating state.
-        if os.environ.get("SKYRL_ISOEXEC_GDN") == "1":
-            from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.gdn_gptmodel import (
-                swap_gdn_core,
-            )
-
-            n_gdn = swap_gdn_core(self.gpt, vllm_config=vllm_config)
-            if n_gdn == 0:
-                # Zero GatedDeltaNet layers means every layer came out dense: a different model
-                # from the one the checkpoint describes, which would build, run, and even be bitwise
-                # decode==prefill while generating gibberish. Refuse.
-                raise RuntimeError(
-                    "[isoexec-gdn] SKYRL_ISOEXEC_GDN=1 but the Megatron GPTModel has no GatedDeltaNet "
-                    "layers. The no-TE local layer spec built dense attention for every layer. A "
-                    "hybrid no-TE spec (GDN on 3 of 4 layers) is required."
+        # The ContractAdapter owns this worker's enforcement sequence: build the contract BEFORE
+        # any install that asserts against it (idempotent, cached; ordering is load-bearing: pik's
+        # _assert_plan_matches_manifest reads cached_contract_view() and silently skips on None, so
+        # building after the pik install left the engine with zero reachable refusing pin checks),
+        # check EVERY contract claim against the deployed engine facts (runtimes/vllm/adapter.py),
+        # run the install sequence below, then close the INSTALL boundary.
+        def _isoexec_install():
+            # Engine half of the TP/EP-invariant row-parallel (pik) pair; the trainer applies the
+            # identical patch. It makes the row-parallel K-reduction follow the same fixed leaf tree on
+            # both sides, so the engine may run a different TP than the trainer with KL still exactly 0.
+            if os.environ.get("SKYRL_ISOEXEC_PIK") == "1":
+                from skyrl.backends.skyrl_train.isoexec.ops.collectives.pik_tp_invariant import (
+                    apply_pik_tp_invariant,
                 )
 
-        # Fuse `F.rms_norm(x) * (1.0 + weight)` into one kernel and hoist the add to the weight-sync
-        # boundary. Instance-level rebinds on THIS model, so the trainer's identical norm class is
-        # untouched -- hoisting gamma trainer-side would detach `weight`'s gradient path, which a
-        # forward-only IsoExec gate cannot see. Self-gates on SKYRL_ISOEXEC_GDN_FUSED_OUTNORM.
-        from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (
-            install_engine_fused_norms,
-        )
+                apply_pik_tp_invariant(side="ENGINE")
 
-        # The count distinguishes "the fused twin installed" from "the flag was on and it rebound
-        # nothing"; the install fingerprint below reports it.
-        self._ix_fused_norms = install_engine_fused_norms(self.gpt)
+            # swap attention -> vLLM paged
+            cfg = self.gpt.config
+            head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
+            # Megatron shards attention heads across TP, so core_attention sees per-rank head counts
+            # (including the kv-replication case num_query_groups < TP); vLLM expects local counts too.
+            from skyrl.backends.skyrl_train.isoexec.ops.attention.megatron_varlen_attn import (
+                isoexec_local_head_counts,
+            )
 
-        # RoPE-by-absolute-position: GPTModel computes RoPE for sequence-index 0..L-1, but vLLM
-        # paged decode feeds 1-token inputs whose true position is N. Index a precomputed RoPE
-        # cache by vLLM's `positions` so decode rotates at the right angle (else decode != prefill).
-        max_pos = int(getattr(vllm_config.model_config, "max_model_len", 8192))
-        self._rope = _PositionIndexedRoPE(self.gpt.rotary_pos_emb, max_pos)
-        self.gpt.rotary_pos_emb = self._rope
+            local_q, local_kv = isoexec_local_head_counts(cfg, self._tp_size)
+            swap_core_attention(
+                self.gpt,
+                num_heads=local_q,
+                num_kv_heads=local_kv,
+                head_dim=head_dim,
+                scale=head_dim**-0.5,
+            )
 
-        # Fuse the attention RoPE and hoist cos/sin out of the per-layer recompute. Installed here,
-        # in the vLLM worker process only: the patch point is a module global, so the trainer must
-        # never reach this line, and the fused path additionally requires the mark
-        # _PositionIndexedRoPE stamps above. Self-gates on SKYRL_ISOEXEC_FUSED_ROPE.
-        from skyrl.backends.skyrl_train.isoexec.ops.rope.rope_fused import (
-            install_engine_fused_rope,
-        )
-        from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.megatron_patches import (
-            is_rope_fp32_installed,
-        )
-
-        # The op refuses to fuse over the megatron fp32-rope patch (different rounding chain). That
-        # guard state lives in the megatron runtime, so the adapter reads it and passes it down --
-        # ops must never import a runtime.
-        install_engine_fused_rope(fp32_rope_installed=is_rope_fp32_installed())
-
-        # Replace megatron's fused-QKV gather over the full TP group with an all-gather over the
-        # subgroup whose shards are the only columns this rank keeps. When `num_query_groups <
-        # tp_world` megatron gathers every qkv column and then slices; contiguous rank-ordered
-        # ColumnParallelLinear sharding makes the subgroup gather byte-identical to
-        # gather-then-slice. Installed at model build because it creates and WARMS a sub-process
-        # group, and the gather it replaces runs inside the decode CUDA graphs -- a communicator
-        # built lazily under capture is fatal. Self-gates on the geometry it reads off the layers.
-        from skyrl.backends.skyrl_train.isoexec.ops.attention.qkv_subgroup_gather import (
-            install_engine_qkv_subgroup_ag,
-        )
-
-        install_engine_qkv_subgroup_ag(self.gpt, side="ENGINE")
-
-        # Patch vLLM's sampler logprob kernel to the trainer's exact formula HERE, in the worker
-        # process where the sampler runs -- doing it in the engine actor does not reach the worker.
-        # The fused Triton logprob kernel otherwise bypasses aten and diverges from the trainer.
-        if self._local_spec:
-            try:
-                from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.vllm_patches import (
-                    patch_vllm_logprobs_batch_invariant,
-                    patch_vllm_sampler_temperature,
+            # Hybrid models: the GatedDeltaNet layers swap_core_attention skips get a vLLM-registered
+            # mamba state layer and chunk-consistent decode. MUST happen during model construction:
+            # vLLM's KV cache manager enumerates static_forward_context after __init__ and before
+            # allocating state.
+            if os.environ.get("SKYRL_ISOEXEC_GDN") == "1":
+                from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.gdn_gptmodel import (
+                    swap_gdn_core,
                 )
 
-                patch_vllm_logprobs_batch_invariant()
-                patch_vllm_sampler_temperature()
-                _logprob_patched = True
-            except Exception as _e:  # pragma: no cover
+                n_gdn = swap_gdn_core(self.gpt, vllm_config=vllm_config)
+                if n_gdn == 0:
+                    # Zero GatedDeltaNet layers means every layer came out dense: a different model
+                    # from the one the checkpoint describes, which would build, run, and even be bitwise
+                    # decode==prefill while generating gibberish. Refuse.
+                    raise RuntimeError(
+                        "[isoexec-gdn] SKYRL_ISOEXEC_GDN=1 but the Megatron GPTModel has no GatedDeltaNet "
+                        "layers. The no-TE local layer spec built dense attention for every layer. A "
+                        "hybrid no-TE spec (GDN on 3 of 4 layers) is required."
+                    )
+
+            # Fuse `F.rms_norm(x) * (1.0 + weight)` into one kernel and hoist the add to the weight-sync
+            # boundary. Instance-level rebinds on THIS model, so the trainer's identical norm class is
+            # untouched -- hoisting gamma trainer-side would detach `weight`'s gradient path, which a
+            # forward-only IsoExec gate cannot see. Self-gates on SKYRL_ISOEXEC_GDN_FUSED_OUTNORM.
+            from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (
+                install_engine_fused_norms,
+            )
+
+            # The count distinguishes "the fused twin installed" from "the flag was on and it rebound
+            # nothing"; the install fingerprint below reports it.
+            self._ix_fused_norms = install_engine_fused_norms(self.gpt)
+
+            # RoPE-by-absolute-position: GPTModel computes RoPE for sequence-index 0..L-1, but vLLM
+            # paged decode feeds 1-token inputs whose true position is N. Index a precomputed RoPE
+            # cache by vLLM's `positions` so decode rotates at the right angle (else decode != prefill).
+            max_pos = int(getattr(vllm_config.model_config, "max_model_len", 8192))
+            self._rope = _PositionIndexedRoPE(self.gpt.rotary_pos_emb, max_pos)
+            self.gpt.rotary_pos_emb = self._rope
+
+            # Fuse the attention RoPE and hoist cos/sin out of the per-layer recompute. Installed here,
+            # in the vLLM worker process only: the patch point is a module global, so the trainer must
+            # never reach this line, and the fused path additionally requires the mark
+            # _PositionIndexedRoPE stamps above. Self-gates on SKYRL_ISOEXEC_FUSED_ROPE.
+            from skyrl.backends.skyrl_train.isoexec.ops.rope.rope_fused import (
+                install_engine_fused_rope,
+            )
+            from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.megatron_patches import (
+                is_rope_fp32_installed,
+            )
+
+            # The op refuses to fuse over the megatron fp32-rope patch (different rounding chain). That
+            # guard state lives in the megatron runtime, so the adapter reads it and passes it down --
+            # ops must never import a runtime.
+            install_engine_fused_rope(fp32_rope_installed=is_rope_fp32_installed())
+
+            # Replace megatron's fused-QKV gather over the full TP group with an all-gather over the
+            # subgroup whose shards are the only columns this rank keeps. When `num_query_groups <
+            # tp_world` megatron gathers every qkv column and then slices; contiguous rank-ordered
+            # ColumnParallelLinear sharding makes the subgroup gather byte-identical to
+            # gather-then-slice. Installed at model build because it creates and WARMS a sub-process
+            # group, and the gather it replaces runs inside the decode CUDA graphs -- a communicator
+            # built lazily under capture is fatal. Self-gates on the geometry it reads off the layers.
+            from skyrl.backends.skyrl_train.isoexec.ops.attention.qkv_subgroup_gather import (
+                install_engine_qkv_subgroup_ag,
+            )
+
+            install_engine_qkv_subgroup_ag(self.gpt, side="ENGINE")
+
+            # Patch vLLM's sampler logprob kernel to the trainer's exact formula HERE, in the worker
+            # process where the sampler runs -- doing it in the engine actor does not reach the worker.
+            # The fused Triton logprob kernel otherwise bypasses aten and diverges from the trainer.
+            if self._local_spec:
+                try:
+                    from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.vllm_patches import (
+                        patch_vllm_logprobs_batch_invariant,
+                        patch_vllm_sampler_temperature,
+                    )
+
+                    patch_vllm_logprobs_batch_invariant()
+                    patch_vllm_sampler_temperature()
+                    _logprob_patched = True
+                except Exception as _e:  # pragma: no cover
+                    _logprob_patched = False
+                    print(f"[ISOEXEC-WRAP] logprob patch failed: {type(_e).__name__}: {_e}", flush=True)
+            else:
                 _logprob_patched = False
-                print(f"[ISOEXEC-WRAP] logprob patch failed: {type(_e).__name__}: {_e}", flush=True)
-        else:
-            _logprob_patched = False
-        # The install sequence is finished: record what each family actually bound and compare it
-        # against this process's contract once. Always build the worker's contract (idempotent,
-        # cached) -- the handshake at create_receiver reads it, and a worker without one silently
-        # skips the check.
-        from ...core.process_contract import get_process_contract
+            # The install sequence is finished: record what each family actually bound and compare it
+            # against this process's contract once. Always build the worker's contract (idempotent,
+            # cached) -- the handshake at create_receiver reads it, and a worker without one silently
+            # skips the check.
+            from ...core.process_contract import get_process_contract
 
-        get_process_contract(model_path)
-        if (
-            os.environ.get("SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN", "0") == "1"
-            and self._tp_size > 1
-            and os.environ.get("SKYRL_ISOEXEC_NCCL_TRANSPORT_BOUNDARY_REQUIREMENTS", "").strip()
-        ):
-            _assert_engine_nccl_manifest(model_path)
-        _record_engine_install_fingerprint(self, cfg, logprob_patched=_logprob_patched)
+            get_process_contract(model_path)
+            if (
+                os.environ.get("SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN", "0") == "1"
+                and self._tp_size > 1
+                and os.environ.get("SKYRL_ISOEXEC_NCCL_TRANSPORT_BOUNDARY_REQUIREMENTS", "").strip()
+            ):
+                _assert_engine_nccl_manifest(model_path)
+            _record_engine_install_fingerprint(self, cfg, logprob_patched=_logprob_patched)
+        # run_install: build_contract -> check_all_claims -> _isoexec_install() -> INSTALL
+        # boundary (every obligation the contract derives for the engine side must have a record;
+        # missing == violation; deliberate refusals propagate, internal ledger errors never do;
+        # gdn.state's install attestation is EXCEPTIONS-listed, recorded at first forward).
+        from ...core.adapter import set_process_adapter
+        from .adapter import VLLMContractAdapter
+
+        set_process_adapter(
+            VLLMContractAdapter(
+                model_path,
+                vllm_config=vllm_config,
+                mp=mp,
+                tp_size=self._tp_size,
+                install_fn=_isoexec_install,
+            )
+        ).run_install()
 
     def embed_input_ids(self, input_ids):
         # vLLM VllmModel protocol requires this exact name.

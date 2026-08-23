@@ -75,34 +75,7 @@ def register(reg) -> None:
             )
         )
     )
-    reg.register_op(
-        OpSpec(
-            name="attention.qwen35_context_layout",
-            sites=["trainer_fwd", "trainer_score"],
-        ).add_impl(
-            ImplSpec(
-                impl_id="qwen35_context_layout_sm90a",
-                version=1,
-                supported_archs=frozenset({"sm90"}),
-                rounding=RoundingSchedule(
-                    machine_assertable={
-                        "input_shape": [4, 32, 256],
-                        "output_shape": [32, 1, 1024],
-                        "operation": "byte_exact_context_permutation",
-                        "block": 1024,
-                        "num_warps": 8,
-                    },
-                    documentary=(
-                        "Manual Qwen-3.5 context-layout op at Megatron "
-                        "DotProductAttention._format_context. CUDA-13 sm90a cubin, prepared "
-                        "driver launch, exact source/shape/stride guards, first-call bitwise "
-                        "check, and eager fallback for grad-enabled or foreign shapes."
-                    ),
-                ),
-                capabilities={"cuda_graph": True, "manual_priority": True},
-                # Shape/source specialization lives in the machine contract and installer guards;
-                # the hazard vocabulary only describes operand probes.
-                hazards=["non_contiguous"],
-            )
-        )
-    )
+    # attention.qwen35_context_layout was deregistered: its impl, installer, cubin and check live
+    # only in the private bring-up repo, so the public contract hashed an entry no fingerprint
+    # could ever confirm (the enforcement audit's phantom-entry headline). Re-registering it
+    # requires the installer and its attestation to land in this tree first.

@@ -525,12 +525,26 @@ class CudaIpcTransferStrategy(WeightTransferStrategy):
         from skyrl.train.utils.utils import str_to_torch_dtype
 
         # IsoExec contract handshake: refuse a composition split-brain before serving weights.
+        # Delegated to the process's ContractAdapter (handshake + WEIGHT_SYNC boundary of the
+        # obligation ledger: the handshake obligation must have a record now, missing refuses;
+        # also serializes this process's enforcement.json verdict. Only deliberate refusals
+        # propagate). A process with no adapter (no IsoExec model built) keeps the plain sequence.
         try:
-            from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
-                assert_init_info_contract,
-            )
+            from skyrl.backends.skyrl_train.isoexec.core.adapter import process_adapter
 
-            assert_init_info_contract(init_info, other_side="trainer")
+            adapter = process_adapter()
+            if adapter is not None:
+                adapter.on_weight_sync(init_info)
+            else:
+                from skyrl.backends.skyrl_train.isoexec.core.enforce import (
+                    weight_sync_boundary,
+                )
+                from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+                    assert_init_info_contract,
+                )
+
+                assert_init_info_contract(init_info, other_side="trainer")
+                weight_sync_boundary("engine")
         except ImportError:  # pragma: no cover - legacy non-IsoExec compatibility
             pass
 

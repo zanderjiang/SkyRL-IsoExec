@@ -96,9 +96,32 @@ def get_process_contract(model_path: str | None = None, *, arch=None):
     from .registry_build import build_registry
 
     reg = build_registry(strict=True)
-    c = models.build_for(model_path, reg, arch=arch)
+    try:
+        c = models.build_for(model_path, reg, arch=arch)
+    except Exception as e:
+        # Reporter: contract-build validation. The failure still propagates to the caller; the
+        # ledger records it so a wrapped-and-swallowed build failure is loud at the INSTALL close.
+        try:
+            from .enforce import BUILD_VALID, INSTALL, VIOLATION, report
+
+            report(f"{BUILD_VALID}:contract", INSTALL, VIOLATION, f"{type(e).__name__}: {e}")
+        except Exception:  # noqa: BLE001 -- reporting must not mask the build error
+            pass
+        raise
     _CONTRACT = c
     _VIEW = build_contract_view(c, reg)
+    try:
+        from . import enforce
+
+        enforce.report(
+            f"{enforce.BUILD_VALID}:contract",
+            enforce.INSTALL,
+            enforce.OK,
+            f"numerical_policy={c.identities.numerical_policy}",
+        )
+        enforce.attest_state_hooks(c)
+    except Exception as e:  # noqa: BLE001 -- reporting must never break the build
+        logger.warning("[ISOEXEC-ENFORCE] build_valid/state-hook report skipped: %s", e)
     ids = c.identities
     logger.warning(
         "[ISOEXEC-CONTRACT] model=%s arch=%s numerical_policy=%s semantic=%s deployment=%s entries=%d",
@@ -140,18 +163,41 @@ def contract_hash(model_path: str | None = None) -> str | None:
     return composite_hash(c.identities.numerical_policy) if c is not None else None
 
 
+def assert_topology_within_claims(contract, actual, *, side: str = "?") -> bool:
+    """Refuse to run a topology outside the contract's claimed envelopes.
+
+    Deprecated name, kept for existing callers: the logic lives in the ContractAdapter's
+    ``TopologyChecker`` (core/adapter.py); this delegates to the aggregate check there. Same
+    ledger records, banner, refusal, and SKYRL_ISOEXEC_MANIFEST_STRICT=0 demotion as before.
+    """
+    from .adapter import check_topology_claims
+
+    ok, _results = check_topology_claims(contract, actual, side=side)
+    return ok
+
+
 def assert_contract_agreement(other_hash: str, *, other_side: str = "peer") -> bool:
     """Handshake check: the peer runtime's contract hash must equal ours.
 
     Returns True on match. A mismatch is fatal unless SKYRL_ISOEXEC_MANIFEST_STRICT=0, which warns
     and returns False.
     """
+    def _report(result, evidence):
+        try:
+            from . import enforce
+
+            enforce.report("handshake:numerical_policy", enforce.WEIGHT_SYNC, result, evidence)
+        except Exception as e:  # noqa: BLE001 -- reporting must never break the handshake
+            logger.warning("[ISOEXEC-ENFORCE] handshake report skipped: %s", e)
+
     ours = contract_hash()
     if ours is None:
         logger.warning("[ISOEXEC-CONTRACT-HANDSHAKE] local contract not built; skipping agreement check")
+        _report("skipped", "local contract not built")
         return True
     if other_hash == ours:
         logger.warning("[ISOEXEC-CONTRACT-HANDSHAKE] MATCH hash=%s (%s)", ours, other_side)
+        _report("ok", f"MATCH hash={ours} ({other_side})")
         return True
     strict = os.environ.get("SKYRL_ISOEXEC_MANIFEST_STRICT", "1").lower() not in ("", "0", "false", "no")
     msg = (
@@ -159,6 +205,7 @@ def assert_contract_agreement(other_hash: str, *, other_side: str = "peer") -> b
         "The two runtimes resolved DIFFERENT numerical policies -- a split-brain that would break "
         "the gate (or, worse, pass while measuring the wrong thing)."
     )
+    _report("violation", msg)
     if strict:
         raise RuntimeError(msg)
     logger.error(msg + " (SKYRL_ISOEXEC_MANIFEST_STRICT=0 -> warn-only)")
@@ -171,13 +218,23 @@ def assert_init_info_contract(init_info, *, other_side: str = "trainer") -> bool
     Skips when the peer stamped nothing or the local contract cannot be derived; a genuine mismatch
     raises according to the strictness knob.
     """
+    def _report_skip(evidence):
+        try:
+            from . import enforce
+
+            enforce.report("handshake:numerical_policy", enforce.WEIGHT_SYNC, enforce.SKIPPED, evidence)
+        except Exception:  # noqa: BLE001 -- reporting must never break weight sync
+            pass
+
     other = getattr(init_info, "contract_hash", None)
     if other is None:
+        _report_skip(f"{other_side} stamped no contract_hash")
         return True
     try:
         ours = contract_hash()
     except Exception as e:  # noqa: BLE001 -- local derivation failure must not break weight sync
         logger.warning("[ISOEXEC-CONTRACT-HANDSHAKE] local contract derivation failed (%s); skipping", e)
+        _report_skip(f"local contract derivation failed: {e}")
         return True
     if ours is None:
         logger.warning("[ISOEXEC-CONTRACT-HANDSHAKE] local contract not built; skipping agreement check")

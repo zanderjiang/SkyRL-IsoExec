@@ -83,6 +83,16 @@ def record_install(op: str, site: str, impl_id: str, obj=None, pinned=None) -> N
         recorder().record(op, site, impl_id, obj, pinned)
     except Exception as e:  # pragma: no cover - never fatal
         logger.warning(f"[ISOEXEC-FINGERPRINT] record_install({op},{site}) skipped: {e}")
+        return
+    # The attestation ledger: a record's existence is what discharges install_attest@INSTALL
+    # (NOT_INSTALLED included -- attesting a non-install is the record; the comparator decides
+    # whether it violates the contract). Fail-safe, separately from the record itself.
+    try:
+        from . import enforce
+
+        enforce.report(f"install_attest:{op}:{site}", enforce.INSTALL, enforce.OK, impl_id)
+    except Exception as e:  # pragma: no cover - never fatal
+        logger.warning(f"[ISOEXEC-FINGERPRINT] install_attest report({op},{site}) skipped: {e}")
 
 
 def record_installs(op: str, sites, impl_id: str, obj=None, pinned=None) -> None:
@@ -145,21 +155,37 @@ def log_fingerprint(view=None, tag: str = "default") -> dict:
         )
     problems = []
     if view is not None:
+        # Each per-key verdict also lands in the obligation ledger (fail-safe): the comparator
+        # itself stays log-only; the FIRST_FORWARD boundary is what refuses per the severity table.
+        try:
+            from . import enforce
+        except Exception:  # pragma: no cover - a broken ledger must not break the comparator
+            enforce = None
+        _phase = enforce.FIRST_FORWARD if enforce and "first_forward" in tag else (enforce.INSTALL if enforce else None)
         entries = view or {}
         for key, got in sorted(rec.items()):
             want = entries.get(key)
+            problem = None
             if want is None:
-                problems.append(f"{key} installed as {got['impl_id']!r} but manifest names no such (op,site)")
+                problem = f"{key} installed as {got['impl_id']!r} but manifest names no such (op,site)"
             elif want["impl_id"] != got["impl_id"]:
-                problems.append(
+                problem = (
                     f"{key}: manifest={want['impl_id']!r} but INSTALLED={got['impl_id']!r} "
                     f"({got['module']}.{got['qualname']})"
                 )
             elif "pinned_constants" in got and want["pinned_constants"] != got["pinned_constants"]:
-                problems.append(
+                problem = (
                     f"{key}: manifest pins={want['pinned_constants']!r} but INSTALLED pins="
                     f"{got['pinned_constants']!r} ({got['module']}.{got['qualname']})"
                 )
+            if problem is not None:
+                problems.append(problem)
+            if enforce is not None:
+                oid = f"fingerprint:{key[0]}:{key[1]}"
+                if problem is None:
+                    enforce.report(oid, _phase, enforce.OK, f"({tag}) {got['impl_id']}")
+                else:
+                    enforce.report(oid, _phase, enforce.VIOLATION, problem)
         for p in problems:
             logger.error("[ISOEXEC-FINGERPRINT] MISMATCH %s", p)
         if not problems:

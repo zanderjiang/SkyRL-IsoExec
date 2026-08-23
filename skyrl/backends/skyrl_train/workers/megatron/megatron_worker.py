@@ -1110,11 +1110,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
-        # isoexec Phase 2: build + log the composition contract identities on the TRAINER side.
-        # Both runtimes build the SAME complete (op,site)->impl contract from the same
-        # code+model+arch, so their identities match by construction; a differing [ISOEXEC-CONTRACT]
-        # hash across the two process logs is a composition split-brain (the #1 failure mode).
-        # Build+log only; wrapped so it can never break the run. See core/process_contract.py.
+        # isoexec Phase 2: the ContractAdapter drives the trainer's enforcement sequence -- build
+        # the composition contract (fail-soft, as before), check EVERY contract claim against the
+        # deployed trainer facts, run the install path below, close the INSTALL boundary. Both
+        # runtimes build the SAME complete (op,site)->impl contract from the same code+model+arch,
+        # so their identities match by construction; a differing [ISOEXEC-CONTRACT] hash across the
+        # two process logs is a composition split-brain (the #1 failure mode).
         if os.environ.get("SKYRL_ISOEXEC"):
             # NCCL pin A/B EVIDENCE, read from the WORKER's own environment (the ray runtime env is
             # what the driver *asked* for; this is what the process actually got, which is the only
@@ -1130,230 +1131,247 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 f"(SKYRL_ISOEXEC_NCCL_PIN={os.environ.get('SKYRL_ISOEXEC_NCCL_PIN', '1')})",
                 flush=True,
             )
-            try:
-                from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
-                    get_process_contract,
-                )
 
-                get_process_contract(model_path)
-            except Exception as _e:  # pragma: no cover - never fatal
-                logger.warning(f"[ISOEXEC-CONTRACT] trainer contract build skipped: {_e}")
-        # initialize the bridge and provider objects
-        self.init_configs(
-            model_path,
-            self.cfg.policy.megatron_config,
-            self.cfg.policy.megatron_config.model_config_kwargs,
-            self.cfg.policy.megatron_config.transformer_config_kwargs,
-            bf16=self.cfg.bf16,
-            flash_attn=self.cfg.flash_attn,
-            language_model_only=self.cfg.policy.language_model_only,
-        )
-
-        if self.enable_router_replay:
-            from skyrl.backends.skyrl_train.utils.replay_utils import (
-                patch_topk_router_layer_number,
+        def _isoexec_install():
+            # initialize the bridge and provider objects
+            self.init_configs(
+                model_path,
+                self.cfg.policy.megatron_config,
+                self.cfg.policy.megatron_config.model_config_kwargs,
+                self.cfg.policy.megatron_config.transformer_config_kwargs,
+                bf16=self.cfg.bf16,
+                flash_attn=self.cfg.flash_attn,
+                language_model_only=self.cfg.policy.language_model_only,
             )
 
-            patch_topk_router_layer_number()
-
-        # Freeze MoE router params before optimizer build.
-        # Megatron's DistributedOptimizer reads requires_grad at construction.
-        if self.cfg.policy.megatron_config.freeze_moe_router:
-            if self._rank == 0:
-                logger.info("freeze_moe_router=True: freezing MoE router params")
-            self.provider.register_pre_wrap_hook(freeze_moe_router)
-
-        # wrap with DDP for training
-        wrap_with_ddp = not self.cfg.policy.inference_only_init
-        self.actor_module = self.make_megatron_module(
-            wrap_with_ddp=wrap_with_ddp,
-            ddp_config=self.cfg.policy.megatron_config.ddp_config if wrap_with_ddp else None,
-            lora_config=self.cfg.policy.model.lora if self._is_lora else None,
-            lora_type=self.cfg.policy.megatron_config.lora_config.lora_type,
-            bf16=self.cfg.bf16,
-        )
-        # SkyRL-IsoExec: match the trainer's attention kernel to the engine's. The trainer runs the
-        # local (no-TE) spec, where torch SDPA is a different kernel from the engine's and leaves
-        # large per-token rollout-vs-train logprob outliers; swapping core_attention to the same
-        # torch varlen kernel, alongside the batch-invariant non-attention ops, puts the pre-update
-        # scoring gate at the numerical floor.
-        if os.environ.get("SKYRL_ISOEXEC") == "1":
-            if (
-                os.environ.get("SKYRL_ISOEXEC_LOCAL_SPEC") == "1"
-                and os.environ.get("SKYRL_ISOEXEC_VARLEN_ATTN", "1") == "1"
-            ):
-                from skyrl.backends.skyrl_train.isoexec.ops.attention.megatron_varlen_attn import (
-                    enable_trainer_batch_invariant,
-                    swap_trainer_core_attention_varlen,
+            if self.enable_router_replay:
+                from skyrl.backends.skyrl_train.utils.replay_utils import (
+                    patch_topk_router_layer_number,
                 )
 
-                if os.environ.get("SKYRL_ISOEXEC_BATCH_INVARIANT", "1") == "1":
-                    enable_trainer_batch_invariant()
-                swap_trainer_core_attention_varlen(self.actor_module)
-            else:
-                print(
-                    "[ISOEXEC-TRAINER] SKIPPED trainer attention match "
-                    "(requires SKYRL_ISOEXEC_LOCAL_SPEC=1 and SKYRL_ISOEXEC_VARLEN_ATTN=1)",
-                    flush=True,
-                )
+                patch_topk_router_layer_number()
 
-        # SkyRL-IsoExec: bitwise auto-fusion sites (isoexec/autofuse/sites.py). Applies on both the
-        # TE and local-spec paths; inert one-liner unless SKYRL_ISOEXEC_AUTOFUSE=1 (default 0).
-        # Decisions are CONSUMED from the shared fusion ledger (never made here), each admitted
-        # shape re-proves bit-equality against eager on live operands once per process, and the
-        # manifest-handshake pin (registered at isoexec package import, Tier-0.3) turns a
-        # trainer<->engine flag/ledger split-brain into a weight-sync refusal. Wrapped: a wiring
-        # failure demotes to eager per site and must never break worker init.
-        if os.environ.get("SKYRL_ISOEXEC") == "1":
-            try:
-                from skyrl.backends.skyrl_train.isoexec.autofuse.sites import (
-                    install_autofuse_sites,
-                    selected_autofuse_requires_exact_install,
-                )
+            # Freeze MoE router params before optimizer build.
+            # Megatron's DistributedOptimizer reads requires_grad at construction.
+            if self.cfg.policy.megatron_config.freeze_moe_router:
+                if self._rank == 0:
+                    logger.info("freeze_moe_router=True: freezing MoE router params")
+                self.provider.register_pre_wrap_hook(freeze_moe_router)
 
-                install_autofuse_sites("trainer")
-            except Exception as _af_e:  # pragma: no cover - fail-to-eager, never fail the worker
+            # wrap with DDP for training
+            wrap_with_ddp = not self.cfg.policy.inference_only_init
+            self.actor_module = self.make_megatron_module(
+                wrap_with_ddp=wrap_with_ddp,
+                ddp_config=self.cfg.policy.megatron_config.ddp_config if wrap_with_ddp else None,
+                lora_config=self.cfg.policy.model.lora if self._is_lora else None,
+                lora_type=self.cfg.policy.megatron_config.lora_config.lora_type,
+                bf16=self.cfg.bf16,
+            )
+            # SkyRL-IsoExec: match the trainer's attention kernel to the engine's. The trainer runs the
+            # local (no-TE) spec, where torch SDPA is a different kernel from the engine's and leaves
+            # large per-token rollout-vs-train logprob outliers; swapping core_attention to the same
+            # torch varlen kernel, alongside the batch-invariant non-attention ops, puts the pre-update
+            # scoring gate at the numerical floor.
+            if os.environ.get("SKYRL_ISOEXEC") == "1":
                 if (
-                    "selected_autofuse_requires_exact_install" in locals()
-                    and selected_autofuse_requires_exact_install()
+                    os.environ.get("SKYRL_ISOEXEC_LOCAL_SPEC") == "1"
+                    and os.environ.get("SKYRL_ISOEXEC_VARLEN_ATTN", "1") == "1"
                 ):
-                    raise RuntimeError(
-                        "selected AUTOFUSE ledger has admitted artifacts but trainer installation failed"
-                    ) from _af_e
-                print(f"[ISOEXEC-AUTOFUSE] trainer install skipped on error: {_af_e}", flush=True)
+                    from skyrl.backends.skyrl_train.isoexec.ops.attention.megatron_varlen_attn import (
+                        enable_trainer_batch_invariant,
+                        swap_trainer_core_attention_varlen,
+                    )
 
-        # SkyRL-IsoExec: TP/EP-INVARIANT row-parallel (pik). Lets the trainer keep its production
-        # tensor-parallel size while the rollout engine runs a different one and the rollout<->train
-        # KL stays exactly 0 -- the row-parallel K-reduction follows a fixed leaf tree independent of
-        # TP (see isoexec/pik_tp_invariant.py). No-op unless SKYRL_ISOEXEC_PIK=1. Applies on both the TE
-        # and selective-TE/local-spec paths: selective TE deliberately assigns every row-parallel
-        # role to megatron.core RowParallelLinear, which is the exact class this patch intercepts.
-        if os.environ.get("SKYRL_ISOEXEC") == "1" and os.environ.get("SKYRL_ISOEXEC_PIK") == "1":
-            from skyrl.backends.skyrl_train.isoexec.ops.collectives.pik_tp_invariant import (
-                apply_pik_tp_invariant,
-            )
+                    if os.environ.get("SKYRL_ISOEXEC_BATCH_INVARIANT", "1") == "1":
+                        enable_trainer_batch_invariant()
+                    swap_trainer_core_attention_varlen(self.actor_module)
+                else:
+                    print(
+                        "[ISOEXEC-TRAINER] SKIPPED trainer attention match "
+                        "(requires SKYRL_ISOEXEC_LOCAL_SPEC=1 and SKYRL_ISOEXEC_VARLEN_ATTN=1)",
+                        flush=True,
+                    )
 
-            apply_pik_tp_invariant(side="TRAINER")
+            # SkyRL-IsoExec: bitwise auto-fusion sites (isoexec/autofuse/sites.py). Applies on both the
+            # TE and local-spec paths; inert one-liner unless SKYRL_ISOEXEC_AUTOFUSE=1 (default 0).
+            # Decisions are CONSUMED from the shared fusion ledger (never made here), each admitted
+            # shape re-proves bit-equality against eager on live operands once per process, and the
+            # manifest-handshake pin (registered at isoexec package import, Tier-0.3) turns a
+            # trainer<->engine flag/ledger split-brain into a weight-sync refusal. Wrapped: a wiring
+            # failure demotes to eager per site and must never break worker init.
+            if os.environ.get("SKYRL_ISOEXEC") == "1":
+                try:
+                    from skyrl.backends.skyrl_train.isoexec.autofuse.sites import (
+                        install_autofuse_sites,
+                        selected_autofuse_requires_exact_install,
+                    )
 
-        # TE-primitives mode keeps the exact LOCAL_SPEC model unchanged. Admission walks the final
-        # module tree after every IsoExec rebind, refuses any TE model owner, and instruments only
-        # Megatron's already-selected TE multi-tensor gradient-norm primitive.
-        if os.environ.get("SKYRL_ISOEXEC_TE_PRIMITIVES", "0") == "1":
-            from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.te_primitives import (
-                admit,
-            )
+                    install_autofuse_sites("trainer")
+                except Exception as _af_e:  # pragma: no cover - fail-to-eager, never fail the worker
+                    if (
+                        "selected_autofuse_requires_exact_install" in locals()
+                        and selected_autofuse_requires_exact_install()
+                    ):
+                        raise RuntimeError(
+                            "selected AUTOFUSE ledger has admitted artifacts but trainer installation failed"
+                        ) from _af_e
+                    print(f"[ISOEXEC-AUTOFUSE] trainer install skipped on error: {_af_e}", flush=True)
 
-            admit(self.actor_module)
-
-        # THE TRAINER'S INSTALL FINGERPRINT (design obligation 2, worklist F1). The IsoExec install
-        # sequence for this process is finished above; record what it actually bound and log the
-        # comparison against this process's manifest. Until F1 the fingerprint had ONE call site in
-        # the whole tree -- inside the vLLM RecurrentGDN branch -- so the trainer side of every
-        # composition was dark, and `validate_against_installed` had nothing to validate.
-        if os.environ.get("SKYRL_ISOEXEC") == "1":
-            if (
-                os.environ.get("SKYRL_ISOEXEC_NCCL_PIN", "1") == "0"
-                and int(self.cfg.policy.megatron_config.tensor_model_parallel_size) > 1
-                and os.environ.get("SKYRL_ISOEXEC_NCCL_TRANSPORT_BOUNDARY_REQUIREMENTS", "").strip()
-            ):
-                from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
-                    cached_contract_view,
+            # SkyRL-IsoExec: TP/EP-INVARIANT row-parallel (pik). Lets the trainer keep its production
+            # tensor-parallel size while the rollout engine runs a different one and the rollout<->train
+            # KL stays exactly 0 -- the row-parallel K-reduction follows a fixed leaf tree independent of
+            # TP (see isoexec/pik_tp_invariant.py). No-op unless SKYRL_ISOEXEC_PIK=1. Applies on both the TE
+            # and selective-TE/local-spec paths: selective TE deliberately assigns every row-parallel
+            # role to megatron.core RowParallelLinear, which is the exact class this patch intercepts.
+            if os.environ.get("SKYRL_ISOEXEC") == "1" and os.environ.get("SKYRL_ISOEXEC_PIK") == "1":
+                from skyrl.backends.skyrl_train.isoexec.ops.collectives.pik_tp_invariant import (
+                    apply_pik_tp_invariant,
                 )
-                from skyrl.backends.skyrl_train.isoexec.ops.collectives.nccl_identity import (
-                    assert_contract_matches,
-                    effective_identity,
-                )
 
-                _nccl_impl, _nccl_constants = effective_identity()
-                assert_contract_matches(
-                    cached_contract_view(),
-                    ("trainer_fwd", "trainer_score"),
-                    _nccl_impl,
-                    _nccl_constants,
-                )
-            self._isoexec_record_trainer_fingerprint()
+                apply_pik_tp_invariant(side="TRAINER")
 
-        if self._local_rank == 0 and not os.path.exists(
-            model_path
-        ):  # if not local path, try downloading model weights from huggingface
-            snapshot_download(model_path)  # will be no-op if already downloaded
-        torch.distributed.barrier()
-
-        if self._rank == 0:
-            print_model_size(self.actor_module[0])
-
-        # create profiler
-        if self.cfg.policy.megatron_config.torch_profiler_config.enable:
-            self.profiler = Profiler(self.cfg.policy.megatron_config.torch_profiler_config)
-
-        # create optimizer (skipped for inference-only flows; Megatron's
-        # DistributedOptimizer eagerly materializes fp32 master + AdamW state
-        # on GPU, which OOMs large MoE models on memory-constrained nodes)
-        if self.cfg.policy.inference_only_init:
-            self.optimizer = None
-            self.scheduler = None
-        else:
-            optim_config = init_megatron_optim_config(
-                self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
-            )
-            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+            # TE-primitives mode keeps the exact LOCAL_SPEC model unchanged. Admission walks the final
+            # module tree after every IsoExec rebind, refuses any TE model owner, and instruments only
+            # Megatron's already-selected TE multi-tensor gradient-norm primitive.
             if os.environ.get("SKYRL_ISOEXEC_TE_PRIMITIVES", "0") == "1":
                 from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.te_primitives import (
-                    census_optimizer,
+                    admit,
                 )
 
-                census_optimizer(self.optimizer, optim_config)
+                admit(self.actor_module)
 
-            # create scheduler
-            self.scheduler = get_megatron_optimizer_param_scheduler(
-                optimizer=self.optimizer,
-                config=self.cfg.policy.optimizer_config,
-                num_training_steps=num_training_steps,
-            )
-
-        # create worker model
-        self.model = MegatronModelWrapper(
-            config=self.cfg,
-            actor_module=self.actor_module,
-            actor_optimizer=self.optimizer,
-            policy_loss_fn=self.policy_loss_fn,
-        )
-
-        self.empty_cuda_cache = self.cfg.policy.megatron_config.empty_cuda_cache
-
-        # Enable expandable_segments after init so model weights stay in IPC-compatible
-        # standard CUDA memory; only subsequent activations use expandable segments.
-        self._set_expandable_segments(True)
-
-        # SkyRL-IsoExec: pay the trainer's NCCL communicator memory HERE, once, visibly.
-        # NCCL allocates per communicator AND per transport at first use, so without this
-        # the TP/EP/DP communicators materialize mid-step -- after vLLM has sized its KV
-        # pool -- and `wake_up(kv_cache)` OOMs. Only matters when the channel pin is off
-        # (pinned it is ~0.1 GiB/rank); the banner it prints is the input to the
-        # gpu_memory_utilization budget. No-op unless SKYRL_ISOEXEC_NCCL_PREWARM=1.
-        _nccl_prewarm_report = None
-        if os.environ.get("SKYRL_ISOEXEC_NCCL_PREWARM", "0") == "1":
-            _capability_mode = os.environ.get("SKYRL_ISOEXEC_NCCL_CAPABILITY_MODE", "off").strip().lower() or "off"
-            if _capability_mode == "enforce":
-                from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.nccl_transport_capabilities import (
-                    register_mpu_manifest,
-                )
-
-                _manifest_path = os.environ.get("SKYRL_ISOEXEC_NCCL_CAPABILITY_MANIFEST", "").strip()
-                if not _manifest_path:
-                    raise RuntimeError(
-                        "[ISOEXEC-NCCL-CAP] enforce mode requires "
-                        "SKYRL_ISOEXEC_NCCL_CAPABILITY_MANIFEST from an admitted full-step census"
+            # THE TRAINER'S INSTALL FINGERPRINT (design obligation 2, worklist F1). The IsoExec install
+            # sequence for this process is finished above; record what it actually bound and log the
+            # comparison against this process's manifest. Until F1 the fingerprint had ONE call site in
+            # the whole tree -- inside the vLLM RecurrentGDN branch -- so the trainer side of every
+            # composition was dark, and `validate_against_installed` had nothing to validate.
+            if os.environ.get("SKYRL_ISOEXEC") == "1":
+                if (
+                    os.environ.get("SKYRL_ISOEXEC_NCCL_PIN", "1") == "0"
+                    and int(self.cfg.policy.megatron_config.tensor_model_parallel_size) > 1
+                    and os.environ.get("SKYRL_ISOEXEC_NCCL_TRANSPORT_BOUNDARY_REQUIREMENTS", "").strip()
+                ):
+                    from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+                        cached_contract_view,
                     )
-                register_mpu_manifest(mpu, _manifest_path)
-            from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.nccl_prewarm import (
-                prewarm_trainer_nccl,
+                    from skyrl.backends.skyrl_train.isoexec.ops.collectives.nccl_identity import (
+                        assert_contract_matches,
+                        effective_identity,
+                    )
+
+                    _nccl_impl, _nccl_constants = effective_identity()
+                    assert_contract_matches(
+                        cached_contract_view(),
+                        ("trainer_fwd", "trainer_score"),
+                        _nccl_impl,
+                        _nccl_constants,
+                    )
+                self._isoexec_record_trainer_fingerprint()
+
+            if self._local_rank == 0 and not os.path.exists(
+                model_path
+            ):  # if not local path, try downloading model weights from huggingface
+                snapshot_download(model_path)  # will be no-op if already downloaded
+            torch.distributed.barrier()
+
+            if self._rank == 0:
+                print_model_size(self.actor_module[0])
+
+            # create profiler
+            if self.cfg.policy.megatron_config.torch_profiler_config.enable:
+                self.profiler = Profiler(self.cfg.policy.megatron_config.torch_profiler_config)
+
+            # create optimizer (skipped for inference-only flows; Megatron's
+            # DistributedOptimizer eagerly materializes fp32 master + AdamW state
+            # on GPU, which OOMs large MoE models on memory-constrained nodes)
+            if self.cfg.policy.inference_only_init:
+                self.optimizer = None
+                self.scheduler = None
+            else:
+                optim_config = init_megatron_optim_config(
+                    self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
+                )
+                self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+                if os.environ.get("SKYRL_ISOEXEC_TE_PRIMITIVES", "0") == "1":
+                    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.te_primitives import (
+                        census_optimizer,
+                    )
+
+                    census_optimizer(self.optimizer, optim_config)
+
+                # create scheduler
+                self.scheduler = get_megatron_optimizer_param_scheduler(
+                    optimizer=self.optimizer,
+                    config=self.cfg.policy.optimizer_config,
+                    num_training_steps=num_training_steps,
+                )
+
+            # create worker model
+            self.model = MegatronModelWrapper(
+                config=self.cfg,
+                actor_module=self.actor_module,
+                actor_optimizer=self.optimizer,
+                policy_loss_fn=self.policy_loss_fn,
             )
 
-            _nccl_prewarm_report = prewarm_trainer_nccl(tag="policy")
-        # A budgeted plan is not admitted until every lazy NCCL transport has materialized, the
-        # ProcessGroupNCCL option reads back exactly, and the measured non-torch charge fits.
-        self.strategy.verify_nccl_channels(_nccl_prewarm_report)
+            self.empty_cuda_cache = self.cfg.policy.megatron_config.empty_cuda_cache
+
+            # Enable expandable_segments after init so model weights stay in IPC-compatible
+            # standard CUDA memory; only subsequent activations use expandable segments.
+            self._set_expandable_segments(True)
+
+            # SkyRL-IsoExec: pay the trainer's NCCL communicator memory HERE, once, visibly.
+            # NCCL allocates per communicator AND per transport at first use, so without this
+            # the TP/EP/DP communicators materialize mid-step -- after vLLM has sized its KV
+            # pool -- and `wake_up(kv_cache)` OOMs. Only matters when the channel pin is off
+            # (pinned it is ~0.1 GiB/rank); the banner it prints is the input to the
+            # gpu_memory_utilization budget. No-op unless SKYRL_ISOEXEC_NCCL_PREWARM=1.
+            _nccl_prewarm_report = None
+            if os.environ.get("SKYRL_ISOEXEC_NCCL_PREWARM", "0") == "1":
+                _capability_mode = os.environ.get("SKYRL_ISOEXEC_NCCL_CAPABILITY_MODE", "off").strip().lower() or "off"
+                if _capability_mode == "enforce":
+                    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.nccl_transport_capabilities import (
+                        register_mpu_manifest,
+                    )
+
+                    _manifest_path = os.environ.get("SKYRL_ISOEXEC_NCCL_CAPABILITY_MANIFEST", "").strip()
+                    if not _manifest_path:
+                        raise RuntimeError(
+                            "[ISOEXEC-NCCL-CAP] enforce mode requires "
+                            "SKYRL_ISOEXEC_NCCL_CAPABILITY_MANIFEST from an admitted full-step census"
+                        )
+                    register_mpu_manifest(mpu, _manifest_path)
+                from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.nccl_prewarm import (
+                    prewarm_trainer_nccl,
+                )
+
+                _nccl_prewarm_report = prewarm_trainer_nccl(tag="policy")
+            # A budgeted plan is not admitted until every lazy NCCL transport has materialized, the
+            # ProcessGroupNCCL option reads back exactly, and the measured non-torch charge fits.
+            self.strategy.verify_nccl_channels(_nccl_prewarm_report)
+
+        # run_install: contract build (fail-soft) -> check_all_claims (REFUSING, strict default:
+        # a topology outside the claims must stop the run, not warn into it) -> the install path
+        # above -> INSTALL boundary of the obligation ledger (every check the contract derives for
+        # the trainer side must have a record by the end of init_model -- a required check that
+        # never ran refuses here as loudly as one that failed). Refusals propagate; internal
+        # ledger errors never do.
+        if os.environ.get("SKYRL_ISOEXEC"):
+            from skyrl.backends.skyrl_train.isoexec.core.adapter import set_process_adapter
+            from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+                MegatronContractAdapter,
+            )
+
+            set_process_adapter(
+                MegatronContractAdapter(
+                    model_path,
+                    megatron_config=self.cfg.policy.megatron_config,
+                    install_fn=_isoexec_install,
+                    world_size=self._world_size,
+                )
+            ).run_install(close=os.environ.get("SKYRL_ISOEXEC") == "1")
+        else:
+            _isoexec_install()
 
     def forward(
         self,

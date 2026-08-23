@@ -21,7 +21,17 @@ from skyrl.backends.skyrl_train.isoexec.models.policy import build_selections
 def _build():
     reg = build_registry(strict=True)
     sel = build_selections(qwen3_5.PROFILE, qwen3_5.EXCEPTIONS)
-    return reg, sel, build_execution_contract(reg, sel, arch="sm90", model=qwen3_5.MODEL)
+    # claims as in models/qwen3_5.build: delivery tests exercise the PRODUCTION contract.
+    p = qwen3_5.PROFILE
+    return reg, sel, build_execution_contract(
+        reg,
+        sel,
+        arch="sm90",
+        model=qwen3_5.MODEL,
+        topology=p.topology,
+        states=p.states,
+        tolerances=p.tolerances,
+    )
 
 
 def _no_env():

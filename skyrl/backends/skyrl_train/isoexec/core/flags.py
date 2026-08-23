@@ -1795,6 +1795,19 @@ FLAGS: List[Flag] = [
         "on the other.",
     ),
     Flag(
+        "ISOEXEC_CONTRACT_PATH",
+        "",
+        ("both",),
+        "path where every contract-building process writes contract.json (and enforce.py writes "
+        "the enforcement.json verdict beside it)",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+        notes="The enforcement audit proved the launcher-exported value reached NO actor -- the name was not in this "
+        "table, so actor_forwarding_tuple could not carry it and no worker ever wrote contract.json. Registered "
+        "on both channels so the artifact write hooks actually fire. Non-SKYRL_ name kept: existing launch "
+        "scripts and contract_delivery already spell it.",
+    ),
+    Flag(
         "SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL",
         "0",
         ("trainer",),

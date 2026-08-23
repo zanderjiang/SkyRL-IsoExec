@@ -54,6 +54,74 @@ class TrainerNcclAdmission:
 
 
 @dataclass(frozen=True)
+class TopologyAxisFact:
+    """One parallelism axis's proven envelope, declared with the gate that proved it.
+
+    ``kind="invariant"`` states the composition is bitwise-identical at every degree in ``domain``
+    and requires ``proof`` -- a repo-relative path to the colocated gate that measured it.
+    ``kind="pinned"`` states exactly one supported ``degree`` (with its ``collective_plan``).
+    These derive the contract's ``TopologyClaim``s verbatim; an undeclarable axis is simply absent,
+    and absence means "no claim", never "any value".
+    """
+
+    axis: str
+    kind: str
+    degree: Optional[int] = None
+    collective_plan: Optional[str] = None
+    domain: Tuple[int, ...] = ()
+    proof: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("pinned", "invariant"):
+            raise ProfileError(f"topology axis {self.axis!r}: unknown kind {self.kind!r}")
+        if self.kind == "pinned" and (self.degree is None or self.collective_plan is None):
+            raise ProfileError(f"topology axis {self.axis!r}: pinned requires degree and collective_plan")
+        if self.kind == "invariant" and (not self.domain or not self.proof):
+            raise ProfileError(
+                f"topology axis {self.axis!r}: invariant requires a non-empty proven domain AND a "
+                "proof ref (the colocated gate that measured it); an unproven domain is not declarable"
+            )
+
+
+@dataclass(frozen=True)
+class StateFact:
+    """One engine-side state pool's lifecycle fact: what invalidates it and the EXISTING hook that
+    implements the invalidation. Declaration only -- ``ref`` names code that already runs
+    (``"path/inside/isoexec.py::symbol"``); it never introduces hook machinery of its own."""
+
+    state_id: str
+    invalidated_by: Tuple[str, ...]
+    replay_safe: bool
+    ref: str
+
+    def __post_init__(self) -> None:
+        if not self.state_id or not self.invalidated_by or not self.ref:
+            raise ProfileError(
+                f"state fact {self.state_id!r}: requires a non-empty invalidated_by and a ref "
+                "naming the existing hook (a claim with no implementing hook is prose)"
+            )
+
+
+@dataclass(frozen=True)
+class ToleranceFact:
+    """An accepted numeric envelope for one case pair. Bounds are decimal STRINGS (threshold text,
+    hashed as declared), never parsed floats."""
+
+    case_pair: Tuple[str, str]
+    bounds: Tuple[Tuple[str, str], ...]
+    attributed_to: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.case_pair) != 2 or not self.bounds:
+            raise ProfileError(f"tolerance fact {self.case_pair!r}: requires a 2-case pair and bounds")
+        for k, v in self.bounds:
+            try:
+                float(v)
+            except (TypeError, ValueError):
+                raise ProfileError(f"tolerance fact {self.case_pair!r}: bound {k}={v!r} is not a decimal string")
+
+
+@dataclass(frozen=True)
 class RouterProfile:
     """The MoE router's shape: decides which ``moe.router`` impl is eligible and the pins that ride along.
 
@@ -87,8 +155,6 @@ class ModelProfile:
     zero_centered_norms: gamma applied as ``* (1 + w)``. A function difference, not a constant, so
                         ``norms.rms`` has two impls; the engine's fused twin exists only for this form.
     tensor_parallel:    TP>1 anywhere, i.e. the pik collectives install. At TP=1 they carry no entry.
-    has_context_layout_manual_op: bring-up supplied an audited attention context-layout manual op.
-                        Capability evidence, so it is excluded from live-config structural equality.
     gdn_kernel:         which GDN core kernel is pinned. Decides two ops: the ``gdn.core`` kernel pin
                         and, since chunk_synced owns its own state pool, the engine's ``gdn.state``.
     gdn_chunk_size:     C, the chunk-boundary period; only reaches the manifest under
@@ -108,7 +174,6 @@ class ModelProfile:
     has_moe: bool = False
     zero_centered_norms: bool = True
     tensor_parallel: bool = True
-    has_context_layout_manual_op: bool = field(default=False, compare=False)
     router: Optional[RouterProfile] = None
     gdn_kernel: str = "recurrent"
     gdn_chunk_size: int = 64
@@ -120,6 +185,13 @@ class ModelProfile:
     # Admission evidence, not an architecture discriminator. Excluded from profile equality so
     # reconciliation cannot mistake a composition capability for structure.
     trainer_nccl_admissions: Tuple[TrainerNcclAdmission, ...] = field(default=(), compare=False)
+    # Proven parallelism envelopes (TopologyAxisFact per axis) -> contract TopologyClaims. Proof
+    # evidence like the NCCL admissions, so excluded from live-config structural equality.
+    topology: Tuple[TopologyAxisFact, ...] = field(default=(), compare=False)
+    # Lifecycle facts (StateFact) -> contract StateClaims; each names its existing hook.
+    states: Tuple[StateFact, ...] = field(default=(), compare=False)
+    # Accepted numeric envelopes (ToleranceFact) -> contract ToleranceClaims.
+    tolerances: Tuple[ToleranceFact, ...] = field(default=(), compare=False)
     notes: str = ""
     # Provenance: "declared" (a models/*.py file) or "config" (read off a live provider).
     source: str = "declared"
@@ -136,6 +208,9 @@ class ModelProfile:
         admitted = [tuple(item.effective_constants().items()) for item in self.trainer_nccl_admissions]
         if len(admitted) != len(set(admitted)):
             raise ProfileError(f"{self.model!r}: duplicate trainer NCCL admission for one effective tuple")
+        axes = [t.axis for t in self.topology]
+        if len(axes) != len(set(axes)):
+            raise ProfileError(f"{self.model!r}: duplicate topology axis declaration")
 
     def op_families(self) -> frozenset:
         """Which op families this architecture needs, for comparison against the registry."""

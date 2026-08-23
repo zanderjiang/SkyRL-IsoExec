@@ -335,6 +335,19 @@ def state_layer_cls():
                 log_fingerprint_once(cached_contract_view(), tag="engine_first_forward")
             except Exception as _e:  # pragma: no cover - never fatal
                 logger.warning(f"[ISOEXEC-FINGERPRINT] gdn.state record skipped: {_e}")
+            # FIRST_FORWARD boundary, outside the fail-soft block above, via the process's
+            # ContractAdapter: fingerprint compare (once per tag), the delivered-composition
+            # backstop (validate_contract_against_installed), and the phase close refusing any
+            # contract-derived fingerprint obligation with no record. Deliberate refusals propagate.
+            from ...core.adapter import process_adapter
+
+            _adapter = process_adapter()
+            if _adapter is not None:
+                _adapter.on_first_forward()
+            else:  # no adapter constructed in this process (direct-model tests): plain boundary
+                from ...core.enforce import first_forward_boundary
+
+                first_forward_boundary("engine")
             self._cc.conv_weight, self._cc.conv_bias = conv_weight, conv_bias
             self._cc.A_log, self._cc.dt_bias = gdn.A_log, gdn.dt_bias
             return self._cc

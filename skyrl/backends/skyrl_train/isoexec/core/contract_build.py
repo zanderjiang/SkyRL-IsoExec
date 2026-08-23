@@ -27,6 +27,9 @@ from ..contract import (
     Identities,
     ImplRef,
     ModelRef,
+    StateClaim,
+    ToleranceClaim,
+    TopologyClaim,
     compute_identities,
     validate_or_raise,
 )
@@ -194,12 +197,62 @@ def _group_discharge(registry: Registry, op: str, entries: dict) -> Optional[Equ
     )
 
 
+def derive_topology_claims(topology) -> tuple:
+    """Project the profile's declared ``TopologyAxisFact``s into contract ``TopologyClaim``s.
+
+    Pure projection, no invention: every degree/domain/proof is the profile's recorded fact
+    (``models/profile.TopologyAxisFact`` already refuses an invariant axis with no proven domain or
+    no proof ref). Sorted by axis so declaration order never moves the hash.
+    """
+    claims = []
+    for t in sorted(topology or (), key=lambda t: t.axis):
+        claims.append(
+            TopologyClaim(
+                axis=t.axis,
+                kind=t.kind,
+                degree=t.degree,
+                collective_plan=t.collective_plan,
+                domain=tuple(t.domain),
+                proof=t.proof,
+            )
+        )
+    return tuple(claims)
+
+
+def derive_state_claims(states) -> tuple:
+    """Profile ``StateFact``s -> contract ``StateClaim``s, verbatim and sorted by state_id."""
+    return tuple(
+        StateClaim(
+            state_id=s.state_id,
+            invalidated_by=tuple(s.invalidated_by),
+            replay_safe=bool(s.replay_safe),
+            ref=s.ref,
+        )
+        for s in sorted(states or (), key=lambda s: s.state_id)
+    )
+
+
+def derive_tolerance_claims(tolerances) -> tuple:
+    """Profile ``ToleranceFact``s -> contract ``ToleranceClaim``s, verbatim and sorted by pair."""
+    return tuple(
+        ToleranceClaim(
+            case_pair=tuple(t.case_pair),
+            bounds=tuple(t.bounds),
+            attributed_to=tuple(t.attributed_to),
+        )
+        for t in sorted(tolerances or (), key=lambda t: t.case_pair)
+    )
+
+
 def build_execution_contract(
     registry: Registry,
     selections: Dict,
     arch: str = ARCH,
     model: Optional[str] = None,
     profile=None,
+    topology=(),
+    states=(),
+    tolerances=(),
     validate_pins: bool = True,
     allow_non_accelerator_arch: bool = False,
 ) -> ExecutionContract:
@@ -290,7 +343,11 @@ def build_execution_contract(
         identities=Identities("", "", ""),
         cases=cases,
         composition=tuple(composition),
-        claims=Claims(),
+        claims=Claims(
+            topology=derive_topology_claims(topology),
+            state=derive_state_claims(states),
+            tolerances=derive_tolerance_claims(tolerances),
+        ),
     )
     contract = dataclasses.replace(contract, identities=compute_identities(contract))
     required = {

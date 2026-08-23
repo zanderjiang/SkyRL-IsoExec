@@ -197,6 +197,20 @@ def _assert_plan_matches_manifest(side: str, plan) -> None:
         problems.append(f"leaves: manifest pins {want_leaves}, env built G={plan.num_leaves}")
     if want_dtype is not None and str(want_dtype) != have_dtype:
         problems.append(f"leaf_dtype: manifest pins {want_dtype!r}, env built {have_dtype!r}")
+    # Reporter: the one refusing pin check the audit found reachable. Fail-safe, verdict unchanged.
+    try:
+        from ...core import enforce
+        from ...core.fingerprint import ENGINE_SITES, TRAINER_SITES
+
+        for site in {"ENGINE": ENGINE_SITES, "TRAINER": TRAINER_SITES}.get(side, ()):
+            enforce.report(
+                f"fingerprint:collectives.tree_all_reduce:{site}",
+                enforce.INSTALL,
+                enforce.OK if not problems else enforce.VIOLATION,
+                "; ".join(problems) or f"plan leaves={plan.num_leaves} leaf_dtype={have_dtype} match the pins",
+            )
+    except Exception as _e:  # pragma: no cover - never fatal
+        logger.warning(f"[ISOEXEC-ENFORCE] pik plan report skipped: {_e}")
     if not problems:
         return
     msg = (

@@ -428,6 +428,35 @@ class Worker(DistributedTorchRayActor):
         except Exception:  # pragma: no cover - legacy non-IsoExec compatibility
             pass
 
+        # WEIGHT_SYNC boundary (trainer side): the stamp above IS the trainer's half of the
+        # handshake -- record it and close the phase, serializing this process's enforcement.json
+        # verdict, through the process's ContractAdapter (a worker without one -- non-Megatron
+        # backends -- keeps the plain report + close). Outside the fail-soft block so a deliberate
+        # ledger refusal propagates; the helpers themselves swallow internal errors.
+        if os.environ.get("SKYRL_ISOEXEC") == "1":
+            try:
+                from skyrl.backends.skyrl_train.isoexec.core.adapter import process_adapter
+                from skyrl.backends.skyrl_train.isoexec.core.enforce import (
+                    WEIGHT_SYNC,
+                    report,
+                    weight_sync_boundary,
+                )
+
+                stamped = getattr(init_info, "contract_hash", None)
+                adapter = process_adapter()
+                if adapter is not None:
+                    adapter.on_weight_sync(stamped)
+                else:
+                    if stamped is not None:
+                        report("handshake:numerical_policy", WEIGHT_SYNC, "ok", f"stamped composite={stamped}")
+                    else:
+                        report(
+                            "handshake:numerical_policy", WEIGHT_SYNC, "skipped", "no local contract; stamped nothing"
+                        )
+                    weight_sync_boundary("trainer")
+            except ImportError:  # pragma: no cover - legacy non-IsoExec compatibility
+                pass
+
         # Create sender on all ranks
         # Strategy implementations may have different logic for different ranks
         tasks = [

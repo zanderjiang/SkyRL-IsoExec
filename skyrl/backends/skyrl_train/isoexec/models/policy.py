@@ -121,15 +121,6 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
     put("attention.varlen", TRAINER, impl="varlen_custom", pinned={"num_splits": 1})
     put("attention.varlen", ENGINE, impl="vllm_flash_ns1", pinned={"num_splits": 1, "fa_version": 3})
 
-    # Optional manual ownership declared by model bring-up. The flag determines runtime service, not
-    # composition identity: both trainer sites stay explicit so an enabled installer is never unowned.
-    if profile.has_context_layout_manual_op:
-        put(
-            "attention.qwen35_context_layout",
-            TRAINER,
-            impl="qwen35_context_layout_sm90a",
-        )
-
     # Rotary.
     put("rope.rope", TRAINER, impl="eager")
     put("rope.rope", ENGINE, impl="fused")

@@ -43,6 +43,29 @@ ISOEXEC_FORWARD_GATE_KEYS = tuple(f"{ISOEXEC_FORWARD_GATE_PREFIX}_{stat}" for st
 # bit-pattern contracts.
 ISOEXEC_FORWARD_GATE_MEAN_MAX = 1.0e-5
 ISOEXEC_FORWARD_GATE_MAX_MAX = 1.0e-4
+ISOEXEC_FORWARD_GATE_CASE_PAIR = ("engine_decode", "trainer_score")
+
+
+def isoexec_gate_limits() -> Tuple[float, float]:
+    """``(mean_max, max_max)`` for the forward gate.
+
+    Where this process built an ExecutionContract, the contract's ToleranceClaim for the
+    (engine_decode, trainer_score) pair is authoritative -- the envelope is contract data, hashed
+    into the deployment identity, not a controller constant. The module constants remain the
+    fallback for processes with no contract (e.g. a CPU driver, which cannot build one).
+    """
+    try:
+        from skyrl.backends.skyrl_train.isoexec.core.process_contract import cached_contract
+
+        c = cached_contract()
+        if c is not None:
+            for t in c.claims.tolerances:
+                if tuple(t.case_pair) == ISOEXEC_FORWARD_GATE_CASE_PAIR:
+                    b = dict(t.bounds)
+                    return float(b["abs_diff_mean_max"]), float(b["abs_diff_max_max"])
+    except Exception:  # noqa: BLE001 -- limit resolution must never break the gate itself
+        pass
+    return ISOEXEC_FORWARD_GATE_MEAN_MAX, ISOEXEC_FORWARD_GATE_MAX_MAX
 
 
 def finalize_post_update_rollout_logprob_diff_std(metrics: Dict[str, float]) -> None:
@@ -65,6 +88,18 @@ def finalize_post_update_rollout_logprob_diff_std(metrics: Dict[str, float]) -> 
 
 # Backward-compatible import name; it now finalizes the explicitly named post-update series.
 finalize_minibatch_rollout_logprob_diff_std = finalize_post_update_rollout_logprob_diff_std
+
+
+def _report_isoexec_gate(result: str, evidence: str) -> None:
+    # Reporter: the tolerance gate's verdict into the obligation ledger. Fail-safe; the gate's own
+    # refusal logic is unchanged and remains the enforcement.
+    try:
+        from skyrl.backends.skyrl_train.isoexec.core import enforce
+
+        pair = ISOEXEC_FORWARD_GATE_CASE_PAIR
+        enforce.report(f"gate:{pair[0]}|{pair[1]}", enforce.STEP1, result, evidence)
+    except Exception:  # noqa: BLE001 -- reporting must never break the gate
+        pass
 
 
 def validate_isoexec_forward_gate(
@@ -97,6 +132,7 @@ def validate_isoexec_forward_gate(
                 f"canonical key(s) were emitted: {emitted}."
             )
         metrics["policy/isoexec_forward_gate_audited"] = 0.0
+        _report_isoexec_gate("skipped", "sampled non-audit step (scoring_audit_skipped)")
         return False
     if missing or invalid:
         details = []
@@ -104,6 +140,7 @@ def validate_isoexec_forward_gate(
             details.append(f"missing={missing}")
         if invalid:
             details.append(f"non_finite_or_non_numeric={invalid}")
+        _report_isoexec_gate("violation", "incomplete canonical gate: " + "; ".join(details))
         raise RuntimeError(
             "[ISOEXEC-GATE] REFUSED before backward: canonical identical-weight gate from the "
             "pre-update scoring phase is incomplete (" + "; ".join(details) + "). "
@@ -113,22 +150,24 @@ def validate_isoexec_forward_gate(
     mean = float(metrics[f"{ISOEXEC_FORWARD_GATE_PREFIX}_mean"])
     minimum = float(metrics[f"{ISOEXEC_FORWARD_GATE_PREFIX}_min"])
     maximum = float(metrics[f"{ISOEXEC_FORWARD_GATE_PREFIX}_max"])
-    if (
-        minimum < 0.0
-        or maximum < mean
-        or mean > ISOEXEC_FORWARD_GATE_MEAN_MAX
-        or maximum > ISOEXEC_FORWARD_GATE_MAX_MAX
-    ):
+    mean_limit, max_limit = isoexec_gate_limits()
+    if minimum < 0.0 or maximum < mean or mean > mean_limit or maximum > max_limit:
+        _report_isoexec_gate(
+            "violation",
+            f"min={minimum:.9e} mean={mean:.9e} max={maximum:.9e} outside mean_limit={mean_limit:.1e} "
+            f"max_limit={max_limit:.1e}",
+        )
         raise RuntimeError(
             "[ISOEXEC-GATE] RED before backward: the canonical identical-weight scoring gate "
             f"is outside its admitted range (min={minimum:.9e}, mean={mean:.9e}, "
-            f"max={maximum:.9e}, mean_limit={ISOEXEC_FORWARD_GATE_MEAN_MAX:.1e}, "
-            f"max_limit={ISOEXEC_FORWARD_GATE_MAX_MAX:.1e}). "
+            f"max={maximum:.9e}, mean_limit={mean_limit:.1e}, "
+            f"max_limit={max_limit:.1e}). "
             "A finite value is not sufficient evidence of IsoExec."
         )
     metrics["policy/isoexec_forward_gate_audited"] = 1.0
-    metrics["policy/isoexec_forward_gate_mean_limit"] = ISOEXEC_FORWARD_GATE_MEAN_MAX
-    metrics["policy/isoexec_forward_gate_max_limit"] = ISOEXEC_FORWARD_GATE_MAX_MAX
+    metrics["policy/isoexec_forward_gate_mean_limit"] = mean_limit
+    metrics["policy/isoexec_forward_gate_max_limit"] = max_limit
+    _report_isoexec_gate("ok", f"mean={mean:.3e} max={maximum:.3e} within ({mean_limit:.1e}, {max_limit:.1e})")
     return True
 
 

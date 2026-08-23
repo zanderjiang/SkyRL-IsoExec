@@ -140,14 +140,32 @@ def assert_contract_matches(view, sites, impl_id: str, constants: Mapping[str, s
         raise RuntimeError("active NCCL composition cannot be admitted because the process contract is unavailable")
     actual = dict(constants)
     problems = []
+    per_site = {}
     for site in sites:
         entry = view.get(("collectives.nccl_pin", site))
         if entry is None:
-            problems.append(f"{site}: contract has no collectives.nccl_pin entry")
+            per_site[site] = f"{site}: contract has no collectives.nccl_pin entry"
         elif entry["impl_id"] != impl_id or entry["pinned_constants"] != actual:
-            problems.append(
-                f"{site}: contract={entry['impl_id']!r}/{entry['pinned_constants']!r} " f"runtime={impl_id!r}/{actual!r}"
+            per_site[site] = (
+                f"{site}: contract={entry['impl_id']!r}/{entry['pinned_constants']!r} "
+                f"runtime={impl_id!r}/{actual!r}"
             )
+        else:
+            per_site[site] = None
+    problems = [p for p in per_site.values() if p]
+    # Reporter: the runtime NCCL tuple vs the contract, per site. Fail-safe, verdict unchanged.
+    try:
+        from ...core import enforce
+
+        for site, p in per_site.items():
+            enforce.report(
+                f"fingerprint:collectives.nccl_pin:{site}",
+                enforce.INSTALL,
+                enforce.OK if p is None else enforce.VIOLATION,
+                p or census(impl_id, actual),
+            )
+    except Exception:  # pragma: no cover - never fatal
+        pass
     if problems:
         raise RuntimeError(
             "[ISOEXEC-NCCL-MANIFEST] effective ALGO/MIN/MAX disagrees with the frozen contract; "

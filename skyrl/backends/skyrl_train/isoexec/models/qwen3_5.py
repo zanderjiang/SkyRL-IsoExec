@@ -7,8 +7,18 @@ EP=engine_prefill, ED=engine_decode.
 
 from __future__ import annotations
 
+import os
+
 from .policy import build_selections
-from .profile import SCORE_SOFTMAX, ModelProfile, RouterProfile, TrainerNcclAdmission
+from .profile import (
+    SCORE_SOFTMAX,
+    ModelProfile,
+    RouterProfile,
+    StateFact,
+    ToleranceFact,
+    TopologyAxisFact,
+    TrainerNcclAdmission,
+)
 
 MODEL = "qwen3.5-35b-a3b"
 
@@ -26,7 +36,6 @@ PROFILE = ModelProfile(
     has_moe=True,
     zero_centered_norms=True,
     tensor_parallel=True,
-    has_context_layout_manual_op=True,
     router=RouterProfile(score_function=SCORE_SOFTMAX, expert_bias=False),
     gdn_kernel="recurrent",
     ssm_cache_dtype="float32",
@@ -44,6 +53,70 @@ PROFILE = ModelProfile(
             ),
         ),
     ),
+    # Proven parallelism envelopes -> contract TopologyClaims. Each value is grounded in a
+    # colocated recorded gate, not asserted here:
+    #   TP  -- the pik leaf-tree row-parallel output is bitwise-identical to the TP=1 reference at
+    #          every world in the domain (divisors of pik_leaves=8), asserted by the named gate.
+    #   SP  -- trainer sequence parallelism on/off is the same expression: RS == AR-then-slice,
+    #          bitwise, on both transports, at the tested TP sizes.
+    #   PP  -- pinned 1: no pipeline entry anywhere in the composition; the engine adapter forces
+    #          pipeline_model_parallel_size=1 (runtimes/vllm/gptmodel_vllm.py).
+    #   CP  -- pinned 1: the GDN packed-meta shim keeps every cp_size!=1 path unreachable until
+    #          the CP=1 tautology is discharged (the named gate pins that unreachability).
+    # EP is deliberately ABSENT: the trainer-EP8/engine-EP1 asymmetry has no recorded invariance
+    # gate in this tree, and an unproven domain is not declarable (profile.TopologyAxisFact refuses).
+    topology=(
+        TopologyAxisFact(
+            axis="TP",
+            kind="invariant",
+            domain=(1, 2, 4, 8),
+            proof="ops/collectives/tests/test_bf16_leaf_scheme_cpu.py",
+        ),
+        TopologyAxisFact(
+            axis="SP",
+            kind="invariant",
+            domain=(0, 1),
+            proof="ops/collectives/tests/test_tree_reduce_scatter_cpu.py",
+        ),
+        TopologyAxisFact(axis="PP", kind="pinned", degree=1, collective_plan="none"),
+        TopologyAxisFact(
+            axis="CP",
+            kind="pinned",
+            degree=1,
+            collective_plan="none",
+            proof="ops/gdn/tests/test_packed_meta_cache_cpu.py",
+        ),
+    ),
+    # Engine state lifecycle -> StateClaims. DECLARATIONS of hooks that already run, each ref
+    # naming the implementing code (checked for existence by the colocated core test):
+    #   engine_prefix_cache -- flush-on-sync invariant (lifecycle ordering check; the hard backstop
+    #       is the prefix-hit-without-held-state REFUSE in ops/gdn/gdn_recurrent_state.py).
+    #   gdn_recurrent_state -- sleep/wake re-allocates kv storage, so the state core rebinds on a
+    #       (data_ptr, shape) key change every call; weight sync bumps the sync epoch.
+    states=(
+        StateFact(
+            state_id="engine_prefix_cache",
+            invalidated_by=("weight_sync",),
+            replay_safe=True,
+            ref="lifecycle/ordering.py::check_prefix_cache_flush_on_sync",
+        ),
+        StateFact(
+            state_id="gdn_recurrent_state",
+            invalidated_by=("weight_sync", "sleep_wake"),
+            replay_safe=True,
+            ref="runtimes/vllm/gdn_engine_patch.py::_get_layer_state",
+        ),
+    ),
+    # The controller's forward acceptance gate (rollout logprobs vs identical-weight trainer
+    # scoring) -> a ToleranceClaim. Values are the qualified thresholds the gate enforced
+    # (skyrl/train/utils/trainer_utils.py); the gate now READS them back from this claim wherever
+    # a contract exists, so the envelope is contract data, not a controller constant.
+    tolerances=(
+        ToleranceFact(
+            case_pair=("engine_decode", "trainer_score"),
+            bounds=(("abs_diff_max_max", "1.0e-4"), ("abs_diff_mean_max", "1.0e-5")),
+        ),
+    ),
     notes="hybrid GDN+MoE; trainer alltoall/EP=8/ETP=1 against engine no-gather/EP=1/ETP=8",
 )
 
@@ -55,9 +128,9 @@ EXCEPTIONS: dict = {}
 # under it, so ``native_kv_cache`` is not selectable there. Declaring the variant here gives it a
 # contract entry and an identity of its own.
 #
-# Nothing reads ``SKYRL_ISOEXEC_GDN_KERNEL`` back into the profile, so a live chunk_synced process
-# still derives from ``PROFILE``; both runtimes read the same env var, so the handshake stays green
-# and the first-forward fingerprint is what arbitrates.
+# ``build()`` selects between the two by ``SKYRL_ISOEXEC_GDN_KERNEL`` when no profile is passed:
+# both runtimes read the same forwarded env var, so a matched pair derives the same variant and a
+# one-sided flip is a hash mismatch that refuses at the handshake.
 CHUNK_SYNCED_PROFILE = PROFILE.with_overrides(gdn_kernel="chunk_synced")
 
 # UN-SHARDED widths, derived from the checkpoint's config (NOT back-derived from the legacy
@@ -103,12 +176,22 @@ def gemm_census(*, tp: int, etp: int) -> list:
 def build(registry, *, arch=None, profile=None):
     """Build the Qwen3.5 ExecutionContract against a registry.
 
-    ``profile`` selects the variant -- ``PROFILE`` (recurrent) by default, or
-    ``CHUNK_SYNCED_PROFILE``. Same derivation, different hash, so a one-sided flip refuses to run.
+    ``profile`` selects the variant explicitly; by default it follows ``SKYRL_ISOEXEC_GDN_KERNEL``
+    (the value the read sites use), so the declaration matches what installs. Same derivation,
+    different hash, so a one-sided flip refuses to run.
     """
     from ..core.arch import ARCH
     from ..core.contract_build import build_execution_contract
 
+    if profile is None:
+        kernel = os.environ.get("SKYRL_ISOEXEC_GDN_KERNEL", "")
+        profile = CHUNK_SYNCED_PROFILE if kernel == "chunk_synced" else PROFILE
     return build_execution_contract(
-        registry, build_selections(profile or PROFILE, EXCEPTIONS), arch=arch or ARCH, model=MODEL
+        registry,
+        build_selections(profile, EXCEPTIONS),
+        arch=arch or ARCH,
+        model=MODEL,
+        topology=profile.topology,
+        states=profile.states,
+        tolerances=profile.tolerances,
     )

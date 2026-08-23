@@ -5,5 +5,6 @@ Claim -> test:
 - QKV subgroup all-gather admission predicates (fail-closed envelope) -> `test_qkv_subgroup_admission.py` (CPU, pytest)
 - QKV subgroup all-gather live bitwise proof -> `attn_qkv_subgroup_dist.py` (torchrun world>=2; skips elsewhere)
 
-Not covered here: `attention.qwen35_context_layout:qwen35_context_layout_sm90a` -- its module/cubin
-and GPU gate remain in the private repo. `*_gpu.py`/`*_dist.py` are run as files, not collected by pytest.
+`attention.qwen35_context_layout:qwen35_context_layout_sm90a` was deregistered from the public
+contract: its module/cubin and GPU gate remain in the private repo, so the public tree hashed an
+entry nothing could install or check. `*_gpu.py`/`*_dist.py` are run as files, not collected by pytest.
