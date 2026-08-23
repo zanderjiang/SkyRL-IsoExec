@@ -29,7 +29,7 @@ when it is off.
 
 - Code and layout: [`skyrl/backends/skyrl_train/isoexec/`](./skyrl/backends/skyrl_train/isoexec)
 - The contract: [`skyrl/backends/skyrl_train/isoexec/contract/`](./skyrl/backends/skyrl_train/isoexec/contract)
-- A matched IsoExec / native run pair: [`examples/train/isoexec/`](./examples/train/isoexec)
+- A matched IsoExec / native run pair: [`examples/isoexec/`](./examples/isoexec)
 
 Supported models: Qwen3 dense, Megatron MoE, and hybrid GatedDeltaNet (Qwen3.5).
 

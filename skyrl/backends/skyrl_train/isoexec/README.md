@@ -53,7 +53,7 @@ Supported models: Qwen3 dense, Megatron MoE, and hybrid GatedDeltaNet (Qwen3.5).
 
 ## Running it
 
-`examples/train/isoexec/` holds a matched pair — `run_qwen35_dapo_isoexec.sh` and
+`examples/isoexec/` holds a matched pair — `run_qwen35_dapo_isoexec.sh` and
 `run_qwen35_dapo_native.sh` — identical in every task-side knob so that any difference between the
 two runs is attributable to the stack. Build the pinned runtime first with
 `examples/isoexec/build_isoexec_env.sh` (see [`pinned-wheels/README.md`](../../../../pinned-wheels/README.md) for

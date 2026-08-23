@@ -5,7 +5,7 @@
 # skyrl config defaults. Build the runtime first: examples/isoexec/build_isoexec_env.sh
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 local_root=${ISOEXEC_LOCAL_ROOT:-${HOME}/isoexec}   # venvs, wheel cache, logs; override per site
 cd "${repo}"
 # Optional site preamble (cluster module loads, proxies, shared caches). Absent on most machines.
