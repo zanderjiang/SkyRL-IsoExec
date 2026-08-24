@@ -22,7 +22,10 @@ wheel_mirror=${ISOEXEC_WHEEL_MIRROR-https://github.com/zanderjiang/SkyRL-IsoExec
 build_jobs=${ISOEXEC_BUILD_JOBS:-$(nproc)}
 fla_dir=${ISOEXEC_FLA_SOURCE:-${repo}/third_party/flash-linear-attention}
 fla_commit=ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0
-py=3.12
+# Ray refuses a client whose CPython micro-version differs from the cluster head's -- match it
+# (e.g. ISOEXEC_PYTHON=3.12.12); uv fetches a managed build if none is on PATH.
+py=${ISOEXEC_PYTHON:-3.12}
+py_dir=3.12
 
 usage() { echo "usage: $0 [--wheels-only | --verify-only] [--replace]"; }
 refuse() { echo "REFUSAL: $*" >&2; exit 1; }
@@ -83,7 +86,7 @@ is_source_built() { local w; for w in "${source_built[@]}"; do [[ "${w}" == "$1"
 
 # ---------------------------------------------------------------- source builds
 install_cuda13() {  # install_cuda13 <venv>: nvcc 13.0 from wheels, laid out as a CUDA_HOME
-  local venv=$1 cuda=$1/lib/python${py}/site-packages/nvidia/cu13 f
+  local venv=$1 cuda=$1/lib/python${py_dir}/site-packages/nvidia/cu13 f
   uv pip install --python "${venv}/bin/python" \
     'nvidia-cuda-cccl==13.0.85' 'nvidia-cuda-crt==13.0.88' 'nvidia-cuda-nvcc==13.0.88' \
     'nvidia-cuda-runtime==13.0.96' 'nvidia-curand==10.4.0.35' 'nvidia-nvvm==13.0.88'
@@ -142,7 +145,7 @@ build_wheel() {  # build_wheel <name>: sources.txt recipe -> ${wheel_cache}/<nam
   ensure_toolchain
   src=${local_root}/src/$(dist_name "${name}")
   out=$(mktemp -d "${wheel_cache}/.build.XXXXXX")
-  cuda=${build_root}/lib/python${py}/site-packages/nvidia/cu13
+  cuda=${build_root}/lib/python${py_dir}/site-packages/nvidia/cu13
   log "building ${name} from ${source} (jobs=${build_jobs})"
   checkout_source "${source}" "${src}"
   SECONDS=0
@@ -280,7 +283,7 @@ build_runtime() {  # build_runtime <stage>
   is_source_built "$(basename "$(wheel_path '^transformer_engine_torch-')")" || extra+=("$(wheel_path '^transformer_engine_torch-')")
   uv pip install --no-config --python "${stage}/bin/python" --no-deps \
     'nvidia-cublas==13.2.0.9' 'transformer-engine==2.17.1' 'transformer-engine-cu13==2.17.1' "${extra[@]}"
-  lib=${stage}/lib/python${py}/site-packages/nvidia/cu13/lib
+  lib=${stage}/lib/python${py_dir}/site-packages/nvidia/cu13/lib
   ln -s libcublas.so.13 "${lib}/libcublas.so"
   ln -s libcublasLt.so.13 "${lib}/libcublasLt.so"
 }
