@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# Build and verify the two CUDA-13 environments used by the IsoExec launcher.
-#
-#   runtime  <local_root>/venvs/skyrl-isoexec-cu130   uv sync of the `isoexec` extra (+ TE 2.17.1)
-#   jit      <local_root>/venvs/skyrl-cuda130-jit     nvcc toolchain for FlashInfer/TE JIT
-#
-# Stages: wheels -> fla -> build (staged, atomic promote) -> verify. Every stage refuses on drift.
-# The wheels stage fills pinned-wheels/ — the directory uv.lock resolves the isoexec extra from —
-# with symlinks into ISOEXEC_WHEEL_CACHE. Each wheels.txt entry is fetched (ISOEXEC_WHEEL_MIRROR,
-# then upstream) and sha256-checked; one that cannot be fetched is built, as the last resort, from
-# its sources.txt recipe in a third venv, <local_root>/venvs/skyrl-cuda130-build (torch+nvcc+cmake+rust).
+# Build and verify the IsoExec runtime + JIT venvs. Fills pinned-wheels/ (the directory uv.lock
+# resolves the isoexec extra from) per wheels.txt: fetch from mirror/upstream, sha256-check, or as
+# a last resort build from the sources.txt recipe. See pinned-wheels/README.md.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -17,13 +10,12 @@ runtime_root=${ISOEXEC_RUNTIME_VENV:-${local_root}/venvs/skyrl-isoexec-cu130}
 jit_root=${ISOEXEC_JIT_VENV:-${local_root}/venvs/skyrl-cuda130-jit}
 build_root=${ISOEXEC_BUILD_VENV:-${local_root}/venvs/skyrl-cuda130-build}
 wheel_dir=${repo}/pinned-wheels
-wheel_cache=${ISOEXEC_WHEEL_CACHE:-${local_root}/wheels}   # fetched and built wheels live here
-wheel_mirror=${ISOEXEC_WHEEL_MIRROR-https://github.com/zanderjiang/SkyRL-IsoExec/releases/download/wheels-20260620}  # serves every wheels.txt filename ('+' as '.'); empty disables
+wheel_cache=${ISOEXEC_WHEEL_CACHE:-${local_root}/wheels}
+wheel_mirror=${ISOEXEC_WHEEL_MIRROR-https://github.com/zanderjiang/SkyRL-IsoExec/releases/download/wheels-20260620}  # empty disables
 build_jobs=${ISOEXEC_BUILD_JOBS:-$(nproc)}
 fla_dir=${ISOEXEC_FLA_SOURCE:-${repo}/third_party/flash-linear-attention}
 fla_commit=ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0
-# Ray refuses a client whose CPython micro-version differs from the cluster head's -- match it
-# (e.g. ISOEXEC_PYTHON=3.12.12); uv fetches a managed build if none is on PATH.
+# Ray refuses a client whose CPython micro-version differs from the cluster head's; match it here.
 py=${ISOEXEC_PYTHON:-3.12}
 py_dir=3.12
 
@@ -43,8 +35,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# ---------------------------------------------------------------- wheels
-fetch() {  # fetch <name> <dest> <upstream-url|->
+fetch() {  # <name> <dest> <upstream-url|->
   local name=$1 dest=$2 upstream=$3 url
   for url in ${wheel_mirror:+${wheel_mirror%/}/${name//+/.}} ${upstream#-}; do
     log "fetching ${name} from ${url}"
@@ -54,7 +45,7 @@ fetch() {  # fetch <name> <dest> <upstream-url|->
   return 1
 }
 
-source_built=()  # wheels.txt names whose file was built here (lock hash does not apply)
+source_built=()
 
 ensure_wheels() {
   local sha name upstream dest cached observed
@@ -84,8 +75,7 @@ wheel_path() { awk -v n="$1" '$2 ~ n {print $2}' "${wheel_dir}/wheels.txt" | sed
 dist_name() { local stem=${1%%-*}; echo "${stem//_/-}"; }
 is_source_built() { local w; for w in "${source_built[@]}"; do [[ "${w}" == "$1" ]] && return 0; done; return 1; }
 
-# ---------------------------------------------------------------- source builds
-install_cuda13() {  # install_cuda13 <venv>: nvcc 13.0 from wheels, laid out as a CUDA_HOME
+install_cuda13() {  # <venv>: nvcc 13.0 from wheels, laid out as a CUDA_HOME
   local venv=$1 cuda=$1/lib/python${py_dir}/site-packages/nvidia/cu13 f
   uv pip install --python "${venv}/bin/python" \
     'nvidia-cuda-cccl==13.0.85' 'nvidia-cuda-crt==13.0.88' 'nvidia-cuda-nvcc==13.0.88' \
@@ -98,7 +88,7 @@ install_cuda13() {  # install_cuda13 <venv>: nvcc 13.0 from wheels, laid out as 
   ln -sf /usr/lib64/libcuda.so.1 "${cuda}/lib/stubs/libcuda.so"
 }
 
-build_toolchain() {  # build_toolchain <stage>: pinned torch + its CUDA-13 libraries, nvcc, build tools
+build_toolchain() {  # <stage>
   local stage=$1
   uv venv --python "${py}" --relocatable "${stage}"
   uv pip install --python "${stage}/bin/python" "$(wheel_path '^torch-')" "$(wheel_path '^triton-')" \
@@ -119,7 +109,7 @@ ensure_toolchain() {
   mv -- "${stage}" "${build_root}"
 }
 
-checkout_source() {  # checkout_source <source> <dir>
+checkout_source() {  # <source> <dir>
   local source=$1 dir=$2 url ref sha
   rm -rf -- "${dir}"; mkdir -p "${dir}"
   case "${source}" in
@@ -137,7 +127,7 @@ checkout_source() {  # checkout_source <source> <dir>
   esac
 }
 
-build_wheel() {  # build_wheel <name>: sources.txt recipe -> ${wheel_cache}/<name> (+ .sha256)
+build_wheel() {  # <name>: sources.txt recipe -> ${wheel_cache}/<name>
   local name=$1 source build_env subdir src out cuda
   read -r source build_env < <(awk -v n="${name}" '$1 == n {$1 = ""; print substr($0, 2)}' "${wheel_dir}/sources.txt")
   [[ -n "${source:-}" ]] || return 1
@@ -164,7 +154,6 @@ build_wheel() {  # build_wheel <name>: sources.txt recipe -> ${wheel_cache}/<nam
   log "built ${name} in ${SECONDS}s: sha256 $(cat "${wheel_cache}/${name}.sha256")"
 }
 
-# ---------------------------------------------------------------- flash-linear-attention
 # Checked out, not installed -- see ops/gdn/gdn_fla_backward.py. Its kernels are part of the contract.
 ensure_fla() {
   if [[ ! -d "${fla_dir}/fla" ]]; then
@@ -178,8 +167,7 @@ ensure_fla() {
   [[ "$(git -C "${fla_dir}" rev-parse HEAD)" == "${fla_commit}" ]] || refuse "flash-linear-attention drift"
 }
 
-# ---------------------------------------------------------------- verify
-verify_envs() {  # verify_envs <runtime> <jit>
+verify_envs() {  # <runtime> <jit>
   local runtime=$1 jit=$2
   [[ -x "${runtime}/bin/python" ]] || { echo "REFUSAL: runtime Python missing: ${runtime}" >&2; return 1; }
   [[ -x "${jit}/bin/python" ]] || { echo "REFUSAL: JIT Python missing: ${jit}" >&2; return 1; }
@@ -268,11 +256,9 @@ print(json.dumps({"jit": str(jit), "nvcc": str(nvcc), "packages": observed}, sor
 PY
 }
 
-# ---------------------------------------------------------------- build
-build_runtime() {  # build_runtime <stage>
+build_runtime() {  # <stage>
   local stage=$1 lib skip=() extra=() name
-  # Source-built wheels cannot match the byte hashes frozen in uv.lock: sync skips them and they are
-  # installed on top, the same way TE (outside the lock) always is.
+  # Source-built wheels cannot match the byte hashes frozen in uv.lock: sync skips them, they install on top.
   for name in "${source_built[@]}"; do
     skip+=(--no-install-package "$(dist_name "${name}")"); extra+=("${wheel_dir}/${name}")
   done
@@ -288,14 +274,13 @@ build_runtime() {  # build_runtime <stage>
   ln -s libcublasLt.so.13 "${lib}/libcublasLt.so"
 }
 
-build_jit() {  # build_jit <stage>
+build_jit() {  # <stage>
   local stage=$1
   uv venv --python "${py}" --relocatable "${stage}"
   install_cuda13 "${stage}"
   uv pip install --python "${stage}/bin/python" --no-deps --editable "${repo}"
 }
 
-# ---------------------------------------------------------------- main
 for tool in sha256sum curl git uv; do command -v "${tool}" >/dev/null || refuse "${tool} is required"; done
 
 case "${mode}" in
