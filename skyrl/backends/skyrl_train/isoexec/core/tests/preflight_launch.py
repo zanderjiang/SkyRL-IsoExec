@@ -4,7 +4,7 @@
 
 Phase 1 runs the complete enforcement battery (every core/tests/test_*.py, each in its own
 subprocess, plus the contract leaf suite via unittest). Phase 2 builds the production contract
-under the run-script env (examples/train/isoexec/run_qwen35_dapo_isoexec.sh) and prints the four
+under the run-script env (examples/isoexec/run_qwen35_dapo_isoexec.sh) and prints the four
 identity values plus the derived obligation counts. Any failure exits nonzero and prints
 PREFLIGHT: BLOCKED (<reason>); a clean run prints PREFLIGHT: READY.
 
@@ -23,7 +23,7 @@ import time
 HERE = pathlib.Path(__file__).resolve()
 TEST_DIR = HERE.parent
 REPO = HERE.parents[6]
-RUN_SCRIPT = REPO / "examples/train/isoexec/run_qwen35_dapo_isoexec.sh"
+RUN_SCRIPT = REPO / "examples/isoexec/run_qwen35_dapo_isoexec.sh"
 LEAF_PKG = "skyrl/backends/skyrl_train/isoexec/contract/tests"
 PROD_ARCH = "sm90"
 

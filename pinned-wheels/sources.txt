@@ -1,0 +1,6 @@
+# filename  source  build-environment...
+# source: git+<url>@<commit>[#subdirectory=<dir>]  or  <sdist-url>#sha256=<hash>
+# Built by build_isoexec_env.sh when a wheel cannot be fetched; see README.md.
+vllm-1.0.0.dev20260620+cu130-cp312-cp312-linux_x86_64.whl  git+https://github.com/vllm-project/vllm@6f573f486bc659adf51a8d4639e225097f2d8d39  VLLM_VERSION_OVERRIDE=1.0.0.dev20260620+cu130 CMAKE_BUILD_TYPE=Release TORCH_CUDA_ARCH_LIST=9.0a
+flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl  git+https://github.com/Dao-AILab/flash-attention@14c377950125c70b7a9dabf9c561fca53715ac7d#subdirectory=hopper  FLASH_ATTENTION_FORCE_BUILD=TRUE
+transformer_engine_torch-2.17.1-cp312-cp312-linux_x86_64.whl  https://files.pythonhosted.org/packages/31/6d/49ce8a9369c744355ac29505400b275d73ac3c5c03b0feecab2e81df3b3e/transformer_engine_torch-2.17.1.tar.gz#sha256=5891479407be643c2c6df3b68b25a6b9497a996efe577eb88899c27c04dad9e2  NVTE_FRAMEWORK=pytorch NVTE_PYTORCH_FORCE_BUILD=TRUE NVTE_BUILD_USE_NVIDIA_WHEELS=1 NVTE_WITH_NCCL_EP=0

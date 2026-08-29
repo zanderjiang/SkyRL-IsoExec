@@ -1,0 +1,6 @@
+# sha256  filename  upstream-url ("-" = no public source; served by ISOEXEC_WHEEL_MIRROR only)
+063edf3d548cf57ddf0a6294121c815dec98477307890fff40dff29401c0154d  torch-2.14.0.dev20260620+cu130-cp312-cp312-manylinux_2_28_x86_64.whl  https://download.pytorch.org/whl/nightly/cu130/torch-2.14.0.dev20260620%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl
+fd64476dcf7a3d56ce252bde145bb6cdb8a5d3785c6491428cf3899a0c0df544  triton-3.7.1+git5d6048aa-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl  https://download-r2.pytorch.org/whl/nightly/triton-3.7.1%2Bgit5d6048aa-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+ad0f919d8f21f1f3b7c4f2b480d1c9372410ec64fbbb19fa62cf47e966f4fa20  vllm-1.0.0.dev20260620+cu130-cp312-cp312-linux_x86_64.whl  -
+b802f459bc0bd8642ffeecf965990476b35775da3dd2fd6a5a6b24f982e712aa  flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl  -
+2a06bc89229bece34fb3bea384cb5a0655e60bd3eb664835478cf36ed8277921  transformer_engine_torch-2.17.1-cp312-cp312-linux_x86_64.whl  -

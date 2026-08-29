@@ -1,2 +1,2 @@
-# The wheels themselves are large binaries obtained per the README; only the README is tracked.
+# The wheels themselves are large binaries obtained per the README; only README.md, wheels.txt and sources.txt are tracked.
 *.whl

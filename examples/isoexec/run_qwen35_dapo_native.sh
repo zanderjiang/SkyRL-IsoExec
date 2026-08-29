@@ -3,7 +3,7 @@
 # run_qwen35_dapo_isoexec.sh — identical config except no IsoExec composition and prefix caching on.
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 local_root=${ISOEXEC_LOCAL_ROOT:-${HOME}/isoexec}   # venvs, wheel cache, logs; override per site
 cd "${repo}"
 # Optional site preamble (cluster module loads, proxies, shared caches). Absent on most machines.
