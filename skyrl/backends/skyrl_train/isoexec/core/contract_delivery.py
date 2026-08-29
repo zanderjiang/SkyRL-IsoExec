@@ -7,6 +7,7 @@ installed-key validation: every installed (op, site) must carry an explicit entr
 
 from __future__ import annotations
 
+import logging
 import os
 
 from ..contract import (
@@ -39,9 +40,13 @@ def write_contract_file(contract: ExecutionContract, path: str) -> str:
 def load_contract(path: str, expected_hash_env: str = CONTRACT_HASH_ENV) -> ExecutionContract:
     """Read a delivered contract and cross-check it against the env var.
 
-    The file's self-consistency (stored identities == recomputed) is always enforced; when the env
-    var is set it must additionally equal the file's numerical_policy identity.
+    The file's self-consistency (stored identities == recomputed) is always enforced -- debug mode
+    demotes the env cross-check, never this, because a tampered file is not a kernel mix. When the
+    env var is set it must additionally equal the file's numerical_policy identity; a demoted
+    mismatch is still recorded against ``build_valid:contract``, so the artifact is not green.
     """
+    from . import enforce
+
     with open(path, "rb") as fh:
         contract = from_canonical_json(fh.read())
     if compute_identities(contract) != contract.identities:
@@ -50,11 +55,18 @@ def load_contract(path: str, expected_hash_env: str = CONTRACT_HASH_ENV) -> Exec
         )
     env_hash = os.environ.get(expected_hash_env)
     if env_hash is not None and env_hash != contract.identities.numerical_policy:
-        raise ContractDeliveryError(
+        msg = (
             f"contract delivery cross-check FAILED: {expected_hash_env}={env_hash!r} but the "
             f"file at {path!r} carries numerical_policy "
             f"{contract.identities.numerical_policy!r}. A mismatched composition refuses to "
             f"run rather than producing a silent divergence."
+        )
+        enforce.report(f"{enforce.BUILD_VALID}:contract", enforce.INSTALL, enforce.VIOLATION, msg)
+        if not enforce.demoted():
+            raise ContractDeliveryError(msg)
+        logging.getLogger(__name__).error(
+            "[ISOEXEC-DEBUG] DEMOTED (violation still recorded): %s",
+            msg,
         )
     return contract
 

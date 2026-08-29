@@ -1,7 +1,7 @@
 """CPU tests for the packed-sequence host-read memo (``packed_meta_cache``).
 
-WHAT THIS GATES. The host-sync census (run 2026-08-15 on Qwen3.5-0.8B, 18 GDN + 6 attention, one
-packed thd forward + backward) named every host-blocking CUDA sync of the trainer forward. All of
+WHAT THIS GATES. The host-sync census (Qwen3.5-0.8B, 18 GDN + 6 attention, one packed thd forward
+ + backward) named every host-blocking CUDA sync of the trainer forward. All of
 them are reads of the SAME ``cu_seqlens`` object, repeated once per layer:
 
     gated_delta_net.py:601   cu_seqlens[-1].cpu().item()      2 per GDN layer
@@ -24,8 +24,8 @@ else. Four obligations:
      in-place write through the tensor or any alias must invalidate; a different tensor with equal
      values must not be served the first one's entry; a declined tensor must still get a correct
      answer.
-  3. **Engagement, not installation.** ``served`` must rise only on a real hit. Six levers in this
-     campaign shipped structurally inert; an install banner is not evidence.
+  3. **Engagement, not installation.** ``served`` must rise only on a real hit. A lever can ship
+     structurally inert; an install banner is not evidence.
   4. **The patched megatron bodies are the upstream bodies.** ``_unpack_sequence_memo`` must return
      the same slices as the code it replaces, and ``_resolve_cu_seqlens_memo`` must return an
      ``is``-identical tensor and raise on exactly the inputs upstream raises on -- with and without
@@ -42,7 +42,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import packed_meta_cache as pmc  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import (
+    packed_meta_cache as pmc,  # noqa: E402
+)
 
 
 def _reset_packed_meta_census():
@@ -323,7 +325,9 @@ def _upstream_unpack(x, cu_seqlens, dim=1):
 @pytest.mark.parametrize("lens", BATCHES)
 @pytest.mark.parametrize("dim", [0, 1])
 def test_unpack_sequence_memo_matches_upstream_slice_for_slice(lens, dim):
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     cu = _cu(lens)
     total = int(cu[-1])
@@ -341,7 +345,9 @@ class _Dummy:
 
 @pytest.mark.parametrize("validate_once", [False, True])
 def test_resolve_cu_seqlens_returns_an_IS_IDENTICAL_tensor(monkeypatch, validate_once):
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     monkeypatch.setenv("SKYRL_ISOEXEC_GDN_VALIDATE_ONCE", "1" if validate_once else "0")
     cu = _cu([96, 64, 136])
@@ -355,7 +361,9 @@ def test_resolve_cu_seqlens_returns_an_IS_IDENTICAL_tensor(monkeypatch, validate
 
 @pytest.mark.parametrize("validate_once", [False, True])
 def test_resolve_cu_seqlens_still_raises_on_a_total_mismatch(monkeypatch, validate_once):
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     monkeypatch.setenv("SKYRL_ISOEXEC_GDN_VALIDATE_ONCE", "1" if validate_once else "0")
     cu = _cu([96, 64])
@@ -367,7 +375,9 @@ def test_resolve_cu_seqlens_still_raises_on_a_total_mismatch(monkeypatch, valida
 def test_cp1_resolve_never_inspects_sequence_lengths(monkeypatch, validate_once):
     """Divisibility by one is true without indexing or launching work on ``cu``."""
     from skyrl.backends.skyrl_train.isoexec.ops.gdn import packed_meta_cache
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     class NoDeviceValueReads:
         _version = 0
@@ -390,7 +400,9 @@ def test_cp1_guard_structurally_owns_every_divisibility_operation():
     import inspect
     import textwrap
 
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(shim._resolve_cu_seqlens_memo)))
     function = tree.body[0]
@@ -415,7 +427,9 @@ def test_cp1_guard_structurally_owns_every_divisibility_operation():
 
 @pytest.mark.parametrize("validate_once", [False, True])
 def test_cp_greater_than_one_still_returns_the_identical_valid_tensor(monkeypatch, validate_once):
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     monkeypatch.setenv("SKYRL_ISOEXEC_GDN_VALIDATE_ONCE", "1" if validate_once else "0")
     cu = _cu([96, 64, 136])
@@ -428,7 +442,9 @@ def test_cp_greater_than_one_still_returns_the_identical_valid_tensor(monkeypatc
 @pytest.mark.parametrize("validate_once", [False, True])
 def test_resolve_cu_seqlens_still_raises_on_a_cp_divisibility_violation(monkeypatch, validate_once):
     """The memo must not blind the check it memoizes -- both branches refuse the same input."""
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     monkeypatch.setenv("SKYRL_ISOEXEC_GDN_VALIDATE_ONCE", "1" if validate_once else "0")
     cu = _cu([96, 65])  # 65 is not divisible by 2
@@ -438,7 +454,9 @@ def test_resolve_cu_seqlens_still_raises_on_a_cp_divisibility_violation(monkeypa
 
 def test_validate_once_agrees_with_the_device_check_on_every_batch(monkeypatch):
     """Host-side `% cp_size` and the device `(lens % cp).any()` must accept/refuse identically."""
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     for lens in BATCHES + [[3, 6, 9], [2, 4, 7]]:
         for cp in (1, 2, 3):
@@ -456,7 +474,9 @@ def test_validate_once_agrees_with_the_device_check_on_every_batch(monkeypatch):
 
 
 def test_validate_once_default_is_OFF():
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     assert not shim._validate_once_enabled()
 
@@ -482,7 +502,9 @@ def test_rope_thd_memo_is_bitwise_equal_to_upstream(monkeypatch, lens, memo):
     pytest.importorskip("megatron.core.models.common.embeddings.rope_utils")
     from megatron.core.models.common.embeddings import rope_utils as ru
 
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import gdn_fla_shim as shim
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron import (
+        gdn_fla_shim as shim,
+    )
 
     monkeypatch.setenv("SKYRL_ISOEXEC_PACKED_META_CACHE", memo)
     cu = _cu(lens)

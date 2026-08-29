@@ -1,9 +1,12 @@
 """Multi-rank, no-model harness for the distributed sampled-logprob seam.
 
-Gates the ``logprobs.log_softmax`` impls ``aten_reference`` vs ``aten_reference_fused_exp``
-(bitwise, torch.equal on the fp32 words) and the ``logprobs.lm_head_slice:sampled_rows`` extract
-path, over the live TP gather wire. Promoted from the private repo's nightly logprob_extract_4rank.py.
-CI: torchrun --standalone --nproc-per-node=4 <thisfile>.
+Gates the ``logprobs.lm_head_slice:sampled_rows`` extract path and the
+``SKYRL_ISOEXEC_EXACT_SAMPLED_LOGPROBS`` source, bitwise via torch.equal on the fp32 words, over
+the live TP gather wire. Both sides of the source are exercised via separate processes
+(``--fixed-source-mode incumbent|candidate``): the admission vote pins the env per process, so an
+in-process flip refuses as structural drift. Promoted from the private repo's nightly
+logprob_extract_4rank.py.
+CI: SKYRL_ISOEXEC=1 torchrun --standalone --nproc-per-node=4 <thisfile>.
 """
 
 import argparse
@@ -113,7 +116,6 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--pattern", choices=("random", "ties", "nonfinite"), default="random")
-    parser.add_argument("--source-lever", action="store_true")
     parser.add_argument("--fixed-source-mode", choices=("incumbent", "candidate"))
     parser.add_argument("--measure-periodic-probe", action="store_true")
     args = parser.parse_args()
@@ -156,14 +158,9 @@ def main() -> None:
     target.view(-1)[: min(target.numel(), adversarial.numel())] = adversarial[: target.numel()]
 
     def current() -> torch.Tensor:
-        if args.source_lever:
-            os.environ["SKYRL_ISOEXEC_EXACT_SAMPLED_LOGPROBS"] = "0"
         return ChunkedDistributedLogprob.apply(logits, target, start, end, args.chunk_size, dist.group.WORLD, True)
 
     def candidate() -> torch.Tensor:
-        if args.source_lever:
-            os.environ["SKYRL_ISOEXEC_EXACT_SAMPLED_LOGPROBS"] = "1"
-            return ChunkedDistributedLogprob.apply(logits, target, start, end, args.chunk_size, dist.group.WORLD, True)
         return _candidate(logits, target, dist.group.WORLD, args.chunk_size)
 
     if args.fixed_source_mode is not None:
@@ -305,7 +302,6 @@ def main() -> None:
             f"full_vocab_elements/device={gathered_vocab_elements_per_device} "
             f"dtype={logits.dtype} pattern={args.pattern} bit_equal={bool(equal_vote.item())} rank_equal={rank_equal} "
             f"sum_tree_control_mismatches={control_mismatches} "
-            f"source_lever={args.source_lever} "
             f"current_ms_median={statistics.median(current_latencies):.3f} "
             f"current_ms_min={min(current_latencies):.3f} current_ms_max={max(current_latencies):.3f} "
             f"candidate_ms_median={statistics.median(candidate_latencies):.3f} "

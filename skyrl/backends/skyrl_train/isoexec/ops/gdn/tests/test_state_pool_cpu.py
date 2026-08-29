@@ -1,4 +1,4 @@
-"""CPU guards for the GDN chunk-synced state pool (`_state_pool`) and the op-count instrument.
+"""CPU guards for the GDN CPR state pool (`_state_pool`) and the op-count instrument.
 
 WHAT IS BEING GUARDED. The pool build used to be three full-size passes --
 
@@ -13,16 +13,17 @@ chosen to include the values a rounding bug would move (signed zeros, denormals,
 
 They also check the SAVING, in the unit in which it is real. This is not an op-count win -- at the
 dispatcher it is +1 op -- it is a device-traffic and peak-memory win, so the test measures elements
-written, not calls. A claim that is not measured in its own unit is a banner, and this campaign has
-shipped five of those already.
+written, not calls. A claim that is not measured in its own unit is a banner, not evidence.
 """
 
 from __future__ import annotations
 
 import torch
+from _op_census import (
+    count_ops,  # vendored copy of the private repo's tools/op_census.py
+)
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_chunk_synced import _state_pool
-from _op_census import count_ops  # vendored copy of the private repo's tools/op_census.py
+from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr import _state_pool
 
 
 def _reference(h: torch.Tensor, n_chunks: int, device) -> torch.Tensor:

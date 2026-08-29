@@ -18,7 +18,9 @@ from .types import (
     TopologyClaim,
 )
 
-SUPPORTED_SCHEMA_VERSIONS = {"1"}
+# "2" folds the cases' declared conditions and an entry's coverage kind into the identities, so a
+# "1" artifact would hash differently under this code: it is refused, never silently rehashed.
+SUPPORTED_SCHEMA_VERSIONS = {"2"}
 
 
 class SerializationError(Exception):
@@ -264,7 +266,13 @@ def from_canonical_json(data: bytes) -> ExecutionContract:
     d = json.loads(data.decode("utf-8"), parse_float=_reject_float, parse_constant=_reject_float)
     _fields(d, ("schema_version", "model", "identities", "cases", "composition", "claims"), "contract")
     if d["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS:
-        raise SerializationError(f"unsupported schema_version {d['schema_version']!r}")
+        raise SerializationError(
+            f"unsupported schema_version {d['schema_version']!r}; this code reads "
+            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}. A schema '1' artifact predates '2' folding the "
+            f"cases' declared conditions and an entry's coverage kind into the hashed identities, "
+            f"so its identities would not mean here what they meant where it was frozen. Re-freeze: "
+            f"rebuild the contract from the model profile with this code and deliver the new artifact."
+        )
     _fields(d["model"], ("family", "architectures", "profile_ref"), "model")
     _fields(d["identities"], ("semantic", "numerical_policy", "deployment"), "identities")
     _fields(d["claims"], ("topology", "state", "tolerances"), "claims")

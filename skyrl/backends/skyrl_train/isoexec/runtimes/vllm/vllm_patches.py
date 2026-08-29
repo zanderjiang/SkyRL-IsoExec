@@ -1,8 +1,11 @@
 """vLLM monkey-patches for bitwise-matched rollouts.
 
-Covers the batch-invariance env pins, flash-attention ``num_splits=1``, an aten-equivalent logprob
-kernel, and skipping the sampler's temperature divide at temperature 1.0. Every patch is idempotent
-and fails to stock: if the vLLM surface it targets is missing it logs and leaves vLLM unchanged.
+Covers the batch-invariance env pins, flash-attention ``num_splits=1``, the two logprob sites --
+the V1 ``Sampler.compute_logprobs`` hook (the one that executes today; see
+``patch_vllm_sampler_logprobs_rowinv``) and the V2-runner ``compute_token_logprobs`` rebind (inert
+on the V1 runner; kept for a future V2 flip) -- and skipping the sampler's temperature divide at
+temperature 1.0. Every patch is idempotent and fails to stock: if the vLLM surface it targets is
+missing it logs and leaves vLLM unchanged.
 """
 
 from __future__ import annotations
@@ -112,10 +115,21 @@ def isoexec_engine_arg_overrides() -> dict:
 
 
 def patch_vllm_logprobs_batch_invariant() -> bool:
-    """Replace vLLM's fused-Triton logprob kernel with one that matches the trainer bitwise.
+    """Rebind the **Model Runner V2** token-logprob kernel to the trainer's aten formulation.
 
-    An optional Triton fast path is bitwise self-checked against the aten reference on first use and
-    permanently disabled if it ever disagrees.
+    .. warning:: **INERT ON THE V1 RUNNER -- i.e. on every production composition today.** This
+       patches ``vllm.v1.worker.gpu.sample.logprob.compute_token_logprobs``, which only the
+       experimental Model Runner V2 (``VllmConfig.use_v2_model_runner``) ever calls.
+       ``MegatronGPTModelHybridForCausalLM`` is not in ``DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES``
+       and MoE models are excluded besides, so production resolves the V1 ``GPUModelRunner``,
+       whose logprobs (sampled AND prompt) come from
+       ``vllm.v1.sample.sampler.Sampler.compute_logprobs`` (``logits.log_softmax``) instead --
+       measured on a real generation as ``patched_v2_compute_token_logprobs_calls=0`` against
+       ``v1_sampler_compute_logprobs_calls=8``. The V1 site is hooked
+       by :func:`patch_vllm_sampler_logprobs_rowinv` below; this patch is kept ONLY so a future
+       flip to the V2 runner does not silently reopen the divergence. Never attest an engine
+       logprob impl off this function's return value.
+
     """
     try:
         import torch
@@ -126,6 +140,27 @@ def patch_vllm_logprobs_batch_invariant() -> bool:
     if getattr(_lp, "_isoexec_logprob_patched", False):
         return True
 
+    # The row-count- and TP-invariant leaf-tree sampled logprob -- the composed default, no flag.
+    # Lazy import, fail-to-incumbent: a missing module leaves today's aten-order path in charge,
+    # exactly as the trainer-side shim in megatron/model_utils.py does.
+    try:
+        from skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv import (
+            rowinv_sampled_logprobs as _rowinv_sampled_logprobs,
+        )
+
+        _rowinv_available = True
+    except ImportError as _rowinv_import_error:
+        _err = repr(_rowinv_import_error)
+        _rowinv_available = False
+        logger.error("[isoexec] rowinv import failed; engine keeps the incumbent: %s", _err)
+        print(
+            f"[ISOEXEC-ROWINV-LOGPROB] REFUSED: module import failed; engine keeps the incumbent ({_err})",
+            flush=True,
+        )
+
+        def _rowinv_sampled_logprobs(*args, **kwargs):  # type: ignore[misc]  # pragma: no cover
+            return None
+
     def _reference_compute_token_logprobs(logits, token_ids):
 
         token_ids = token_ids.to(torch.int64)
@@ -135,75 +170,169 @@ def patch_vllm_logprobs_batch_invariant() -> bool:
         logprobs = x - lse
         return logprobs.gather(-1, token_ids)
 
-    _fastpath_enabled = os.environ.get("SKYRL_ISOEXEC_LOGPROBS_FASTPATH", "1") == "1"
-    _fastpath = {"kernel": None, "verified": False, "disabled": not _fastpath_enabled}
-    try:
-        import triton
-        import triton.language as tl
-        from triton.language.extra import libdevice
-
-        @triton.jit
-        def _isoexec_fused_exp_kernel(e_ptr, logits_ptr, amax_ptr, stride, vocab, BLOCK: tl.constexpr):
-            row = tl.program_id(0)
-            col_blk = tl.program_id(1)
-            mx = tl.load(amax_ptr + row)
-            off = col_blk * BLOCK + tl.arange(0, BLOCK)
-            m = off < vocab
-            v = tl.load(logits_ptr + row * stride + off, mask=m, other=0.0).to(tl.float32)
-            e = libdevice.exp(v - mx)
-            tl.store(e_ptr + row * stride + off, e, mask=m)
-
-        _fastpath["kernel"] = _isoexec_fused_exp_kernel
-    except Exception as _te:
-        _fastpath["disabled"] = True
-        logger.warning("[isoexec] logprobs fast path unavailable (no triton/libdevice): %s", _te)
-
-    def _fast_compute_token_logprobs(logits, token_ids):
-        token_ids = token_ids.to(torch.int64)
-        logits = logits.to(torch.float32)
-        amax = torch.amax(logits, dim=-1, keepdim=True)
-        e = torch.empty_like(logits)
-        grid = (logits.shape[0], triton.cdiv(logits.shape[1], 2048))
-        _fastpath["kernel"][grid](e, logits, amax, logits.stride(0), logits.shape[1], BLOCK=2048)
-        lse = e.sum(-1, keepdim=True).float().log()
-        return logits.gather(-1, token_ids) - amax - lse
-
     def _batch_invariant_compute_token_logprobs(logits, token_ids):
-        use_fast = (
-            not _fastpath["disabled"]
-            and _fastpath["kernel"] is not None
-            and logits.is_cuda
-            and logits.dim() == 2
-            and logits.shape[0] > 16
-            and logits.stride(1) == 1
-        )
-        if not use_fast:
-            return _reference_compute_token_logprobs(logits, token_ids)
-        if not _fastpath["verified"]:
-
-            if bool(torch.isfinite(logits).all()):
-                ref = _reference_compute_token_logprobs(logits, token_ids)
-                fast = _fast_compute_token_logprobs(logits, token_ids)
-                if torch.equal(ref, fast):
-                    _fastpath["verified"] = True
-                    print("[ISOEXEC-ENGINE] logprobs fast path self-check PASS (bitwise)", flush=True)
-                    return fast
-                _fastpath["disabled"] = True
-                logger.error(
-                    "[isoexec] logprobs fast path FAILED bitwise self-check "
-                    "(libdevice.exp != aten.exp on this stack?) -- permanently using reference"
-                )
-                print("[ISOEXEC-ENGINE] logprobs fast path self-check FAIL -> reference", flush=True)
-                return ref
-            return _reference_compute_token_logprobs(logits, token_ids)
-        return _fast_compute_token_logprobs(logits, token_ids)
+        # rowinv first, incumbent on DECLINE (None) -- the same hook shape as the
+        # trainer's two Functions in megatron/model_utils.py. NOTE the deliberate asymmetry of the
+        # ARGUMENTS, not of the function: the engine receives an ALREADY-GATHERED full [N, V] row
+        # (gptmodel_vllm sets parallel_output=False), so it passes group=None / world=1 and rowinv
+        # computes all G leaves locally, while the trainer hands in its TP shard. The leaf
+        # boundaries and combine tree are functions of G alone, so both compositions evaluate the
+        # SAME G-leaf expression and the bits agree -- do not "simplify" the engine onto a
+        # different schedule; one function everywhere is the design.
+        if _rowinv_available:
+            got = _rowinv_sampled_logprobs(
+                logits,
+                token_ids,
+                vocab_start_index=0,
+                vocab_end_index=logits.shape[-1],
+                group=None,
+                # The dtype the row arrives in, BEFORE the incumbent's fp32 widening -- the same
+                # statement the trainer makes about its shard.
+                src_dtype=logits.dtype,
+                reference=lambda: _reference_compute_token_logprobs(logits, token_ids),
+            )
+            if got is not None:
+                return got
+        return _reference_compute_token_logprobs(logits, token_ids)
 
     _lp.compute_token_logprobs = _batch_invariant_compute_token_logprobs
     _lp._isoexec_logprob_patched = True
-    logger.info("[isoexec] patched vLLM compute_token_logprobs -> aten log_softmax (== trainer)")
+    logger.info("[isoexec] patched V2-runner compute_token_logprobs (INERT on the V1 runner)")
     print(
-        "[ISOEXEC-ENGINE] patched vLLM compute_token_logprobs -> aten log_softmax (== trainer) "
-        "for bitwise rollout logprobs",
+        "[ISOEXEC-ENGINE] patched vLLM V2-runner compute_token_logprobs -> aten log_softmax. "
+        "NOTE: this module belongs to Model Runner V2 and is NEVER CALLED by the V1 GPUModelRunner "
+        "that production resolves (use_v2_model_runner=False for this arch); kept for a future V2 "
+        "flip only. The V1 logprob producer is Sampler.compute_logprobs -- see "
+        "patch_vllm_sampler_logprobs_rowinv.",
+        flush=True,
+    )
+    return True
+
+
+#: Census of the V1 ``Sampler.compute_logprobs`` hook. ``calls`` counts entries into the hook
+#: (the proof the hook is on the executing path), ``rowinv_owned`` the calls whose returned tensor
+#: came out of the rowinv full-row entry, ``incumbent`` the calls served by vLLM's own
+#: ``log_softmax`` (flag declined / rowinv declined). Engagement truth stays with
+#: ``ops/logprobs/rowinv.py::stats()['served']`` -- this census only localizes WHERE the calls go.
+_CL_STATE = {"calls": 0, "rowinv_owned": 0, "incumbent": 0, "reported": 0}
+
+
+def sampler_logprobs_census() -> dict:
+    return dict(_CL_STATE)
+
+
+def _cl_report() -> None:
+    n = _CL_STATE["calls"]
+    if n < 1 or (n & (n - 1)) != 0 or n == _CL_STATE["reported"]:
+        return
+    _CL_STATE["reported"] = n
+    print(
+        f"[ISOEXEC-SAMPLER-LOGPROBS] pid={os.getpid()} V1 Sampler.compute_logprobs hook: "
+        f"calls={n} rowinv_owned={_CL_STATE['rowinv_owned']} incumbent={_CL_STATE['incumbent']}",
+        flush=True,
+    )
+
+
+def sampler_logprobs_hook_state() -> dict:
+    """Live evidence for the engine attestation: what the V1 sampler site will actually run.
+
+    Read off the ``Sampler`` class itself -- the object the V1 runner calls through -- never off
+    "a patch function returned True" (the exact trap the V2 patch fell into: installed, attested,
+    never executed).
+    """
+    state = {"v1_hook_installed": False, "v1_hook_calls": 0, "rowinv_available": False, "error": ""}
+    try:
+        from vllm.v1.sample.sampler import Sampler
+
+        raw = Sampler.__dict__.get("compute_logprobs")
+        if isinstance(raw, staticmethod):
+            raw = raw.__func__
+        state["v1_hook_installed"] = bool(getattr(raw, "_isoexec_rowinv_full_row_hook", False))
+        state["v1_hook_calls"] = int(_CL_STATE["calls"])
+    except Exception as e:  # noqa: BLE001 -- no vllm means no evidence, and the record says so
+        state["error"] = repr(e)
+    try:
+        from skyrl.backends.skyrl_train.isoexec.ops.logprobs import rowinv  # noqa: F401
+
+        state["rowinv_available"] = True
+    except Exception as e:  # noqa: BLE001
+        state["error"] = (state["error"] + "; " if state["error"] else "") + repr(e)
+    return state
+
+
+def patch_vllm_sampler_logprobs_rowinv() -> bool:
+    """Hook the V1 runner's ACTUAL logprob producer: ``Sampler.compute_logprobs``.
+
+    This staticmethod is the single site that produces BOTH sampled-token logprobs
+    (``Sampler.forward``, ``raw_logprobs`` under ``logprobs_mode="raw_logprobs"``) and prompt
+    logprobs (``gpu_model_runner._get_prompt_logprobs_dict``) on the V1 ``GPUModelRunner`` --
+    proven by live call counters, not inferred (see ``patch_vllm_logprobs_batch_invariant``'s
+    warning for why the older V2-module patch never executed). Unlike the V2 site's gather-only
+    contract, this one takes ``[N, V]`` logits and must return the FULL fp32 logprob row --
+    ``gather_logprobs`` consumes it for top-k and ranks -- so it routes through
+    ``rowinv.rowinv_full_logprobs``, whose row shares the sampled entry's leaf-tree denominator
+    bit for bit.
+
+    Installed unconditionally: rowinv is the composed logprob at every site, so there is no
+    flag-off state in which the engine may keep vLLM's ``log_softmax`` while the trainer scores on
+    the leaf tree. The only remaining "off" is a failed import, which returns False here and
+    leaves the incumbent in charge -- visible as served=0, which the engagement boundary refuses.
+    Every rowinv DECLINE falls back to the original ``compute_logprobs``, bits unchanged.
+    """
+    try:
+        from vllm.v1.sample.sampler import Sampler
+    except Exception as e:
+        logger.warning("[isoexec] cannot hook V1 Sampler.compute_logprobs: %s", e)
+        return False
+    raw = Sampler.__dict__.get("compute_logprobs")
+    if isinstance(raw, staticmethod):
+        raw = raw.__func__
+    if raw is None:
+        logger.warning("[isoexec] V1 Sampler has no compute_logprobs; hook not installed")
+        return False
+    if getattr(raw, "_isoexec_rowinv_full_row_hook", False):
+        return True
+    try:
+        from skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv import (
+            rowinv_full_logprobs as _rowinv_full_logprobs,
+        )
+    except ImportError as e:
+        logger.error("[isoexec] rowinv import failed; V1 sampler hook not installed: %r", e)
+        print(
+            f"[ISOEXEC-ROWINV-LOGPROB] V1 sampler hook REFUSED: rowinv import failed ({e!r}); "
+            "the engine keeps the incumbent and the census stays served=0, which the engagement "
+            "boundary refuses",
+            flush=True,
+        )
+        return False
+
+    _orig = raw
+
+    def _isoexec_compute_logprobs(logits):
+        _CL_STATE["calls"] += 1
+        got = _rowinv_full_logprobs(
+            logits,
+            # The dtype the row arrives in, BEFORE any fp32 widening -- the same statement the
+            # trainer makes about its shard.
+            src_dtype=logits.dtype,
+            reference=lambda: _orig(logits),
+        )
+        if got is not None:
+            _CL_STATE["rowinv_owned"] += 1
+            _cl_report()
+            return got
+        _CL_STATE["incumbent"] += 1
+        _cl_report()
+        return _orig(logits)
+
+    _isoexec_compute_logprobs._isoexec_rowinv_full_row_hook = True
+    _isoexec_compute_logprobs._isoexec_orig = _orig
+    Sampler.compute_logprobs = staticmethod(_isoexec_compute_logprobs)
+    logger.info("[isoexec] hooked V1 Sampler.compute_logprobs -> rowinv full-row leaf tree")
+    print(
+        "[ISOEXEC-ROWINV-LOGPROB] V1 Sampler.compute_logprobs HOOKED (full-row leaf-tree "
+        "denominator; sampled and prompt logprobs both flow through this site). A hook installed "
+        "is not a hook engaged: judge by served>0 in the rowinv census.",
         flush=True,
     )
     return True

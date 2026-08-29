@@ -7,8 +7,8 @@ from ...core.adapter import ContractAdapter
 
 
 class VLLMContractAdapter(ContractAdapter):
-    def __init__(self, model_path, *, vllm_config, mp, tp_size, install_fn):
-        super().__init__("engine", model_path)
+    def __init__(self, model_path, *, vllm_config, mp, tp_size, install_fn, model_fn=None):
+        super().__init__("engine", model_path, model_fn=model_fn)
         self._vllm_config = vllm_config
         self._mp = mp
         self._tp_size = int(tp_size)

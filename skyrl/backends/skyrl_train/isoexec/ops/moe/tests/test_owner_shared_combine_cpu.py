@@ -22,9 +22,7 @@ pytest.importorskip("triton")
 _real_capability = torch.cuda.get_device_capability
 torch.cuda.get_device_capability = lambda _device=None: (9, 0)
 try:
-    OC = importlib.import_module(
-        "skyrl.backends.skyrl_train.isoexec.ops.moe.moe_pik_combine_owner"
-    )
+    OC = importlib.import_module("skyrl.backends.skyrl_train.isoexec.ops.moe.moe_pik_combine_owner")
 finally:
     torch.cuda.get_device_capability = _real_capability
 
@@ -39,7 +37,6 @@ def _reset_shared_owner_fusion_state():
     for name in OC._SHARED_OWNER_COUNTS:
         OC._SHARED_OWNER_COUNTS[name] = 0
     OC._SHARED_OWNER_FIRST_REJECT = None
-
 
 
 def _compile(world=8, k=8, routed_bf16=True, shared_bf16=True):
@@ -79,9 +76,7 @@ def _fp_ops(ptx: str) -> list[str]:
         if not fields:
             continue
         op = fields[1] if fields[0].startswith("@") and len(fields) > 1 else fields[0]
-        if op.split(".")[0] in ("add", "mul", "fma", "sub", "cvt") and (
-            ".f32" in op or ".bf16" in op or ".f16" in op
-        ):
+        if op.split(".")[0] in ("add", "mul", "fma", "sub", "cvt") and (".f32" in op or ".bf16" in op or ".f16" in op):
             ops.append(op.rstrip(";"))
     return ops
 
@@ -100,21 +95,15 @@ def test_generated_source_pins_every_existing_rounding_boundary():
     shared_product_round = src.index(
         "shared_bf = (shared_root_bf.to(tl.float32) * gate_bf.to(tl.float32)).to(tl.bfloat16)"
     )
-    final_add_round = src.index(
-        "result = (routed_bf.to(tl.float32) + shared_bf.to(tl.float32)).to(tl.bfloat16)"
-    )
+    final_add_round = src.index("result = (routed_bf.to(tl.float32) + shared_bf.to(tl.float32)).to(tl.bfloat16)")
     store = src.index("tl.store(out0 + goff, result")
     assert routed_round < final_add_round < store
     assert shared_round < gate_load < shared_product_round < final_add_round
 
 
 def test_both_peer_folds_use_the_same_canonical_balanced_tree():
-    routed = OC._named_tree_src(
-        8, True, inp="rin", tmp="rt", base="rbase", indent=""
-    )
-    shared = OC._named_tree_src(
-        8, True, inp="sin", tmp="st", base="sbase", indent=""
-    )
+    routed = OC._named_tree_src(8, True, inp="rin", tmp="rt", base="rbase", indent="")
+    shared = OC._named_tree_src(8, True, inp="sin", tmp="st", base="sbase", indent="")
     # They are not two hand-written approximations: after renaming inputs/SSA/base, they are the
     # same emitted schedule character for character.
     normalized = routed.replace("rin", "sin").replace("rt", "st").replace("rbase", "sbase")
@@ -164,9 +153,7 @@ def test_launch_disables_fp_contraction_and_unsupported_transport_refuses(monkey
     shared = torch.empty(2, 4, dtype=torch.bfloat16)
     gate = torch.empty(2, dtype=torch.bfloat16)
     rows = torch.empty(2, 8, dtype=torch.int32)
-    assert OC._owner_shared_combine(
-        routed, shared, gate, rows, 2, 8, None, True, True
-    ) is None
+    assert OC._owner_shared_combine(routed, shared, gate, rows, 2, 8, None, True, True) is None
 
 
 def test_flag_is_default_off_and_forwarded_through_the_colocated_actor():

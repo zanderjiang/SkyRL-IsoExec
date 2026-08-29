@@ -103,14 +103,16 @@ def register() -> None:
         from ...ops.attention import varlen_backend
 
         varlen_backend.register_varlen_custom_backend()
-        # vLLM's fused-Triton sampler logprob kernel never calls aten log_softmax, and the sampler
-        # runs in the worker.
+        # The sampler runs in the worker, so the logprob patch must land here.
         from .vllm_patches import (
-            patch_vllm_logprobs_batch_invariant,
+            patch_vllm_sampler_logprobs_rowinv,
             patch_vllm_sampler_temperature,
         )
 
-        patch_vllm_logprobs_batch_invariant()
+        # The V1 runner's ACTUAL logprob producer -- Sampler.compute_logprobs serves both sampled
+        # and prompt logprobs. Installed unconditionally; only a failed rowinv import leaves the
+        # sampler byte-for-byte untouched, and the engagement boundary refuses that at served=0.
+        patch_vllm_sampler_logprobs_rowinv()
         # The V1 sampler's unconditional full-vocab temperature divide is the identity at 1.0.
         patch_vllm_sampler_temperature()
 
@@ -145,8 +147,7 @@ def register() -> None:
         lift_gdn_batch_invariance_veto()
 
     if os.environ.get("SKYRL_ISOEXEC_SLEEP_SKIP_WEIGHTS_BACKUP") == "1":
-        # glm_sleep_skip (2026-08-09): THE sleep lever. Skip the D2H backup of the byte ranges the
-        # Skip the D2H backup of the byte ranges the next weight sync provably overwrites before
+        # THE sleep lever. Skip the D2H backup of the byte ranges the next weight sync overwrites before
         # any read; back up only the residual non-synced pool state. Fail-to-stock: see the module
         # docstring.
         from .sleep_skip_backup import install_sleep_skip_weights_backup

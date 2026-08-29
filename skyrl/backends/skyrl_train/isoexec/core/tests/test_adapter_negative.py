@@ -14,9 +14,6 @@ import os
 import pickle
 from types import SimpleNamespace
 
-# torch-first, as in production.
-from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
-
 from skyrl.backends.skyrl_train.isoexec.contract import Claims
 from skyrl.backends.skyrl_train.isoexec.core import adapter as ad
 from skyrl.backends.skyrl_train.isoexec.core import arch as arch_mod
@@ -26,8 +23,13 @@ from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
 from skyrl.backends.skyrl_train.isoexec.core.process_contract import build_contract_view
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
-from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import MegatronContractAdapter
+from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+    MegatronContractAdapter,
+)
 from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContractAdapter
+
+# torch-first, as in production.
+from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
 
 # CPU-only harness (a live production run owns the GPUs): real builds read core/arch.ARCH.
 if arch_mod.ARCH == arch_mod.NON_ACCELERATOR_ARCH:
@@ -164,8 +166,8 @@ def test_perturbed_stamp_refuses_at_weight_sync():
 
 
 def test_wrong_impl_refuses_at_first_forward():
-    # gdn.state is the audit's post-promotion entry: its fingerprint exception was removed when the
-    # declaration was fixed, so a mismatch now refuses at FIRST_FORWARD per the severity table.
+    # gdn.state carries no fingerprint exception, so a mismatch refuses at FIRST_FORWARD per the
+    # severity table.
     target = ("gdn.state", "engine_prefill")
     assert enforce.exemption_for("fingerprint:gdn.state:engine_prefill") is None
     assert enforce.SEVERITY[(enforce.FINGERPRINT, enforce.FIRST_FORWARD)] == enforce.REFUSE
@@ -250,8 +252,7 @@ def test_every_exception_soft_at_its_target_and_nowhere_else():
     plans = {s: enforce.derive_obligation_plan(_CONTRACT, _REG, s) for s in ("trainer", "engine")}
     for ex in enforce.EXCEPTIONS:
         matches = {
-            s: [ob for ob in plans[s].obligations if fnmatch.fnmatchcase(ob.obligation_id, ex.pattern)]
-            for s in plans
+            s: [ob for ob in plans[s].obligations if fnmatch.fnmatchcase(ob.obligation_id, ex.pattern)] for s in plans
         }
         side = "engine" if matches["engine"] else "trainer"
         matched = matches[side]

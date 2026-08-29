@@ -36,6 +36,7 @@ def _split_stats():
     # inlined: the public module keeps the counters but not this test accessor
     return fs._served, fs._declined, fs._decline_reason
 
+
 from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_recurrent_state import (  # noqa: E402
     RecurrentGDN,
 )

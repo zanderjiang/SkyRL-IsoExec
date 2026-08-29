@@ -31,7 +31,6 @@ from types import SimpleNamespace
 
 import torch
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
@@ -87,8 +86,12 @@ def main():
 
     enable_batch_invariant_mode()
 
-    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_batched_experts import _batched_experts_forward
-    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_fused_experts import _fused_forward
+    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_batched_experts import (
+        _batched_experts_forward,
+    )
+    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_fused_experts import (
+        _fused_forward,
+    )
 
     torch.manual_seed(0)
     # Megatron param layout: linear_fc1.weight [2f, h], linear_fc2.weight [h, f].

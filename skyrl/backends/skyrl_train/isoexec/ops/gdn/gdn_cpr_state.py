@@ -1,4 +1,4 @@
-"""Engine state for the canonical chunk-synced GDN function.
+"""Engine state for the canonical CPR GDN function.
 
 Decode advances the fused recurrent core one token at a time and records the prepared inputs in an
 open-chunk buffer. At each chunk boundary the FLA state pass recomputes the boundary from the fp32
@@ -15,7 +15,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 
-from .gdn_chunk_synced import chunk_boundary_states
+from .gdn_cpr import chunk_boundary_states
 from .gdn_ops import gdn_causal_conv, gdn_recurrent_kernel
 from .gdn_recurrent_state import _HOST_BOOKKEEPING_STATS, RecurrentGDN
 
@@ -31,45 +31,45 @@ def _dev_idx(vals, dtype, dev) -> torch.Tensor:
     return torch.from_numpy(np.asarray(vals, dtype=npdt)).to(dev, non_blocking=True)
 
 
-def entry_read(layer: "ChunkSyncedGDN", rows) -> torch.Tensor:
+def entry_read(layer: "CprGDN", rows) -> torch.Tensor:
     """Rows of ``layer``'s fp32 entry state as a device ``[M, HV, V, K]`` tensor."""
     return layer.entry_state[_dev_idx(rows, torch.long, layer.ssm_state.device)]
 
 
-def entry_write(layer: "ChunkSyncedGDN", rows, vals: torch.Tensor) -> None:
+def entry_write(layer: "CprGDN", rows, vals: torch.Tensor) -> None:
     """Write ``vals`` ``[M, HV, V, K]`` fp32 into ``layer``'s entry state at ``rows``."""
     layer.entry_state[_dev_idx(rows, torch.long, layer.ssm_state.device)] = vals
 
 
-def entry_write_one(layer: "ChunkSyncedGDN", row: int, val: torch.Tensor) -> None:
-    """Single-row write (v1 prefill's per-sequence handoff, CS-APC adoption)."""
+def entry_write_one(layer: "CprGDN", row: int, val: torch.Tensor) -> None:
+    """Single-row write (the eager prefill's per-sequence handoff, CPR-APC adoption)."""
     layer.entry_state[row] = val
 
 
-def entry_zero(layer: "ChunkSyncedGDN", rows) -> None:
+def entry_zero(layer: "CprGDN", rows) -> None:
     """Zero ``rows`` -- a fresh prompt's entry state, which must be the trainer's zero h[0]."""
     layer.entry_state[_dev_idx(rows, torch.long, layer.ssm_state.device)] = 0.0
 
 
-def entry_read_stacked(layers: list["ChunkSyncedGDN"], rows, rows_t: torch.Tensor) -> torch.Tensor:
+def entry_read_stacked(layers: list["CprGDN"], rows, rows_t: torch.Tensor) -> torch.Tensor:
     """``cat([ly.entry_state[rows] for ly in layers])`` -- layer-major ``[L*M, HV, V, K]`` fp32."""
     return torch.cat([ly.entry_state[rows_t] for ly in layers], dim=0)
 
 
-def entry_write_stacked(layers: list["ChunkSyncedGDN"], rows, rows_t: torch.Tensor, final: torch.Tensor) -> None:
+def entry_write_stacked(layers: list["CprGDN"], rows, rows_t: torch.Tensor, final: torch.Tensor) -> None:
     """Write a layer-major ``[L*M, HV, V, K]`` fp32 result back to every layer's entry state."""
     M = len(rows)
     for j, ly in enumerate(layers):
         ly.entry_state[rows_t] = final[j * M : (j + 1) * M]
 
 
-# Every live ChunkSyncedGDN in this process, in construction (layer) order. The lazy-resync driver
+# Every live CprGDN in this process, in construction (layer) order. The lazy-resync driver
 # iterates this once per decode step, on the host and before the forward, which is what lets decode()
 # itself capture into a CUDA graph.
-CHUNK_SYNCED_LAYERS: list["ChunkSyncedGDN"] = []
+CPR_LAYERS: list["CprGDN"] = []
 
 
-# APC (automatic prefix caching) under chunk_synced: the boundary-state cache.
+# APC (automatic prefix caching) under cpr: the boundary-state cache.
 #
 # At an absolute position that is an exact multiple of C, a slot's state collapses to two tensors. The
 # open-chunk buffer is empty (pos % C == 0), and the running scan state is a pure function of the fp32
@@ -85,45 +85,45 @@ CHUNK_SYNCED_LAYERS: list["ChunkSyncedGDN"] = []
 #
 # The store is byte-capped and LRU-evicting -- one checkpoint is L_gdn * (HV*V*K*4 + D*(W-1)*2) bytes,
 # and two are kept per prompt. A miss is never a correctness event, only a smaller hit.
-_CS_APC_ENV = "SKYRL_ISOEXEC_GDN_CS_APC"
-_CS_APC_MB_ENV = "SKYRL_ISOEXEC_GDN_CS_APC_MB"
+_CPR_APC_ENV = "SKYRL_ISOEXEC_GDN_CPR_APC"
+_CPR_APC_MB_ENV = "SKYRL_ISOEXEC_GDN_CPR_APC_MB"
 
 
-def cs_apc_enabled() -> bool:
-    """True iff chunk_synced should serve vLLM prefix-cache hits from the boundary-state store.
+def cpr_apc_enabled() -> bool:
+    """True iff cpr should serve vLLM prefix-cache hits from the boundary-state store.
 
     Read at call time like every other mode flag. Default off, in which case `_continuation_mask` keeps
     its loud raise on a cache hit and the engine refuses `enable_prefix_caching` outright.
     """
-    return os.environ.get(_CS_APC_ENV, "0").lower() not in ("", "0", "false", "no")
+    return os.environ.get(_CPR_APC_ENV, "0").lower() not in ("", "0", "false", "no")
 
 
-def cs_apc_shared_mode() -> bool:
-    """True iff CS-APC runs in SHARED-INDEX mode (``SKYRL_ISOEXEC_GDN_CS_APC`` in {2, shm, shared}).
+def cpr_apc_shared_mode() -> bool:
+    """True iff CPR-APC runs in SHARED-INDEX mode (``SKYRL_ISOEXEC_GDN_CPR_APC`` in {2, shm, shared}).
 
     Mode "1" is the in-process design: admission reads the store directly, which is legal only at
     world_size == 1. Shared mode keeps the store and adoption per-worker and adds a scheduler-readable
     membership mirror in /dev/shm, which makes admission possible when the scheduler's process holds no
-    model. ``cs_apc_enabled()`` is true for both: only where admission reads membership differs. In
+    model. ``cpr_apc_enabled()`` is true for both: only where admission reads membership differs. In
     shared mode the store is also append-only within an epoch (``put`` refuses when full) so the
     published index can never advertise an evicted checkpoint.
     """
-    return os.environ.get(_CS_APC_ENV, "0").strip().lower() in ("2", "shm", "shared")
+    return os.environ.get(_CPR_APC_ENV, "0").strip().lower() in ("2", "shm", "shared")
 
 
-def cs_apc_budget_bytes() -> int:
+def cpr_apc_budget_bytes() -> int:
     """Device-memory ceiling for the boundary-state store. Default 1 GiB."""
-    return int(float(os.environ.get(_CS_APC_MB_ENV, "1024") or 1024) * 2**20)
+    return int(float(os.environ.get(_CPR_APC_MB_ENV, "1024") or 1024) * 2**20)
 
 
-# Fired by ``CSBoundaryStore.clear()``. Shared mode registers the shm publisher's ``invalidate`` here
+# Fired by ``CprBoundaryStore.clear()``. Shared mode registers the shm publisher's ``invalidate`` here
 # (rank 0 only), so any wholesale drop of the local store retracts every published entry before the
 # scheduler could admit against it. Exceptions propagate: a failed retraction while the index still
 # advertises must never pass silently.
-CS_APC_ON_CLEAR: list = []
+CPR_APC_ON_CLEAR: list = []
 
 
-class CSBoundaryStore:
+class CprBoundaryStore:
     """Prefix-keyed LRU of chunk-boundary GDN checkpoints, stacked across ALL GDN layers.
 
     Key: an opaque bytes digest of the token prefix ending at the checkpoint's position, built by the
@@ -175,13 +175,13 @@ class CSBoundaryStore:
         if n > self.budget:  # a single checkpoint bigger than the whole budget: refuse, do not thrash
             if not self._said_oversize:
                 self._said_oversize = True
-                # A model whose GDN state exceeds the whole budget can never cache; say so, or CS-APC
+                # A model whose GDN state exceeds the whole budget can never cache; say so, or CPR-APC
                 # looks installed and is permanently inert.
                 print(
-                    f"[ISOEXEC-CS-APC] STORE OVERSIZE: one boundary checkpoint is "
+                    f"[ISOEXEC-CPR-APC] STORE OVERSIZE: one boundary checkpoint is "
                     f"{n / 2**20:.1f} MiB but the whole budget is {self.budget / 2**20:.1f} MiB -- "
-                    "no checkpoint can ever be stored and CS-APC will never serve a hit. Raise "
-                    "SKYRL_ISOEXEC_GDN_CS_APC_MB or set SKYRL_ISOEXEC_GDN_CS_APC=0.",
+                    "no checkpoint can ever be stored and CPR-APC will never serve a hit. Raise "
+                    "SKYRL_ISOEXEC_GDN_CPR_APC_MB or set SKYRL_ISOEXEC_GDN_CPR_APC=0.",
                     flush=True,
                 )
             return False
@@ -191,11 +191,11 @@ class CSBoundaryStore:
                 # Fail-closed: in shared mode the store is append-only within a weight-sync epoch, so
                 # once full no new checkpoint is stored or published until the next reset.
                 print(
-                    f"[ISOEXEC-CS-APC] STORE FULL at {self._bytes / 2**20:.1f}/"
+                    f"[ISOEXEC-CPR-APC] STORE FULL at {self._bytes / 2**20:.1f}/"
                     f"{self.budget / 2**20:.1f} MiB ({len(self._d)} checkpoints): append-only mode "
                     "refuses new checkpoints instead of evicting (the shared index must never "
                     "advertise an evicted entry). Hit rate decays until the next weight sync. "
-                    "Raise SKYRL_ISOEXEC_GDN_CS_APC_MB if this repeats.",
+                    "Raise SKYRL_ISOEXEC_GDN_CPR_APC_MB if this repeats.",
                     flush=True,
                 )
             return False
@@ -211,7 +211,7 @@ class CSBoundaryStore:
     def clear(self) -> None:
         self._d.clear()
         self._bytes = 0
-        for hook in list(CS_APC_ON_CLEAR):  # retract the published index BEFORE anyone can admit
+        for hook in list(CPR_APC_ON_CLEAR):  # retract the published index BEFORE anyone can admit
             hook()
 
     def stats(self) -> dict:
@@ -231,36 +231,36 @@ class CSBoundaryStore:
 # the useful checkpoints are one per distinct prompt.
 _APC_PENDING_MAX = 16
 
-CS_APC_STORE: CSBoundaryStore | None = None
+CPR_APC_STORE: CprBoundaryStore | None = None
 
 
-def cs_apc_store() -> CSBoundaryStore:
+def cpr_apc_store() -> CprBoundaryStore:
     """The process-wide boundary-state store (built on first use, sized by the budget flag)."""
-    global CS_APC_STORE
-    if CS_APC_STORE is None:
-        CS_APC_STORE = CSBoundaryStore(cs_apc_budget_bytes(), evict=not cs_apc_shared_mode())
-    return CS_APC_STORE
+    global CPR_APC_STORE
+    if CPR_APC_STORE is None:
+        CPR_APC_STORE = CprBoundaryStore(cpr_apc_budget_bytes(), evict=not cpr_apc_shared_mode())
+    return CPR_APC_STORE
 
 
-def cs_apc_reset() -> None:
+def cpr_apc_reset() -> None:
     """Drop every cached boundary state. MUST run whenever vLLM's own prefix cache is reset."""
-    if CS_APC_STORE is not None:
-        CS_APC_STORE.clear()
+    if CPR_APC_STORE is not None:
+        CPR_APC_STORE.clear()
 
 
-def cs_apc_store_invalidate() -> None:
+def cpr_apc_store_invalidate() -> None:
     """Wholesale-drop the store because its tensors are about to become unreadable, e.g. an engine
-    sleep path releasing the pools. Alias of :func:`cs_apc_reset`, named for the contract: if the
+    sleep path releasing the pools. Alias of :func:`cpr_apc_reset`, named for the contract: if the
     checkpoint tensors ever move into a releasable pool, this must run before the release, or the
     shared-mode mirror keeps advertising checkpoints no worker can serve."""
-    cs_apc_reset()
+    cpr_apc_reset()
 
 
 _APC_ADOPT_WRITE_BATCH = 64
 
 
-def cs_apc_adopt_many(
-    layers: list["ChunkSyncedGDN"],
+def cpr_apc_adopt_many(
+    layers: list["CprGDN"],
     items: list[tuple[int, int, bytes]],
 ) -> list[int] | None:
     """Install a scheduler step's cached boundary states in one batched transaction.
@@ -280,7 +280,7 @@ def cs_apc_adopt_many(
         return None
     l0 = layers[0]
     C = l0.chunk_size
-    store = cs_apc_store()
+    store = cpr_apc_store()
     checkpoints: list[tuple[torch.Tensor, torch.Tensor]] = []
     for _slot, pos, key in items:
         if pos <= 0 or pos % C:
@@ -298,7 +298,7 @@ def cs_apc_adopt_many(
     rows = rows_by_layer[0]
     if any(other != rows for other in rows_by_layer[1:]):
         raise RuntimeError(
-            "[isoexec-gdn] CS-APC batched adoption found non-lockstepped recurrent pools; "
+            "[isoexec-gdn] CPR-APC batched adoption found non-lockstepped recurrent pools; "
             "continuing would install different requests on different layer rows"
         )
 
@@ -323,7 +323,7 @@ def cs_apc_adopt_many(
     return rows
 
 
-def cs_apc_adopt(layers: list["ChunkSyncedGDN"], slot: int, pos: int, key: bytes) -> bool:
+def cpr_apc_adopt(layers: list["CprGDN"], slot: int, pos: int, key: bytes) -> bool:
     """Install one cached boundary state; compatibility door onto batched adoption.
 
     After this returns True the slot is in every layer's map with ``pos``/``_entry_pos`` set to the hit
@@ -332,7 +332,7 @@ def cs_apc_adopt(layers: list["ChunkSyncedGDN"], slot: int, pos: int, key: bytes
     non-boundary position or a layer-count mismatch; a False is never a correctness event, it just means
     the prompt prefills cold.
     """
-    rows = cs_apc_adopt_many(layers, [(int(slot), int(pos), key)])
+    rows = cpr_apc_adopt_many(layers, [(int(slot), int(pos), key)])
     return rows is not None
 
 
@@ -341,7 +341,7 @@ def _alloc_state(shape, dtype, device):
     return torch.zeros(shape, dtype=dtype, device=device)
 
 
-def layer_batched_resync(layers: list["ChunkSyncedGDN"], slot_pos: list[tuple[int, int]]) -> int:
+def layer_batched_resync(layers: list["CprGDN"], slot_pos: list[tuple[int, int]]) -> int:
     """Fire pending boundary resyncs for ALL layers in ONE stacked state-pass call.
 
     All layers march in lockstep, so their independent closed chunks are stacked as one packed
@@ -374,7 +374,7 @@ def layer_batched_resync(layers: list["ChunkSyncedGDN"], slot_pos: list[tuple[in
     HV, Kd, Vd = l0.num_v_heads, l0.head_k_dim, l0.head_v_dim
 
     if l0._native_core:
-        from .gdn_chunk_synced import native_matched_prep
+        from .gdn_cpr import native_matched_prep
 
         Hk = l0.num_k_heads
         k_raw = torch.cat([ly.k_buf[rows_t] for ly in layers], dim=0).reshape(1, L * M * C, Hk, Kd)
@@ -411,10 +411,10 @@ def layer_batched_resync(layers: list["ChunkSyncedGDN"], slot_pos: list[tuple[in
     return M
 
 
-def cs_arena_specs(*, rows, C, HV, K, V, Hk, dt, gdt, conv_shape) -> list:
-    """``[(attr, shape, dtype), ...]`` for the chunk-synced DEVICE arena, in allocation order.
+def cpr_arena_specs(*, rows, C, HV, K, V, Hk, dt, gdt, conv_shape) -> list:
+    """``[(attr, shape, dtype), ...]`` for the CPR DEVICE arena, in allocation order.
 
-    Extracted from ``ChunkSyncedGDN.__init__`` so allocation order remains explicit.
+    Extracted from ``CprGDN.__init__`` so allocation order remains explicit.
     """
     specs = [
         ("ssm_state", (rows, HV, V, K), torch.float32),
@@ -428,12 +428,12 @@ def cs_arena_specs(*, rows, C, HV, K, V, Hk, dt, gdt, conv_shape) -> list:
     return specs
 
 
-def build_chunk_synced_gdn(*, max_num_seqs: int, chunk_size: int, **kw) -> "ChunkSyncedGDN":
-    """Build a :class:`ChunkSyncedGDN` sized by the scheduler's concurrency cap."""
-    return ChunkSyncedGDN(capacity=max_num_seqs, chunk_size=chunk_size, **kw)
+def build_cpr_gdn(*, max_num_seqs: int, chunk_size: int, **kw) -> "CprGDN":
+    """Build a :class:`CprGDN` sized by the scheduler's concurrency cap."""
+    return CprGDN(capacity=max_num_seqs, chunk_size=chunk_size, **kw)
 
 
-class ChunkSyncedGDN(RecurrentGDN):
+class CprGDN(RecurrentGDN):
     """RecurrentGDN + per-slot open-chunk buffers, fp32 entry states, and the boundary resync."""
 
     _entry_state_dev = None
@@ -442,7 +442,7 @@ class ChunkSyncedGDN(RecurrentGDN):
     def entry_state(self) -> torch.Tensor:
         """The fp32 boundary chain, ``[rows, HV, V, K]``.
 
-        A view into the chunk-synced device arena.
+        A view into the CPR device arena.
         """
         return self._entry_state_dev
 
@@ -453,7 +453,7 @@ class ChunkSyncedGDN(RecurrentGDN):
     def __init__(self, *, capacity: int, chunk_size: int, ssm_state=None, conv_state=None, **kw):
         if ssm_state is not None or conv_state is not None:
             raise ValueError(
-                "[isoexec-gdn] chunk_synced mode owns its state pool (entry states + open-chunk "
+                "[isoexec-gdn] cpr mode owns its state pool (entry states + open-chunk "
                 "buffers live beside it); native vLLM state is not supported. Unset "
                 "SKYRL_ISOEXEC_GDN_NATIVE_STATE."
             )
@@ -470,7 +470,7 @@ class ChunkSyncedGDN(RecurrentGDN):
         from .gdn_ops import gdn_native_kernels_enabled
 
         self._native_core = gdn_native_kernels_enabled()
-        # ``GDN_CS_SLEEP`` places these seven tensors in one verified private-tag arena. Otherwise
+        # ``GDN_CPR_SLEEP`` places these seven tensors in one verified private-tag arena. Otherwise
         # they follow the CUDA allocation context active during model construction. Allocation is
         # complete before graph capture.
         # Open-chunk buffers: the eager core stores prepared values (k expanded to HV, g fp32), the
@@ -480,7 +480,7 @@ class ChunkSyncedGDN(RecurrentGDN):
         # what makes the bf16 snapshots exact and must never round through bf16.
         _Hk = self.num_k_heads if self._native_core else HV
         _gdt = dt if self._native_core else torch.float32
-        _specs = cs_arena_specs(
+        _specs = cpr_arena_specs(
             rows=rows,
             C=C,
             HV=HV,
@@ -491,9 +491,9 @@ class ChunkSyncedGDN(RecurrentGDN):
             gdt=_gdt,
             conv_shape=self.conv_state.shape,
         )
-        from .gdn_cs_sleep import alloc_cs_arena, register_layer
+        from .gdn_cpr_sleep import alloc_cpr_arena, register_layer
 
-        _arena = alloc_cs_arena(_specs, dev)
+        _arena = alloc_cpr_arena(_specs, dev)
         if _arena is None:
             self.ssm_state = _alloc_state((rows, HV, V, K), torch.float32, dev)
             self.conv_state = _alloc_state(tuple(self.conv_state.shape), dt, dev)
@@ -536,7 +536,7 @@ class ChunkSyncedGDN(RecurrentGDN):
         # Native vLLM conv pair (causal_conv1d_fn prefill / _update decode) instead of the eager
         # per-sequence loop: one varlen launch. The two convs round differently, so the trainer shim
         # must flip with it. Read once at build.
-        from .gdn_cs_scatter import fused_scatter_enabled
+        from .gdn_cpr_scatter import fused_scatter_enabled
         from .gdn_ops import gdn_native_conv_enabled
 
         # The native core implies the native conv pair.
@@ -546,13 +546,13 @@ class ChunkSyncedGDN(RecurrentGDN):
         # APC (prefix caching). Off costs nothing on any path. On, prefill also materialises the fp32
         # entry state and conv window at the last one or two chunk boundaries it closes and stashes them
         # as row -> [(absolute boundary pos, entry fp32 [HV,V,K], conv [D,W-1]), ...] for the driver.
-        self._apc = cs_apc_enabled()
+        self._apc = cpr_apc_enabled()
         self._apc_pending: dict[int, list[tuple[int, torch.Tensor, torch.Tensor]]] = {}
-        CHUNK_SYNCED_LAYERS.append(self)
+        CPR_LAYERS.append(self)
 
     # -- internals ------------------------------------------------------------------------
     def _reset_rows(self, rows) -> None:
-        """Zero the chunk-synced side state for rows starting a FRESH prompt.
+        """Zero the CPR side state for rows starting a FRESH prompt.
 
         ``rows`` is a host list of row indices, not a device tensor: prefill decides freshness on the
         host and every caller already has the list.
@@ -566,7 +566,7 @@ class ChunkSyncedGDN(RecurrentGDN):
                 self._apc_pending.pop(int(r), None)
 
     def _on_row_released(self, row: int) -> None:
-        """A released row keeps no chunk-synced side state: entry position, pending checkpoints."""
+        """A released row keeps no CPR side state: entry position, pending checkpoints."""
         self._entry_pos.pop(int(row), None)
         self._row_pos.pop(int(row), None)
         self._apc_pending.pop(int(row), None)
@@ -617,7 +617,7 @@ class ChunkSyncedGDN(RecurrentGDN):
         untouched. It is exact because the state pass is a chunk-sequential fp32 scan: its final over
         the first m-1 chunks equals its own internal entry to chunk m-1.
 
-        Costs about one extra boundary pass per prefill call, only under CS-APC.
+        Costs about one extra boundary pass per prefill call, only under CPR-APC.
         """
         C = self.chunk_size
         sel = [j for j, m in enumerate(ms) if m >= 2]
@@ -716,7 +716,7 @@ class ChunkSyncedGDN(RecurrentGDN):
         if self._native_core:
             # Buffers hold raw compressed-head k and raw a/b: recompute the boundary prep eagerly with
             # the same shared function the trainer forward uses.
-            from .gdn_chunk_synced import native_matched_prep
+            from .gdn_cpr import native_matched_prep
 
             k_raw = self.k_buf[rows_b].reshape(1, M * C, self.num_k_heads, self.head_k_dim)
             a_raw = self.g_buf[rows_b].reshape(M * C, self.num_v_heads)
@@ -759,15 +759,15 @@ class ChunkSyncedGDN(RecurrentGDN):
         conv_metadata=None,
         prefill_query_start_loc=None,
     ):
-        """v2 prefill: native conv fn + matched-prep boundary pass + segmented fused-core scan.
+        """Native prefill: native conv fn + matched-prep boundary pass + segmented fused-core scan.
 
-        Same slot bookkeeping, segment grid and bf16-snapshot/fp32-chain handoff as the v1 ``prefill``
+        Same slot bookkeeping, segment grid and bf16-snapshot/fp32-chain handoff as the eager ``prefill``
         below; only the composition differs -- raw q/k/a/b drive the fused core, and the boundary pass
         consumes ``native_matched_prep`` of the raw buffered values.
         """
         from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 
-        from .gdn_chunk_synced import native_matched_prep
+        from .gdn_cpr import native_matched_prep
         from .gdn_ops import gdn_native_core_kernel
 
         N = len(slots_cpu)
@@ -994,7 +994,7 @@ class ChunkSyncedGDN(RecurrentGDN):
         conv_metadata=None,
         prefill_query_start_loc=None,
     ):
-        """Prefill via the canonical chunk-synced forward; leaves decode-compatible slot state.
+        """Prefill via the canonical CPR forward; leaves decode-compatible slot state.
 
         Handles fresh prompts and chunked-prefill continuations (a slot already in the map resumes
         from its running state, entry state, and open-chunk buffer -- a mid-chunk prefill stop and a
@@ -1328,9 +1328,9 @@ class ChunkSyncedGDN(RecurrentGDN):
         if self._fused_scatter:
             # One launch for all four buffer writes, the pos advance and the LRU stamp. Pure data
             # movement, equal to the indexed writes below, and capture-safe.
-            from .gdn_cs_scatter import cs_buffer_scatter
+            from .gdn_cpr_scatter import cpr_buffer_scatter
 
-            cs_buffer_scatter(
+            cpr_buffer_scatter(
                 buf_k.to(self.k_buf.dtype),
                 v.to(self.v_buf.dtype),
                 buf_g.to(self.g_buf.dtype),

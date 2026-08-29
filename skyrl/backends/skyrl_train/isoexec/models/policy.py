@@ -37,8 +37,7 @@ class Selection:
     def __post_init__(self) -> None:
         if self.classification not in (FUNCTION, DEPLOYMENT):
             raise ContractBuildError(
-                f"unknown classification {self.classification!r}; must be one of "
-                f"['{DEPLOYMENT}', '{FUNCTION}']"
+                f"unknown classification {self.classification!r}; must be one of " f"['{DEPLOYMENT}', '{FUNCTION}']"
             )
         if self.classification == DEPLOYMENT and not self.neutrality_proof:
             raise ContractBuildError(
@@ -53,11 +52,11 @@ class Selection:
                 "neutral (classify it deployment) or it is not (leave it function)."
             )
 
+
 # Site vocabulary.
 TRAINER = ("trainer_fwd", "trainer_score")
 ENGINE = ("engine_prefill", "engine_decode")
 ALL_SITES = TRAINER + ENGINE
-SCORE_ONLY = ("trainer_score",)
 
 # The engine-unpin neutrality proof is entry-scoped: the trainer selection stays FUNCTION-classified
 # because changing it changes the trainer composition and reassociates backward reductions.
@@ -100,6 +99,13 @@ def mm_impl_for_process() -> str:
     return "cublaslt_pinned" if os.environ.get("SKYRL_ISOEXEC_MM_CUBLASLT", "0") == "1" else "triton_batch_invariant"
 
 
+#: The fixed per-leaf tile of the rowinv Kahan exp sum. A contract constant, not a tuning knob:
+#: it must equal the BLOCK ``ops/logprobs/rowinv.py`` compiles with, and the registry declares the
+#: same literal, so a drifted kernel refuses at pin validation instead of hashing a schedule the
+#: process does not run.
+ROWINV_BLOCK = 4096
+
+
 def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
     """``ModelProfile`` -> the complete ``{(op, site): Selection}`` selection set.
 
@@ -135,10 +141,22 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
         put("norms.rms", ALL_SITES, impl="eager_torch_rms")
 
     # Logprobs.
-    # aten-order log-softmax at the scoring site; the engine runs the bitwise-equal fused-exp twin.
-    # The lm_head row slice is engine-only: the trainer scores every position, the engine sampled rows.
-    put("logprobs.log_softmax", SCORE_ONLY, impl="aten_reference")
-    put("logprobs.log_softmax", ENGINE, impl="aten_reference_fused_exp", pinned={"min_rows_fastpath": 16})
+    # The leaf-tree impl is ONE function at all four sites -- that is the whole point (aten's
+    # vocab sum is neither row-count- nor TP-invariant, so no twin of it can serve both runtimes),
+    # so there is no engine-only variant and no site keeps the incumbent. Unconditional: this is
+    # the composition, not a choice, and the aten-order selection it replaced is gone rather than
+    # flag-reachable. FUNCTION-classified (the default): it moves bits, so it is hashed, never
+    # proof-carried.
+    put(
+        "logprobs.log_softmax",
+        ALL_SITES,
+        impl="rowinv_leaftree",
+        # The pins ARE the function: G fixes the leaf boundaries and the combine tree, BLOCK the
+        # per-leaf tile, and the accumulator names the per-leaf summation.
+        pinned={"leaves": profile.pik_leaves, "block": ROWINV_BLOCK, "accum": "kahan_fp32"},
+    )
+    # The lm_head row slice is engine-only either way: the trainer scores every position, the
+    # engine sampled rows -- a pure row selection, orthogonal to which denominator schedule runs.
     put("logprobs.lm_head_slice", ENGINE, impl="sampled_rows")
 
     # GatedDeltaNet.
@@ -150,13 +168,13 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
         put("gdn.conv", TRAINER + ("engine_prefill",), impl="causal_conv1d_fn")
         put("gdn.conv", ("engine_decode",), impl="causal_conv1d_update")
         # Engine-only state, and which object owns it is decided by the GDN mode: under
-        # `chunk_synced` the engine refuses GDN_NATIVE_STATE=1 and ChunkSyncedGDN raises on a
+        # `cpr` the engine refuses GDN_NATIVE_STATE=1 and CprGDN raises on a
         # handed-in state tensor, so `native_kv_cache` is not selectable there.
-        if profile.gdn_kernel == "chunk_synced":
+        if profile.gdn_kernel == "cpr":
             put(
                 "gdn.state",
                 ENGINE,
-                impl="chunk_synced_pool",
+                impl="cpr_pool",
                 pinned={
                     "ssm_state_dtype": profile.ssm_cache_dtype,
                     # The trainer's segmented scan and this pool's boundary pass are the same

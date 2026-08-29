@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import time
 from collections import defaultdict
 from enum import Enum
 from pathlib import Path
@@ -46,26 +47,111 @@ ISOEXEC_FORWARD_GATE_MAX_MAX = 1.0e-4
 ISOEXEC_FORWARD_GATE_CASE_PAIR = ("engine_decode", "trainer_score")
 
 
-def isoexec_gate_limits() -> Tuple[float, float]:
-    """``(mean_max, max_max)`` for the forward gate.
+ISOEXEC_CONTRACT_PATH_ENV = "ISOEXEC_CONTRACT_PATH"
+# The delivered artifact can lag this process: the workers write it while they install, the
+# controller reads it at the first gate. Retried rather than fallen back to on the first miss.
+_GATE_ARTIFACT_TRIES = 5
+_GATE_ARTIFACT_SLEEP_S = 0.2
 
-    Where this process built an ExecutionContract, the contract's ToleranceClaim for the
-    (engine_decode, trainer_score) pair is authoritative -- the envelope is contract data, hashed
-    into the deployment identity, not a controller constant. The module constants remain the
-    fallback for processes with no contract (e.g. a CPU driver, which cannot build one).
+_gate_artifact_cache: Dict[Tuple[str, int, int], Tuple[float, float]] = {}
+_gate_limit_logged: set = set()
+
+
+def _gate_tolerance_bounds(contract) -> Optional[Tuple[float, float]]:
+    """The (engine_decode, trainer_score) tolerance claim's bounds, or None if it declares none."""
+    for t in contract.claims.tolerances:
+        if tuple(t.case_pair) == ISOEXEC_FORWARD_GATE_CASE_PAIR:
+            b = dict(t.bounds)
+            return float(b["abs_diff_mean_max"]), float(b["abs_diff_max_max"])
+    return None
+
+
+def _log_gate_limit_source(source: str, limits: Tuple[float, float], detail: str = "") -> None:
+    # Once per distinct (source, limits): the gate runs every step and the provenance is the point.
+    key = (source, limits)
+    if key in _gate_limit_logged:
+        return
+    _gate_limit_logged.add(key)
+    logger.warning(
+        "[ISOEXEC-GATE] LIMITS source={} mean_max={:.9e} max_max={:.9e}{}",
+        source,
+        limits[0],
+        limits[1],
+        f" ({detail})" if detail else "",
+    )
+
+
+def _gate_limits_from_artifact(path: str) -> Tuple[float, float]:
+    """Limits from the DELIVERED contract at ``path`` (``core/contract_delivery.load_contract``,
+    which validates stored identities == recomputed before anything is read out of it)."""
+    from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import load_contract
+
+    last: Optional[Exception] = None
+    for _ in range(_GATE_ARTIFACT_TRIES):
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            last = e
+            time.sleep(_GATE_ARTIFACT_SLEEP_S)
+            continue
+        key = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+        hit = _gate_artifact_cache.get(key)
+        if hit is not None:
+            return hit
+        bounds = _gate_tolerance_bounds(load_contract(path))
+        if bounds is None:
+            raise RuntimeError(
+                f"the delivered contract at {path!r} declares no tolerance claim for "
+                f"{ISOEXEC_FORWARD_GATE_CASE_PAIR}"
+            )
+        _gate_artifact_cache[key] = bounds
+        return bounds
+    raise RuntimeError(f"contract artifact {path!r} never appeared ({_GATE_ARTIFACT_TRIES} tries): {last}")
+
+
+def isoexec_gate_limits() -> Tuple[float, float]:
+    """``(mean_max, max_max)`` for the forward gate, from the CONTRACT wherever one is reachable.
+
+    The envelope is contract data -- hashed into the deployment identity -- not a controller
+    constant, so the module constants are the last resort, never a silent one. Two contract
+    sources, in order: the ExecutionContract this process built (workers), then the delivered
+    artifact at ``ISOEXEC_CONTRACT_PATH`` (the controller, which builds no contract of its own and
+    would otherwise run the gate on the module fallback while the delivered contract claims
+    something else entirely). A configured artifact that cannot be resolved REFUSES rather than
+    falling back, because falling back is that defect.
     """
     try:
-        from skyrl.backends.skyrl_train.isoexec.core.process_contract import cached_contract
+        from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+            cached_contract,
+        )
 
         c = cached_contract()
-        if c is not None:
-            for t in c.claims.tolerances:
-                if tuple(t.case_pair) == ISOEXEC_FORWARD_GATE_CASE_PAIR:
-                    b = dict(t.bounds)
-                    return float(b["abs_diff_mean_max"]), float(b["abs_diff_max_max"])
-    except Exception:  # noqa: BLE001 -- limit resolution must never break the gate itself
-        pass
-    return ISOEXEC_FORWARD_GATE_MEAN_MAX, ISOEXEC_FORWARD_GATE_MAX_MAX
+    except Exception:  # noqa: BLE001 -- no isoexec package in this process
+        c = None
+    if c is not None:
+        bounds = _gate_tolerance_bounds(c)
+        if bounds is not None:
+            _log_gate_limit_source("process_contract", bounds)
+            return bounds
+    fallback = (ISOEXEC_FORWARD_GATE_MEAN_MAX, ISOEXEC_FORWARD_GATE_MAX_MAX)
+    path = os.environ.get(ISOEXEC_CONTRACT_PATH_ENV)
+    if path:
+        try:
+            bounds = _gate_limits_from_artifact(path)
+        except Exception as e:  # noqa: BLE001 -- reported as a refusal, not swallowed
+            msg = (
+                f"[ISOEXEC-GATE] REFUSED: {ISOEXEC_CONTRACT_PATH_ENV}={path!r} names the delivered "
+                f"contract as this process's limit source, but it could not be resolved: "
+                f"{type(e).__name__}: {e}. Falling back to the module constants "
+                f"{fallback} would judge the run against limits the contract does not declare."
+            )
+            _refuse_isoexec_gate(msg)  # strict raises; debug tracing demotes to the fallback
+            _log_gate_limit_source("module_fallback", fallback, f"DEMOTED: artifact unresolved at {path}")
+            return fallback
+        _log_gate_limit_source("contract_artifact", bounds, path)
+        return bounds
+    _log_gate_limit_source("module_fallback", fallback, "no contract built and no ISOEXEC_CONTRACT_PATH configured")
+    return fallback
 
 
 def finalize_post_update_rollout_logprob_diff_std(metrics: Dict[str, float]) -> None:
@@ -88,6 +174,27 @@ def finalize_post_update_rollout_logprob_diff_std(metrics: Dict[str, float]) -> 
 
 # Backward-compatible import name; it now finalizes the explicitly named post-update series.
 finalize_minibatch_rollout_logprob_diff_std = finalize_post_update_rollout_logprob_diff_std
+
+
+def _refuse_isoexec_gate(msg: str) -> bool:
+    """A gate refusal through the enforcement layer: strict raises, debug tracing demotes.
+
+    Same strict behavior as the bare ``raise`` this replaced; what it adds is that a traced run
+    reaches the trace it was started for instead of dying at the gate, with the ledger record just
+    as red either way.
+    """
+    try:
+        from skyrl.backends.skyrl_train.isoexec.core import enforce
+    except Exception:  # noqa: BLE001 -- no isoexec package: the gate keeps its own hard refusal
+        raise RuntimeError(msg) from None
+    return enforce.refuse(msg)
+
+
+def isoexec_step1_boundary() -> None:
+    """Close STEP1 for the trainer side once the gate has served. Fail-safe except the refusal."""
+    from skyrl.backends.skyrl_train.isoexec.core import enforce
+
+    enforce.step1_boundary("trainer")
 
 
 def _report_isoexec_gate(result: str, evidence: str) -> None:
@@ -151,23 +258,25 @@ def validate_isoexec_forward_gate(
     minimum = float(metrics[f"{ISOEXEC_FORWARD_GATE_PREFIX}_min"])
     maximum = float(metrics[f"{ISOEXEC_FORWARD_GATE_PREFIX}_max"])
     mean_limit, max_limit = isoexec_gate_limits()
+    # Served before the verdict, so the limits the gate judged by are visible even on the red path.
+    metrics["policy/isoexec_forward_gate_mean_limit"] = mean_limit
+    metrics["policy/isoexec_forward_gate_max_limit"] = max_limit
     if minimum < 0.0 or maximum < mean or mean > mean_limit or maximum > max_limit:
         _report_isoexec_gate(
             "violation",
             f"min={minimum:.9e} mean={mean:.9e} max={maximum:.9e} outside mean_limit={mean_limit:.1e} "
             f"max_limit={max_limit:.1e}",
         )
-        raise RuntimeError(
+        _refuse_isoexec_gate(
             "[ISOEXEC-GATE] RED before backward: the canonical identical-weight scoring gate "
             f"is outside its admitted range (min={minimum:.9e}, mean={mean:.9e}, "
             f"max={maximum:.9e}, mean_limit={mean_limit:.1e}, "
             f"max_limit={max_limit:.1e}). "
             "A finite value is not sufficient evidence of IsoExec."
         )
+    else:
+        _report_isoexec_gate("ok", f"mean={mean:.3e} max={maximum:.3e} within ({mean_limit:.1e}, {max_limit:.1e})")
     metrics["policy/isoexec_forward_gate_audited"] = 1.0
-    metrics["policy/isoexec_forward_gate_mean_limit"] = mean_limit
-    metrics["policy/isoexec_forward_gate_max_limit"] = max_limit
-    _report_isoexec_gate("ok", f"mean={mean:.3e} max={maximum:.3e} within ({mean_limit:.1e}, {max_limit:.1e})")
     return True
 
 

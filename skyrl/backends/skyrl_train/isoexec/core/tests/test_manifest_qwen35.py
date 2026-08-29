@@ -17,6 +17,11 @@ _SITES = ("trainer_fwd", "trainer_score", "engine_prefill", "engine_decode")
 
 _SUBSUMED = {("gdn." + op, site) for op in ("l2norm", "gating") for site in _SITES}
 
+# Every key the registry licenses is now selected: log_softmax:trainer_fwd used to sit here
+# because the aten-order default declared no logprob contract at the training forward, and
+# rowinv_leaftree -- one function at all four sites -- is the composition now.
+_LICENSED_UNSELECTED: set = set()
+
 
 @contextmanager
 def _code_defaults(**overrides):
@@ -53,7 +58,8 @@ def test_uncovered_keys_are_exactly_the_subsumed_ops():
     with _code_defaults():
         reg, _, view = _build()
     uncovered = set(reg.installed_keys()) - set(view.keys())
-    assert uncovered == _SUBSUMED, f"unexpected uncovered set: {sorted(uncovered ^ _SUBSUMED)}"
+    expected = _SUBSUMED | _LICENSED_UNSELECTED
+    assert uncovered == expected, f"unexpected uncovered set: {sorted(uncovered ^ expected)}"
 
     assert not (set(view.keys()) - set(reg.installed_keys()))
 

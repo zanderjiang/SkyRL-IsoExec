@@ -13,19 +13,20 @@ import re
 import tempfile
 from types import SimpleNamespace
 
-# torch-first, as in production: workers load torch long before any isoexec module.
-from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
-
 from skyrl.backends.skyrl_train.isoexec.core import adapter as ad
 from skyrl.backends.skyrl_train.isoexec.core import arch as arch_mod
 from skyrl.backends.skyrl_train.isoexec.core import enforce
 from skyrl.backends.skyrl_train.isoexec.core import fingerprint as fp
 from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
-from skyrl.backends.skyrl_train.isoexec.core.process_contract import build_contract_view
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
-from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import MegatronContractAdapter
+from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+    MegatronContractAdapter,
+)
 from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContractAdapter
+
+# torch-first, as in production: workers load torch long before any isoexec module.
+from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
 
 # CPU-only harness (a live production run owns the GPUs): the real adapter build path reads
 # core/arch.ARCH, so point it at the production accelerator instead of the sentinel.
@@ -181,8 +182,11 @@ def test_trainer_full_lifecycle_green():
                 }
                 assert _summary_counts(cap.msgs, "trainer") == counts
 
-                with open(os.path.join(d, "enforcement.json")) as fh:
+                # One verdict file per process now; this fixture is one process.
+                (art,) = enforce.verdict_artifacts(d)
+                with open(art) as fh:
                     loaded = json.load(fh)
+                assert os.path.basename(art).startswith("enforcement.trainer.r")
                 assert loaded["counts"] == counts
                 assert loaded["phases_closed"] == sorted(f"trainer:{p}" for p in enforce.PHASES)
                 by_id = {o["id"]: o for o in loaded["obligations"]}
@@ -243,8 +247,10 @@ def test_engine_full_lifecycle_green():
                 }
                 assert _summary_counts(cap.msgs, "engine") == counts
 
-                with open(os.path.join(d, "enforcement.json")) as fh:
+                (art,) = enforce.verdict_artifacts(d)
+                with open(art) as fh:
                     loaded = json.load(fh)
+                assert os.path.basename(art).startswith("enforcement.engine.r")
                 assert loaded["counts"] == counts
                 assert loaded["phases_closed"] == sorted(
                     f"engine:{p}" for p in (enforce.INSTALL, enforce.FIRST_FORWARD, enforce.WEIGHT_SYNC)

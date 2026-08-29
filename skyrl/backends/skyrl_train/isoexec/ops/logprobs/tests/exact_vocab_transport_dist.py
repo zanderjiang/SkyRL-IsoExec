@@ -47,7 +47,9 @@ if int(os.environ.get("WORLD_SIZE", "1")) < 2 or not torch.cuda.is_available():
     raise SystemExit(0)
 import yaml
 
-from skyrl.backends.skyrl_train.isoexec.ops.logprobs import exact_vocab_transport as transport
+from skyrl.backends.skyrl_train.isoexec.ops.logprobs import (
+    exact_vocab_transport as transport,
+)
 
 _CONFIG_FIELDS = frozenset(
     {
@@ -91,7 +93,11 @@ def _load_config(path: str | None) -> dict:
     for name in ("rows", "shard_widths"):
         if name in result:
             values = result[name]
-            if not isinstance(values, list) or not values or any(not isinstance(value, int) or value < 1 for value in values):
+            if (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(value, int) or value < 1 for value in values)
+            ):
                 raise ValueError(f"{name} must be a non-empty list of positive integers")
             result[name] = tuple(values)
     return result
@@ -275,9 +281,7 @@ def main() -> None:
         configured = os.environ.get("NCCL_MAX_NCHANNELS")
         requested = str(args.nccl_max_nchannels)
         if configured not in (None, requested):
-            raise RuntimeError(
-                f"NCCL_MAX_NCHANNELS={configured} conflicts with --nccl-max-nchannels={requested}"
-            )
+            raise RuntimeError(f"NCCL_MAX_NCHANNELS={configured} conflicts with --nccl-max-nchannels={requested}")
         os.environ["NCCL_MAX_NCHANNELS"] = requested
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -289,9 +293,7 @@ def main() -> None:
     tp_group = _make_tp_group(world, args.tp_max_ctas)
     tp_max_ctas_readback = _readback_max_ctas(tp_group)
     if args.tp_max_ctas is not None and tp_max_ctas_readback != args.tp_max_ctas:
-        raise RuntimeError(
-            f"TP ProcessGroupNCCL max_ctas readback={tp_max_ctas_readback} requested={args.tp_max_ctas}"
-        )
+        raise RuntimeError(f"TP ProcessGroupNCCL max_ctas readback={tp_max_ctas_readback} requested={args.tp_max_ctas}")
     dtype = _dtype(args.dtype)
     rows_out = []
     all_exact = True
@@ -321,12 +323,8 @@ def main() -> None:
                 p2p_before = transport._memory_snapshot(device)
                 p2p_ms, p2p = _timed(lambda wire=wire: _owner_p2p(wire, world, tp_group), args.repeats)
                 p2p_after = transport._memory_snapshot(device)
-                incumbent_ms, incumbent = _timed(
-                    lambda wire=wire: _incumbent(wire, world, tp_group), args.repeats
-                )
-                selected_ms, selected_pair = _timed(
-                    lambda wire=wire: _selected(wire, world, tp_group), args.repeats
-                )
+                incumbent_ms, incumbent = _timed(lambda wire=wire: _incumbent(wire, world, tp_group), args.repeats)
+                selected_ms, selected_pair = _timed(lambda wire=wire: _selected(wire, world, tp_group), args.repeats)
                 selected_owner, selected = selected_pair
                 local_exact = True
                 local_selected_exact = True
@@ -382,10 +380,7 @@ def main() -> None:
         census = transport.stats()
         group_row = census["groups"][0]
         post_lazy_delta = group_row["incremental_nontorch_mib"]
-        local_post_lazy_zero = (
-            post_lazy_delta is not None
-            and abs(post_lazy_delta) <= args.post_lazy_zero_tolerance_mib
-        )
+        local_post_lazy_zero = post_lazy_delta is not None and abs(post_lazy_delta) <= args.post_lazy_zero_tolerance_mib
         zero_vote = torch.tensor(int(local_post_lazy_zero), dtype=torch.int32, device=device)
         dist.all_reduce(zero_vote, op=dist.ReduceOp.MIN, group=tp_group)
         all_post_lazy_zero = bool(zero_vote.item())

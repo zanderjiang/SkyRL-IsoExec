@@ -44,7 +44,6 @@ os.environ["SKYRL_ISOEXEC_MM_FWD_ONLY_BMM"] = "0"
 
 import torch  # noqa: E402
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)

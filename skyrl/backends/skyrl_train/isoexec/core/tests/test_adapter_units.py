@@ -8,9 +8,6 @@ import dataclasses
 import os
 from types import SimpleNamespace
 
-# torch-first, as in production.
-from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo  # noqa: F401
-
 from skyrl.backends.skyrl_train.isoexec.contract import Claims
 from skyrl.backends.skyrl_train.isoexec.core import adapter as ad
 from skyrl.backends.skyrl_train.isoexec.core import arch as arch_mod
@@ -20,8 +17,15 @@ from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
 from skyrl.backends.skyrl_train.isoexec.core.process_contract import build_contract_view
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
-from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import MegatronContractAdapter
+from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+    MegatronContractAdapter,
+)
 from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContractAdapter
+
+# torch-first, as in production.
+from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import (
+    CudaIpcInitInfo,  # noqa: F401
+)
 
 # CPU-only harness (a live production run owns the GPUs): real builds read core/arch.ARCH.
 if arch_mod.ARCH == arch_mod.NON_ACCELERATOR_ARCH:
@@ -187,9 +191,7 @@ def test_run_install_twice_does_not_double_report():
         assert len(enforce.ledger().records["build_valid:contract"]) == 1  # cached build: one attest
         plan = enforce.ledger().plans["trainer"]
         assert all(
-            enforce.ledger().status_of(ob) == enforce.OK
-            for ob in plan.obligations
-            if ob.phase == enforce.INSTALL
+            enforce.ledger().status_of(ob) == enforce.OK for ob in plan.obligations if ob.phase == enforce.INSTALL
         )
 
 

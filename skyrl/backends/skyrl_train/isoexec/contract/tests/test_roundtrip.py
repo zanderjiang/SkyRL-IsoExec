@@ -62,6 +62,18 @@ class TestRoundTrip(unittest.TestCase):
         with self.assertRaises(SerializationError):
             from_canonical_json(json.dumps(d).encode())
 
+    def test_superseded_schema_version_refused(self):
+        # A "1" artifact hashed its cases by id alone: it must refuse, not re-hash under these rules.
+        d = json.loads(to_canonical_json(base_contract()))
+        d["schema_version"] = "1"
+        with self.assertRaises(SerializationError) as cm:
+            from_canonical_json(json.dumps(d).encode())
+        # ...and say which versions it does read and how to get one, since the reader is holding an
+        # artifact and has no other way to learn either.
+        msg = str(cm.exception)
+        self.assertIn("['2']", msg)
+        self.assertIn("rebuild the contract", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

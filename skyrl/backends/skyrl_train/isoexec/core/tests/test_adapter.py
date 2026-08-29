@@ -11,7 +11,11 @@ import dataclasses
 import os
 from types import SimpleNamespace
 
-from skyrl.backends.skyrl_train.isoexec.contract import Claims, StateClaim, ToleranceClaim
+from skyrl.backends.skyrl_train.isoexec.contract import (
+    Claims,
+    StateClaim,
+    ToleranceClaim,
+)
 from skyrl.backends.skyrl_train.isoexec.core import adapter as ad
 from skyrl.backends.skyrl_train.isoexec.core import enforce
 from skyrl.backends.skyrl_train.isoexec.core import fingerprint as fp
@@ -143,8 +147,12 @@ def test_unknown_claim_kind_is_a_refusal():
 
 
 def test_per_runtime_facts_shape():
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import MegatronContractAdapter
-    from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContractAdapter
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+        MegatronContractAdapter,
+    )
+    from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import (
+        VLLMContractAdapter,
+    )
 
     saved = os.environ.get("SKYRL_ISOEXEC_TRAINER_SP")
     try:
@@ -258,10 +266,15 @@ def test_adapter_install_sequence_matches_pre_adapter_ledger_counts():
     Golden, measured 2026-08-21 on the pre-change tree (simulated trainer flow: contract build ->
     assert_topology_within_claims -> record_install x trainer sites -> install_boundary) under the
     production env: [ISOEXEC-ENFORCE] side=trainer ok=36 refused=0 logged=0 missing=0 excepted=0.
+    Re-measured at 37 when rowinv became the composed logprob: the training forward gained a
+    logprob case, so one more install attest is recorded. The shape of the golden -- everything
+    ok, nothing refused, logged, missing or excepted -- is what this pins, not the integer.
     """
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import MegatronContractAdapter
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+        MegatronContractAdapter,
+    )
 
-    golden = {"ok": 36, "refused": 0, "logged": 0, "missing": 0, "excepted": 0}
+    golden = {"ok": 37, "refused": 0, "logged": 0, "missing": 0, "excepted": 0}
     with _fresh():
         pc._CONTRACT, pc._VIEW = None, None  # the adapter builds for real: build_valid is recorded
 
@@ -286,8 +299,12 @@ def test_adapter_install_sequence_matches_pre_adapter_ledger_counts():
 
 
 def test_boundary_delegates_first_forward_and_weight_sync():
-    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import MegatronContractAdapter
-    from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContractAdapter
+    from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
+        MegatronContractAdapter,
+    )
+    from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import (
+        VLLMContractAdapter,
+    )
 
     with _fresh():
         # Trainer stamp flow: report + WEIGHT_SYNC close, exactly what the worker.py site did.

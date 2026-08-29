@@ -24,7 +24,7 @@ _BASE_SITES = frozenset(
 )
 
 # The hazard vocabulary. A test that declares one of these must prove it actually fired, or the
-# pass is vacuous. A floor, not a ceiling.
+# pass is vacuous.
 HAZARDS = frozenset(
     {
         "null_lanes",  # NULL / padded lanes (graph-replay inertness)
@@ -79,24 +79,25 @@ class OneOf:
         self.values = tuple(values)
 
     def __contains__(self, value) -> bool:
-        return any(_pin_values_equal(v, value) for v in self.values)
+        return any(pin_values_equal(v, value) for v in self.values)
 
     def __repr__(self) -> str:
         return f"OneOf{self.values!r}"
 
 
-def _pin_values_equal(a, b) -> bool:
+def pin_values_equal(a, b) -> bool:
     """Equality for a declared schedule value vs a manifest pin.
 
     Sequence-insensitive, because a manifest round-trips through JSON and a declared tuple arrives
-    as a list, and bool-strict, so a pin of ``1`` against a declared ``True`` is a mismatch.
+    as a list, and bool-strict, so a pin of ``1`` against a declared ``True`` is a mismatch. Public
+    because the install fingerprint compares recorded pins against the contract's by the same rule.
     """
     if isinstance(a, bool) != isinstance(b, bool):
         return False
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(_pin_values_equal(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(pin_values_equal(x, y) for x, y in zip(a, b))
     if isinstance(a, dict) and isinstance(b, dict):
-        return set(a) == set(b) and all(_pin_values_equal(a[k], b[k]) for k in a)
+        return set(a) == set(b) and all(pin_values_equal(a[k], b[k]) for k in a)
     return a == b
 
 
@@ -134,7 +135,7 @@ class RoundingSchedule:
             return None
         if isinstance(declared, OneOf):
             return None if value in declared else f"the impl declares {key}={declared!r}"
-        if not _pin_values_equal(declared, value):
+        if not pin_values_equal(declared, value):
             return f"the impl declares {key}={declared!r}"
         return None
 

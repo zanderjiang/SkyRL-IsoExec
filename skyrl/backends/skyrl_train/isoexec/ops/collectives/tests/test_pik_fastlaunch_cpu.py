@@ -347,7 +347,12 @@ def test_pin_does_not_keep_the_admitting_operand_alive(fl):
 # the flag is registered, default OFF, and reaches both actor channels
 # ----------------------------------------------------------------------------------------------
 def test_flags_registered_default_off_and_forwarded():
-    from skyrl.backends.skyrl_train.isoexec.core.flags import ENGINE, FLAGS, TRAIN, actor_forwarding_tuple
+    from skyrl.backends.skyrl_train.isoexec.core.flags import (
+        ENGINE,
+        FLAGS,
+        TRAIN,
+        actor_forwarding_tuple,
+    )
 
     cat = {f.name: f for f in FLAGS}
     for name in ("SKYRL_ISOEXEC_PIK_FASTLAUNCH",):

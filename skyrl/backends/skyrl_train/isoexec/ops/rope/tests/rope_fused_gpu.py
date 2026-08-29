@@ -40,7 +40,6 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
@@ -50,8 +49,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _ftz_check import assert_no_ftz  # noqa: E402
 
+from skyrl.backends.skyrl_train.isoexec.core.contracts import (
+    bitwise_equal,  # noqa: E402
+)
 from skyrl.backends.skyrl_train.isoexec.ops.rope import rope_fused as rf  # noqa: E402
-from skyrl.backends.skyrl_train.isoexec.core.contracts import bitwise_equal  # noqa: E402
 
 DEV = "cuda"
 

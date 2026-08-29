@@ -19,14 +19,18 @@ def _build():
     sel = build_selections(qwen3_5.PROFILE, qwen3_5.EXCEPTIONS)
     # claims as in models/qwen3_5.build: these tests pin the PRODUCTION contract, claims included.
     p = qwen3_5.PROFILE
-    return reg, sel, build_execution_contract(
+    return (
         reg,
         sel,
-        arch="sm90",
-        model=qwen3_5.MODEL,
-        topology=p.topology,
-        states=p.states,
-        tolerances=p.tolerances,
+        build_execution_contract(
+            reg,
+            sel,
+            arch="sm90",
+            model=qwen3_5.MODEL,
+            topology=p.topology,
+            states=p.states,
+            tolerances=p.tolerances,
+        ),
     )
 
 

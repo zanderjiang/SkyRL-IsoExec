@@ -107,7 +107,7 @@ def base_contract() -> ExecutionContract:
         ),
     )
     c = ExecutionContract(
-        schema_version="1",
+        schema_version="2",
         model=ModelRef("qwen3_5", ("Qwen3_5MoeForConditionalGeneration",), "profiles/qwen3_5"),
         identities=Identities("", "", ""),
         cases=cases,

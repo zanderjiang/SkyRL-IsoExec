@@ -2,7 +2,7 @@
 
 Replaces the ``slots.long()`` / ``clamp_`` / ``slot2row[...]`` / int32-cast ATen chain with a single
 Triton program emitting both the int64 and int32 row vectors. Host-free and shape-static so it captures
-into a CUDA graph; ``SKYRL_ISOEXEC_GDN_CS_FUSED_ROWS=0`` (or any unexpected shape/dtype) uses the ATen chain.
+into a CUDA graph; ``SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS=0`` (or any unexpected shape/dtype) uses the ATen chain.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 
 BANNER = "[ISOEXEC-GDN-ROWS]"
-_ENV = "SKYRL_ISOEXEC_GDN_CS_FUSED_ROWS"
+_ENV = "SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS"
 
 _served = 0
 _declined = 0
@@ -28,7 +28,7 @@ def fused_rows_enabled() -> bool:
 
 
 @triton.jit
-def _cs_rows_kernel(
+def _cpr_rows_kernel(
     slots_ptr,
     map_ptr,
     rows_ptr,
@@ -47,7 +47,7 @@ def _cs_rows_kernel(
     tl.store(rows32_ptr + offs, r.to(tl.int32), mask=m)
 
 
-def cs_resolve_rows(slots: torch.Tensor, slot2row: torch.Tensor):
+def cpr_resolve_rows(slots: torch.Tensor, slot2row: torch.Tensor):
     """``(rows_int64, rows_int32)`` for a decode batch's engine slot ids, in one launch.
 
     Equivalent to ``slot2row[slots.long().clamp_(0, slot2row.numel() - 1)]`` plus its int32 cast.
@@ -70,7 +70,7 @@ def cs_resolve_rows(slots: torch.Tensor, slot2row: torch.Tensor):
     rows = torch.empty(n, dtype=torch.int64, device=slot2row.device)
     rows32 = torch.empty(n, dtype=torch.int32, device=slot2row.device)
     blk = min(1024, max(32, triton.next_power_of_2(max(n, 1))))
-    _cs_rows_kernel[(triton.cdiv(n, blk),)](
+    _cpr_rows_kernel[(triton.cdiv(n, blk),)](
         slots,
         slot2row,
         rows,

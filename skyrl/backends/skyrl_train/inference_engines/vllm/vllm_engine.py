@@ -222,7 +222,7 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
         # resumed mid-prompt. Requires GDN on AND recurrent mode; default OFF. This is a prerequisite
         # for G3 (prefix caching), not a standalone speedup: gsm8k prompts fit one chunk.
         from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_ops import (
-            chunk_synced_mode as _gdn_chunk_synced_mode,
+            cpr_mode as _gdn_cpr_mode,
         )
         from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_ops import (
             recurrent_mode as _gdn_recurrent_mode,
@@ -231,7 +231,7 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
         _gdn_chunked = (
             os.environ.get("SKYRL_ISOEXEC_GDN_CHUNKED_PREFILL") == "1"
             and os.environ.get("SKYRL_ISOEXEC_GDN") == "1"
-            and (_gdn_recurrent_mode() or _gdn_chunk_synced_mode())
+            and (_gdn_recurrent_mode() or _gdn_cpr_mode())
         )
         for _k, _v in isoexec_engine_arg_overrides().items():
             if _accel_graph and _k == "enforce_eager":
@@ -313,15 +313,32 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
         assert_compilation_admissible(kwargs)
         # isoexec Phase 2: build + log the composition contract hashes on the ENGINE side. Must
         # equal the trainer's [ISOEXEC-CONTRACT] identities (same code+model+arch -> same hash); a
-        # mismatch across the two logs is a composition split-brain. Build+log only, never fatal
-        # (behavior-preserving); the fatal assert runs worker-side at weight-sync receiver init.
+        # mismatch across the two logs is a composition split-brain. The fatal assert runs
+        # worker-side at weight-sync receiver init; the build here stays fail-soft for everything
+        # environmental (no isoexec package, an import that needs a runtime this process lacks)
+        # EXCEPT ContractBuildError under SKYRL_ISOEXEC=1. That error is the declaration itself
+        # refusing the composition about to run and it names the fix; demoting it to a warning
+        # leaves an unrelated guard further down as the only thing that stops the run, with the
+        # actionable message buried in a worker log.
         if os.environ.get("SKYRL_ISOEXEC"):
+            _fatal_build_error = ()
+            try:
+                from skyrl.backends.skyrl_train.isoexec.core.contract_build import (
+                    ContractBuildError,
+                )
+
+                if os.environ.get("SKYRL_ISOEXEC") == "1":
+                    _fatal_build_error = (ContractBuildError,)
+            except Exception:  # noqa: BLE001 -- no isoexec package here: nothing to make fatal
+                pass
             try:
                 from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
                     get_process_contract,
                 )
 
                 get_process_contract(kwargs.get("model") or "")
+            except _fatal_build_error:
+                raise
             except Exception as _e:
                 logger.warning(f"[isoexec] engine contract build skipped: {_e}")
         hf_overrides = dict(kwargs.get("hf_overrides") or {})
@@ -337,7 +354,6 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
                 varlen_backend,  # noqa: F401
             )
             from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.vllm_patches import (
-                patch_vllm_logprobs_batch_invariant,
                 patch_vllm_sampler_temperature,
             )
 
@@ -349,11 +365,6 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
                     "[isoexec] torch.nn.attention.varlen unavailable; "
                     "CUSTOM backend NOT selected (IsoExec will not be bitwise)"
                 )
-            # The forward is bitwise, but vLLM's v2 sampler computes the ROLLOUT logprob with a fused
-            # Triton kernel that bypasses aten log_softmax -> diverges from the trainer's log_softmax on
-            # a few tokens. Route the generator through aten log_softmax (== trainer) for bitwise
-            # rollout==train. In-process engine (VLLM_ENABLE_V1_MULTIPROCESSING=0) so this reaches the sampler.
-            patch_vllm_logprobs_batch_invariant()
             # V1 Sampler.apply_temperature divides [B, V] fp32 by 1.0 every decode step (432 us at
             # B=512). x/1.0 is bit-preserving, so skipping it moves nothing.
             patch_vllm_sampler_temperature()
@@ -378,25 +389,25 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
             # prefill and prefix caching (align mode) both turn ON -- this is what closes the 15x
             # prefill gap to stock vLLM. Requires native state (fp32 blocks) + recurrent mode.
             _gdn_native_kernels = os.environ.get("SKYRL_ISOEXEC_GDN_NATIVE_KERNELS") == "1"
-            _gdn_cs_mode = _gdn_chunk_synced_mode()
+            _gdn_cpr_on = _gdn_cpr_mode()
             if (
                 _gdn_native_kernels
-                and not _gdn_cs_mode
+                and not _gdn_cpr_on
                 and (os.environ.get("SKYRL_ISOEXEC_GDN_NATIVE_STATE") != "1" or not _gdn_recurrent_mode())
             ):
                 raise ValueError(
                     "[isoexec] SKYRL_ISOEXEC_GDN_NATIVE_KERNELS=1 requires "
                     "SKYRL_ISOEXEC_GDN_NATIVE_STATE=1 and SKYRL_ISOEXEC_GDN_KERNEL=recurrent (the "
                     "native kernels index vLLM's own state blocks directly) -- OR "
-                    "SKYRL_ISOEXEC_GDN_KERNEL=chunk_synced (v2: fused core + matched-prep boundary "
+                    "SKYRL_ISOEXEC_GDN_KERNEL=cpr (fused core + matched-prep boundary "
                     "pass against the private pool)."
                 )
-            if _gdn_native_kernels and _gdn_cs_mode and os.environ.get("SKYRL_ISOEXEC_GDN_NATIVE_STATE") == "1":
+            if _gdn_native_kernels and _gdn_cpr_on and os.environ.get("SKYRL_ISOEXEC_GDN_NATIVE_STATE") == "1":
                 raise ValueError(
-                    "[isoexec] chunk_synced v2 keeps its own state pool (entry states + open-chunk "
+                    "[isoexec] cpr keeps its own state pool (entry states + open-chunk "
                     "buffers live beside it); unset SKYRL_ISOEXEC_GDN_NATIVE_STATE."
                 )
-            if _gdn_native_kernels and not _gdn_cs_mode:
+            if _gdn_native_kernels and not _gdn_cpr_on:
                 kwargs["enable_prefix_caching"] = True
                 kwargs["enable_chunked_prefill"] = True
                 logger.info(
@@ -435,15 +446,15 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
                 # padded decode is what makes the CHUNK decode shapes static; graphs cannot capture
                 # its ragged per-slot gather. RECURRENT decode is one token per sequence -- already
                 # static, and it never reads the host -- so it needs no padding, and forcing the flag
-                # would only advertise a code path (ChunkConsistentGDN.decode_dev) that mode never
-                # enters. CHUNK_SYNCED decode is device-pure like recurrent (the boundary resync
+                # would only advertise a device-slot decode path that mode never enters. CPR
+                # decode is device-pure like recurrent (the boundary resync
                 # runs host-driven in the metadata builder, between replays -- the LAZY driver
                 # that assert_engine_args_compatible installs), so it needs no padding either.
                 from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_ops import (
-                    chunk_synced_mode,
+                    cpr_mode,
                 )
 
-                if not recurrent_mode() and not chunk_synced_mode():
+                if not recurrent_mode() and not cpr_mode():
                     os.environ["SKYRL_ISOEXEC_GDN_PADDED_DECODE"] = "1"
                 # NO inductor, and capture PURE-DECODE batches only. enforce_eager=False alone gives
                 # vLLM's default (mode=VLLM_COMPILE + FULL_AND_PIECEWISE), which is wrong twice over:
@@ -454,7 +465,7 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
                 #     mutates per-request host state (LRU, fill counts) that a graph replay would
                 #     skip -- the 2026-07-12 GRAPHS3 run captured those graphs and desynced the
                 #     scheduler at step 1 (KeyError in update_from_output).
-                # FULL_DECODE_ONLY + CompilationMode.NONE is the decode_dev contract: the eager
+                # FULL_DECODE_ONLY + CompilationMode.NONE is the pure-decode contract: the eager
                 # model, with pure-decode steps replayed as one full graph; everything else eager.
                 _cc = dict(kwargs.get("compilation_config") or {})
                 _cc.setdefault("mode", 0)  # CompilationMode.NONE -- the model runs as-is

@@ -16,6 +16,7 @@ import torch
 
 from ...autofuse.bwd_compile import call_region
 
+
 # Which delta-rule kernel the whole stack runs on. The requirement is only that the trainer, engine
 # prefill and engine decode all evaluate the core with the SAME kernel; the two ways to satisfy that
 # trade cost in opposite directions:
@@ -36,57 +37,58 @@ from ...autofuse.bwd_compile import call_region
 # does not autotune, with `do_not_specialize=["N", "T"]` so decode (T=1) and prefill (T=P) run the same
 # compiled kernel. Chaining prefill -> decode is then bitwise as long as the state round-trips exactly,
 # which it does because the ssm state is stored in fp32.
-_KERNEL_ENV = "SKYRL_ISOEXEC_GDN_KERNEL"
-
-
 def gdn_kernel_mode() -> str:
-    """``"chunk"`` (default), ``"recurrent"`` or ``"chunk_synced"``. Read at call time; every GDN
-    site must agree."""
-    mode = os.environ.get(_KERNEL_ENV, "chunk").lower()
-    if mode not in ("chunk", "recurrent", "chunk_synced"):
-        raise ValueError(f"{_KERNEL_ENV} must be 'chunk', 'recurrent' or 'chunk_synced', got {mode!r}")
-    return mode
+    """The delta-rule kernel this process runs. Read at call time; every GDN site must agree.
+
+    Vocabulary, default and parsing live in ``core/gdn_kernel_env`` -- the same answer the
+    DECLARATION site (models/qwen3_5) hashes into the contract. They used to be parsed separately
+    here, which is how ``SKYRL_ISOEXEC_GDN_KERNEL=CPR`` made both runtimes derive the same
+    WRONG contract and the handshake MATCH.
+    """
+    from ...core.gdn_kernel_env import gdn_kernel_mode as _mode
+
+    return _mode()
 
 
 def recurrent_mode() -> bool:
     return gdn_kernel_mode() == "recurrent"
 
 
-def chunk_synced_mode() -> bool:
-    return gdn_kernel_mode() == "chunk_synced"
+def cpr_mode() -> bool:
+    return gdn_kernel_mode() == "cpr"
 
 
-# Minimal vLLM mamba pages under chunk_synced (engine memory only; moves no bits). chunk_synced never
-# reads vLLM's native GDN state pages -- ChunkSyncedGDN keeps its own private pools and uses the vLLM
+# Minimal vLLM mamba pages under cpr (engine memory only; moves no bits). cpr never
+# reads vLLM's native GDN state pages -- CprGDN keeps its own private pools and uses the vLLM
 # pages only as a slot-id source -- yet those full-size pages dominate the KV pool, because vLLM pads
 # the mamba page up to one attention page and bumps the attention block size until it covers the real
 # state. Every live request then pins memory nothing reads, starving attention KV into preemption.
 #
 # With this flag both state-shape sources (config-time page sizing and the runtime MambaSpec, which
-# must agree or vLLM's page unification asserts) report GDN_CS_MIN_STATE_SHAPES, so the mamba page
-# collapses to one minimal attention page. Everything chunk_synced needs from the pages survives,
+# must agree or vLLM's page unification asserts) report GDN_CPR_MIN_STATE_SHAPES, so the mamba page
+# collapses to one minimal attention page. Everything cpr needs from the pages survives,
 # because it never depended on their size: slot ids stay unique per live request per kv-cache group,
 # stable for the request's lifetime, positive for live requests, and a freed id is only re-issued to a
-# request that then prefills. Scoped to chunk_synced with private pools: recurrent mode and
+# request that then prefills. Scoped to cpr with private pools: recurrent mode and
 # SKYRL_ISOEXEC_GDN_NATIVE_STATE=1 read the native pages for real state and keep full shapes.
-_CS_MIN_PAGES_ENV = "SKYRL_ISOEXEC_GDN_CS_MIN_PAGES"
+_CPR_MIN_PAGES_ENV = "SKYRL_ISOEXEC_GDN_CPR_MIN_PAGES"
 
 # (conv-like, ssm-like) minimal shapes. Two entries so the (conv, ssm) kv_cache tuple structure
 # survives (gdn_engine_patch/gdn_gptmodel read kv_cache[1].shape[0] as a capacity fallback).
 # Sized 16 bytes each so the runner's strided carve-out keeps the second (fp32) tensor aligned
 # for ANY state-dtype combination (gpu_model_runner asserts storage_offset % dtype_size == 0).
-GDN_CS_MIN_STATE_SHAPES = ((1, 8), (1, 1, 4))
+GDN_CPR_MIN_STATE_SHAPES = ((1, 8), (1, 1, 4))
 
 
-def gdn_cs_min_pages() -> bool:
+def gdn_cpr_min_pages() -> bool:
     """True iff vLLM's native GDN state pages should be MINIMAL (slot-id source only).
 
-    Read at call time like every mode flag. Only true in chunk_synced-with-private-pools mode:
+    Read at call time like every mode flag. Only true in cpr-with-private-pools mode:
     recurrent/native-state compositions store REAL state in those pages.
     """
-    if os.environ.get(_CS_MIN_PAGES_ENV, "0").lower() in ("", "0", "false", "no"):
+    if os.environ.get(_CPR_MIN_PAGES_ENV, "0").lower() in ("", "0", "false", "no"):
         return False
-    if not chunk_synced_mode():
+    if not cpr_mode():
         return False
     from .gdn_recurrent_state import (
         native_state_enabled,  # lazy: that module imports gdn_ops
@@ -104,7 +106,7 @@ _NATIVE_CONV_ENV = "SKYRL_ISOEXEC_GDN_NATIVE_CONV"
 
 
 def gdn_native_conv_enabled() -> bool:
-    """True iff chunk_synced runs the native vLLM conv pair on both runtimes (v1.5)."""
+    """True iff cpr runs the native vLLM conv pair on both runtimes."""
     return os.environ.get(_NATIVE_CONV_ENV, "0").lower() not in ("", "0", "false", "no")
 
 
@@ -764,28 +766,28 @@ class _GdnNativeCoreAutograd(torch.autograd.Function):
         return (*grads, None, None)
 
 
-class _GdnNativeChunkSyncedAutograd(_GdnNativeCoreAutograd):
-    """v2 trainer door: native chunk-synced forward with the same native-composition VJP.
+class _GdnNativeCprAutograd(_GdnNativeCoreAutograd):
+    """Trainer door: native CPR forward with the same native-composition VJP.
 
     The backward is inherited verbatim from :class:`_GdnNativeCoreAutograd`, because native
-    chunk-synced is another evaluation strategy of the same delta-rule function (fused_sigmoid within
+    CPR is another evaluation strategy of the same delta-rule function (fused_sigmoid within
     chunks, chunk-pass boundary states on the eager matched prep).
     """
 
     @staticmethod
     def forward(ctx, q, k, v, a, b, A_log, dt_bias, cu_seqlens, chunk_size):
-        from .gdn_chunk_synced import gdn_native_chunk_synced_fwd
+        from .gdn_cpr import gdn_native_cpr_fwd
 
         with torch.no_grad():
-            o = gdn_native_chunk_synced_fwd(q, k, v, a, b, A_log, dt_bias, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
+            o = gdn_native_cpr_fwd(q, k, v, a, b, A_log, dt_bias, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
         ctx.save_for_backward(q, k, v, a, b, A_log, dt_bias)
         ctx.cu_seqlens = cu_seqlens
         ctx.chunk_size = chunk_size
         return o
 
 
-def gdn_native_chunk_synced(q, k, v, a, b, A_log, dt_bias, *, cu_seqlens=None):
-    """Training/scoring entry for the v2 NATIVE chunk-synced composition (raw q/k + raw a/b).
+def gdn_native_cpr(q, k, v, a, b, A_log, dt_bias, *, cu_seqlens=None):
+    """Training/scoring entry for the NATIVE CPR composition (raw q/k + raw a/b).
 
     Accepts both the packed layout (B==1 plus cu_seqlens) and the padded ``[B, T, ...]`` layout the
     scoring path sends (no cu_seqlens); a padded batch is flattened to B independent packed sequences of
@@ -807,14 +809,12 @@ def gdn_native_chunk_synced(q, k, v, a, b, A_log, dt_bias, *, cu_seqlens=None):
         t is not None and t.requires_grad for t in (q, k, v, a, b, A_log, dt_bias)
     )
     if not needs_grad:
-        from .gdn_chunk_synced import gdn_native_chunk_synced_fwd
+        from .gdn_cpr import gdn_native_cpr_fwd
 
         with torch.no_grad():
-            o = gdn_native_chunk_synced_fwd(
-                q, k, v, a, b, A_log, dt_bias, cu_seqlens=cu_seqlens, chunk_size=fla_chunk_size()
-            )
+            o = gdn_native_cpr_fwd(q, k, v, a, b, A_log, dt_bias, cu_seqlens=cu_seqlens, chunk_size=fla_chunk_size())
     else:
-        o = _GdnNativeChunkSyncedAutograd.apply(q, k, v, a, b, A_log, dt_bias, cu_seqlens, fla_chunk_size())
+        o = _GdnNativeCprAutograd.apply(q, k, v, a, b, A_log, dt_bias, cu_seqlens, fla_chunk_size())
     if unbatch is not None:
         B, T = unbatch
         o = o.reshape(B, T, *o.shape[2:])
@@ -1180,7 +1180,7 @@ def gdn_recurrent(
     return o, None
 
 
-class _GdnChunkSyncedAutograd(torch.autograd.Function):
+class _GdnCprAutograd(torch.autograd.Function):
     """Chunk-synced forward plus the same fp32 chunked reference VJP the other modes use.
 
     Chunk-synced is another evaluation strategy of the same delta-rule function (boundary states by the
@@ -1190,10 +1190,10 @@ class _GdnChunkSyncedAutograd(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, g, beta, cu_seqlens, chunk_size):
-        from .gdn_chunk_synced import gdn_chunk_synced_fwd
+        from .gdn_cpr import gdn_cpr_fwd
 
         with torch.no_grad():
-            o = gdn_chunk_synced_fwd(q, k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
+            o = gdn_cpr_fwd(q, k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=chunk_size)
         ctx.save_for_backward(q, k, v, g, beta)
         ctx.cu_seqlens = cu_seqlens
         ctx.chunk_size = chunk_size
@@ -1215,7 +1215,7 @@ class _GdnChunkSyncedAutograd(torch.autograd.Function):
         return (*grads, None, None)
 
 
-def gdn_chunk_synced(
+def gdn_cpr(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1226,15 +1226,15 @@ def gdn_chunk_synced(
     output_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
 ):
-    """Training/scoring-shaped chunk-synced forward: same ``(o, final_state)`` contract as its twins.
+    """Training/scoring-shaped CPR forward: same ``(o, final_state)`` contract as its twins.
 
     The engine does not come through here -- it owns a real state pool and runs
-    ``ChunkSyncedGDN.prefill``/``.decode``, which evaluate the same canonical function incrementally.
+    ``CprGDN.prefill``/``.decode``, which evaluate the same canonical function incrementally.
     """
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
-            "isoexec GDN: gdn_chunk_synced is the stateless (training/prefill-from-zero) entry "
-            "point. The engine carries state through ChunkSyncedGDN."
+            "isoexec GDN: gdn_cpr is the stateless (training/prefill-from-zero) entry "
+            "point. The engine carries state through CprGDN."
         )
     if cu_seqlens is None:
         if q.shape[0] != 1:
@@ -1251,24 +1251,24 @@ def gdn_chunk_synced(
 
             needs_grad = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (q, k, v, g, beta))
             if not needs_grad:
-                from .gdn_chunk_synced import gdn_chunk_synced_fwd
+                from .gdn_cpr import gdn_cpr_fwd
 
                 with torch.no_grad():
-                    o = gdn_chunk_synced_fwd(q, k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=fla_chunk_size())
+                    o = gdn_cpr_fwd(q, k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=fla_chunk_size())
             else:
-                o = _GdnChunkSyncedAutograd.apply(q, k, v, g, beta, cu_seqlens, fla_chunk_size())
+                o = _GdnCprAutograd.apply(q, k, v, g, beta, cu_seqlens, fla_chunk_size())
             return o.reshape(B, T, *o.shape[2:]), None
         cu_seqlens = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
 
     needs_grad = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (q, k, v, g, beta))
     if not needs_grad:
-        from .gdn_chunk_synced import gdn_chunk_synced_fwd
+        from .gdn_cpr import gdn_cpr_fwd
 
         with torch.no_grad():
-            o = gdn_chunk_synced_fwd(q, k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=fla_chunk_size())
+            o = gdn_cpr_fwd(q, k, v, g, beta, cu_seqlens=cu_seqlens, chunk_size=fla_chunk_size())
         return o, None
 
-    o = _GdnChunkSyncedAutograd.apply(q, k, v, g, beta, cu_seqlens, fla_chunk_size())
+    o = _GdnCprAutograd.apply(q, k, v, g, beta, cu_seqlens, fla_chunk_size())
     return o, None
 
 
@@ -1286,7 +1286,7 @@ def gdn_core(
     """:func:`gdn_chunk` or :func:`gdn_recurrent`, per :func:`gdn_kernel_mode`. The trainer's door.
 
     ``SKYRL_ISOEXEC_GDN_TRAINER_KERNEL`` (unset by default) overrides the kernel for this door only; the
-    engine's decode/prefill reach gdn_recurrent / ChunkConsistentGDN directly and keep
+    engine's decode/prefill reach RecurrentGDN / CprGDN directly and keep
     ``SKYRL_ISOEXEC_GDN_KERNEL``. Setting it to ``chunk`` while the engine runs ``recurrent`` deliberately
     relaxes the GDN core so the rollout-vs-train gap measures the chunk-vs-recurrent mismatch. That is
     not a IsoExec configuration."""
@@ -1316,13 +1316,11 @@ def gdn_core(
             )
         return output, final_state
 
-    override = os.environ.get("SKYRL_ISOEXEC_GDN_TRAINER_KERNEL", "").lower()
-    if override and override not in ("chunk", "recurrent", "chunk_synced"):
-        raise ValueError(
-            f"SKYRL_ISOEXEC_GDN_TRAINER_KERNEL must be 'chunk', 'recurrent' or 'chunk_synced', got {override!r}"
-        )
-    if override == "chunk_synced" or (not override and chunk_synced_mode()):
-        return gdn_chunk_synced(
+    from ...core.gdn_kernel_env import gdn_trainer_kernel_override
+
+    override = gdn_trainer_kernel_override()
+    if override == "cpr" or (not override and cpr_mode()):
+        return gdn_cpr(
             q,
             k,
             v,

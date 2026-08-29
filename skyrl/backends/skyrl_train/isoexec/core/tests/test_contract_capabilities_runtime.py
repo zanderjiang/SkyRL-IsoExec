@@ -39,6 +39,7 @@ from skyrl.backends.skyrl_train.isoexec.core.tests.test_contract_capabilities im
 from skyrl.backends.skyrl_train.isoexec.models.policy import entry
 from skyrl.backends.skyrl_train.isoexec.ops.collectives import nccl_identity as ni
 
+
 @contextmanager
 def _extensions():
     saved = dict(pc._EXTENSIONS)
@@ -91,7 +92,6 @@ def _captured(logger):
     finally:
         logger.removeHandler(h)
         logger.setLevel(old)
-
 
 
 # --- 8. extensions / composite ---
@@ -178,8 +178,10 @@ def test_init_info_stamp_on_synthetic_contract():
 
 def test_negative_control_flag_perturbs_composite():
     c = _build()
-    with _installed_contract(c), _extensions(), _env(
-        SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL="1", SKYRL_ISOEXEC_MANIFEST_STRICT=None
+    with (
+        _installed_contract(c),
+        _extensions(),
+        _env(SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL="1", SKYRL_ISOEXEC_MANIFEST_STRICT=None),
     ):
         clean = pc.contract_hash()
         # the trainer stamp site (workers/worker.py) registers this extension when the flag is ON
@@ -224,6 +226,29 @@ def test_log_fingerprint_mismatches_log_error_without_raising():
     assert len([r for r in cap.records if r.levelno >= logging.ERROR]) == 3
 
 
+def test_pin_disagreements_names_every_drifted_key():
+    want = {"kernel": "recurrent", "leaves": 4, "mode": ("tree", "flat"), "fused": True}
+    assert fp.pin_disagreements(want, dict(want, mode=["tree", "flat"])) == []  # JSON round-trip
+    assert fp.pin_disagreements(want, dict(want, fused=1)) == ["fused: contract pins True, install used 1"]
+    bad = fp.pin_disagreements(want, {"kernel": "chunk", "leaves": 4, "mode": ("tree", "flat")})
+    assert bad == [
+        "fused: contract pins True, install recorded nothing",
+        "kernel: contract pins 'recurrent', install used 'chunk'",
+    ]
+
+
+def test_drifted_pin_is_caught_against_the_contract_view():
+    # The pin is the contract's only statement about WHICH function the impl runs; an install that
+    # binds the same impl_id with a different pin is exactly what the recorded pins exist to catch.
+    reg = _registry()
+    view = pc.build_contract_view(_build(reg=reg), reg)
+    with _fresh_recorder():
+        fp.record_install("alpha.mm", "trainer_fwd", "ref", pinned=dict(MM_PINS, leaves=8))
+        problems = fp.log_fingerprint(view, tag="drifted-pin")
+    assert len(problems) == 1
+    assert "leaves: contract pins 4, install used 8" in problems[0]
+
+
 def test_log_fingerprint_clean_match_and_gaps():
     reg = _registry()
     view = pc.build_contract_view(_build(reg=reg), reg)
@@ -242,7 +267,12 @@ def test_log_fingerprint_clean_match_and_gaps():
 def test_nccl_assert_contract_matches_manual_view():
     pins = dict(ni.PINNED_CONSTANTS)
     view = {
-        ("collectives.nccl_pin", s): {"impl_id": "pinned", "version": 1, "pinned_constants": dict(pins), "half": "function"}
+        ("collectives.nccl_pin", s): {
+            "impl_id": "pinned",
+            "version": 1,
+            "pinned_constants": dict(pins),
+            "half": "function",
+        }
         for s in TRAINER
     }
     ni.assert_contract_matches(view, TRAINER, "pinned", pins)  # exact tuple accepted
@@ -267,6 +297,31 @@ def test_nccl_assert_against_a_built_view():
     ni.assert_contract_matches(view, ENGINE, "unpinned", {})
     _refuses(RuntimeError, ni.assert_contract_matches, view, TRAINER, "cap8", ni.CAP8_CONSTANTS)
     _refuses(RuntimeError, ni.assert_contract_matches, view, ENGINE, "unpinned", ni.UNPINNED_CONSTANTS)
+
+
+def test_nccl_mismatch_demotes_under_debug_tracing():
+    # It goes through enforce.refuse like the sibling pik plan check: a debug run must reach the
+    # trace it was started for, and the ledger keeps the violation either way.
+    from skyrl.backends.skyrl_train.isoexec.core import enforce
+
+    pins = dict(ni.PINNED_CONSTANTS)
+    view = {
+        ("collectives.nccl_pin", s): {
+            "impl_id": "pinned",
+            "version": 1,
+            "pinned_constants": dict(pins),
+            "half": "function",
+        }
+        for s in TRAINER
+    }
+    enforce._reset_for_tests()
+    try:
+        with _env(SKYRL_ISOEXEC_DEBUG_TRACE="/tmp/isoexec-test-trace"):
+            ni.assert_contract_matches(view, TRAINER, "unpinned", ni.UNPINNED_CONSTANTS)
+        recs = [r for oid, rs in enforce.ledger().records.items() if "nccl_pin" in oid for r in rs]
+        assert recs and all(r.result == enforce.VIOLATION for r in recs)
+    finally:
+        enforce._reset_for_tests()
 
 
 def _run():

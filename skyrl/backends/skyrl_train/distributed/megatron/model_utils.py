@@ -204,6 +204,56 @@ except ImportError as _ix_exact_sampled_import_error:
         return refusal
 
 
+#: The row-count- and TP-invariant leaf-tree sampled logprob -- the composed default at every
+#: logprob site, no flag. Same lazy-import-with-refusal-shim shape as the two levers above, so a
+#: missing isoexec tree degrades to today's path instead of breaking this module's import. That
+#: degradation is now VISIBLE rather than expected: the contract names rowinv, so a rank that
+#: imports the shim serves the incumbent and its census stays served=0, which
+#: ``enforce.rowinv_engagement_boundary`` refuses at the next weight sync. Unlike the
+#: exact-sampled shim, this one mirrors no pre-branch vote: rowinv.py owns its own admission
+#: protocol and this file cannot reproduce a protocol it did not import. What the shim CAN say is
+#: narrower and still true -- with the module absent, every call declines locally before any
+#: rowinv collective is entered. An import failure is rank-symmetric in practice (every TP rank
+#: runs the same tree and env), and a rank-ASYMMETRIC failure is outside this shim's protection;
+#: it surfaces as the peers' admission collectives timing out, not as a silent split.
+#:
+#: The consumer is ``_ix_logprobs_apply`` -- the ONE dispatch point, sitting in the two
+#: ``from_parallel_logits_to_logprobs*`` wrappers OUTSIDE any autograd.Function, so rowinv's own
+#: Function can carry its backward out and BOTH the scoring forward (inference_only=True) and the
+#: grad-bearing training forward (inference_only=False) are served by the same function.
+try:
+    from skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv import (
+        rowinv_sampled_logprobs as _ix_rowinv_sampled_logprobs,
+    )
+    from skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv import (
+        stats as _ix_rowinv_stats,
+    )
+
+    def _ix_rowinv_available() -> bool:
+        return True
+
+except ImportError as _ix_rowinv_import_error:
+    _IX_ROWINV_IMPORT_REFUSAL_PRINTED = False
+    _IX_ROWINV_IMPORT_ERROR = repr(_ix_rowinv_import_error)
+
+    def _ix_rowinv_available() -> bool:  # type: ignore[misc]
+        global _IX_ROWINV_IMPORT_REFUSAL_PRINTED
+        if not _IX_ROWINV_IMPORT_REFUSAL_PRINTED:
+            _IX_ROWINV_IMPORT_REFUSAL_PRINTED = True
+            print(
+                "[ISOEXEC-ROWINV-LOGPROB] REFUSED: module import failed; this rank keeps the "
+                f"incumbent logprob path. error={_IX_ROWINV_IMPORT_ERROR}",
+                flush=True,
+            )
+        return False
+
+    def _ix_rowinv_sampled_logprobs(*args, **kwargs):  # type: ignore[misc]  # pragma: no cover
+        return None  # unreachable while _ix_rowinv_available() is False; kept for signature parity
+
+    def _ix_rowinv_stats() -> dict:  # type: ignore[misc]  # pragma: no cover
+        return {}
+
+
 _IX_BWD_ENV = "SKYRL_ISOEXEC_LOGPROB_BWD_REDUCED_COMM"
 _IX_BWD_BANNER = "[ISOEXEC-LOGPROB-BWD-REDUCED-COMM]"
 
@@ -886,6 +936,164 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+def _ix_try_rowinv_logprobs(
+    vocab_parallel_logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    group: torch.distributed.ProcessGroup,
+    inference_only: bool,
+    chunk_size: Optional[int],
+) -> Optional[torch.Tensor]:
+    """Serve the whole call on rowinv, or return None so the caller keeps the incumbent whole.
+
+    The seq dim is walked in the same chunks the incumbent would use, each chunk handed through
+    in its NATIVE dtype: rowinv widens TRANSIENTLY inside its own forward (the exact widen keeps
+    the bits identical to pre-widening; the fp32 copy dies at call exit instead of being retained
+    for backward), and this dispatch materializes no fp32 copy of the shard at all.
+    rowinv is row-count invariant BY CONSTRUCTION -- its leaf boundaries and combine tree are
+    functions of G alone, never of rows -- so the chunked and unchunked walks are the same
+    function (chunk-walk asserted bitwise in ops/logprobs/tests/test_rowinv_dispatch_cpu.py; the
+    scheme's row independence in test_rowinv_leaftree_cpu.py and rowinv_gpu.py).
+
+    Grad note: under the grad path rowinv saves each NATIVE-dtype chunk for its rank-local
+    backward -- a view of the live logits when the slice is contiguous, so nothing beyond the
+    activation the caller already holds -- plus per-row scalars. This matches the incumbent
+    ChunkedDistributedLogprob's save-raw-and-recompute memory order instead of the +100% a
+    retained widened fp32 shard would cost at live shapes.
+
+    Fallback discipline: any chunk DECLINE (None) abandons rowinv for the WHOLE call -- one
+    function per returned tensor, never a mid-tensor mix. A failed first-call probe inside rowinv
+    returns the reference's own chunk (incumbent bits, but graph-free), so the grad path treats a
+    graph-free chunk as a decline too, and a tail-chunk probe failure is caught by the census
+    latch (``stats()["agreed"] is False``) after the loop. Declines and verdict votes are
+    TP-unanimous inside rowinv, so every rank abandons together or none does.
+    """
+    src_dtype = vocab_parallel_logits.dtype
+    seq_len = int(vocab_parallel_logits.shape[1])
+    step = seq_len if chunk_size is None else int(chunk_size)
+    # inference_only mirrors the incumbent contract exactly: the Functions save nothing under it
+    # and offer no backward, so rowinv must not quietly grow one (nor retain fp32 chunks for a
+    # backward nobody may take).
+    grad_on = torch.is_grad_enabled() and not inference_only
+    outs = []
+    with torch.set_grad_enabled(grad_on):
+        # torch.split, NOT per-chunk basic indexing. The views are byte-identical to
+        # `vocab_parallel_logits[:, cs:ce, :]` (same storage, shape, stride -- same hot key, same
+        # kernels, same collectives in the same order), so the FORWARD bits cannot move. What
+        # changes is the BACKWARD's grad ROUTING, where this dispatch has latitude (grad reaches
+        # only the optimizer; allclose-gated): basic indexing gives every chunk its own
+        # SliceBackward, whose grad is a FULL-size [.., seq, V/TP] zero-fill with the chunk's grad
+        # copied in, and AccumulateGrad then sums num_chunks of those full tensors -- measured at
+        # 141 ms per 20480x62080 fp32 microbatch at TP=4 against 12.6 ms of actual rowinv backward
+        # math (~20 x 25 GB of zero+add traffic). split's ONE backward node cats all chunk grads
+        # in a single pass (~5 GB), and the summed grad values are unchanged: each element gets
+        # exactly one chunk's contribution either way.
+        for chunk, target_chunk in zip(
+            torch.split(vocab_parallel_logits, step, dim=1),
+            torch.split(target, step, dim=1),
+        ):
+            if not chunk.is_contiguous():
+                chunk = chunk.contiguous()
+
+            def reference(chunk=chunk, target_chunk=target_chunk) -> torch.Tensor:
+                # The true incumbent for this chunk, end to end: the exact statement sequence of
+                # the Functions' inference path (widen, gather branch, aten-order lse, mask,
+                # all_reduce). Probe-path only, so the fp32 copy it widens is transient.
+                # rowinv's first-call probe compares against this, and returns it on failure.
+                target_mask = (target_chunk < vocab_start_index) | (target_chunk >= vocab_end_index)
+                masked_target = (target_chunk - vocab_start_index).masked_fill(target_mask, 0)
+                ref = _compute_distributed_log_softmax(chunk.to(dtype=torch.float32), group=group, src_dtype=src_dtype)
+                ref = torch.gather(ref, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+                ref = ref.masked_fill(target_mask, 0.0)
+                torch.distributed.all_reduce(ref, op=torch.distributed.ReduceOp.SUM, group=group)
+                return ref
+
+            got = _ix_rowinv_sampled_logprobs(
+                chunk,
+                target_chunk,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+                group=group,
+                src_dtype=src_dtype,
+                reference=reference,
+            )
+            if got is None:
+                return None
+            if grad_on and vocab_parallel_logits.requires_grad and not got.requires_grad:
+                # Probe-failure fallback under grad: rowinv handed back the reference's tensor,
+                # which carries no graph. A silent zero-gradient chunk is worse than the fallback
+                # being slow; refuse it and let the incumbent Function serve the whole call.
+                return None
+            outs.append(got)
+    if _ix_rowinv_stats().get("agreed") is False:
+        # A probe failure latched rowinv off. Chunks before it carry rowinv bits and the failing
+        # chunk carries incumbent bits -- never return that mix; the incumbent serves whole.
+        return None
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+
+
+def _ix_logprobs_apply(
+    vocab_parallel_logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    group: torch.distributed.ProcessGroup,
+    inference_only: bool,
+    chunk_size: Optional[int],
+) -> torch.Tensor:
+    """The ONE dispatch point between the rowinv leaf-tree logprob and the incumbent Functions.
+
+    Sits OUTSIDE any autograd.Function on purpose: ``rowinv_sampled_logprobs`` is itself
+    autograd-capable, but a Function applied inside another Function's forward cannot carry its
+    backward out, so an in-Function hook could serve only ``inference_only=True`` -- improving the
+    scoring gate while the optimized objective kept the old schedule, and splitting scoring from
+    training onto different functions. Dispatching here serves BOTH, which is what the contract's
+    ``trainer_fwd`` + ``trainer_score`` entries declare when the flag is on.
+
+    Flag off (the default), this is byte-for-byte today's selection: the same ``.apply(...)`` on
+    the same chunk-size branch, and rowinv is never consulted.
+    """
+    seq_len_local = int(vocab_parallel_logits.shape[1])
+    # Only use the chunked path when chunking actually splits the sequence into multiple chunks.
+    # When chunk_size >= seq_len the whole sequence is one chunk, but ChunkedDistributedLogprob
+    # still saves the raw vocab_parallel_logits and recomputes softmax in backward (~3x peak
+    # memory vs DistributedLogprob's ~2x), so chunking actively hurts in that regime.
+    use_chunked = chunk_size is not None and chunk_size < seq_len_local
+
+    if _ix_rowinv_available():
+        got = _ix_try_rowinv_logprobs(
+            vocab_parallel_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            group,
+            inference_only,
+            chunk_size if use_chunked else None,
+        )
+        if got is not None:
+            return got.contiguous()
+
+    if use_chunked:
+        return ChunkedDistributedLogprob.apply(  # type: ignore
+            vocab_parallel_logits,
+            target,
+            vocab_start_index,
+            vocab_end_index,
+            chunk_size,
+            group,
+            inference_only,
+        ).contiguous()
+    return DistributedLogprob.apply(  # type: ignore
+        vocab_parallel_logits,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        group,
+        inference_only,
+    ).contiguous()
+
+
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -929,31 +1137,18 @@ def from_parallel_logits_to_logprobs(
     cp_rank = torch.distributed.get_rank(cp_group)
     target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
 
-    # Only use the chunked path when chunking actually splits the sequence into
-    # multiple chunks. When chunk_size >= seq_len the whole sequence is one
-    # chunk, but ChunkedDistributedLogprob still saves the raw
-    # vocab_parallel_logits and recomputes softmax in backward (~3x peak memory
-    # vs DistributedLogprob's ~2x), so chunking actively hurts in that regime.
-    seq_len_local = vocab_parallel_logits.shape[1]
-    if chunk_size is not None and chunk_size < seq_len_local:
-        logprobs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
-            vocab_parallel_logits,
-            target,
-            vocab_start_index,
-            vocab_end_index,
-            chunk_size,
-            tp_group,
-            inference_only,
-        ).contiguous()
-    else:
-        logprobs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
-            vocab_parallel_logits,
-            target,
-            vocab_start_index,
-            vocab_end_index,
-            tp_group,
-            inference_only,
-        ).contiguous()
+    # The chunk-size regime choice and the rowinv dispatch both live in _ix_logprobs_apply --
+    # the ONE dispatch point, outside any autograd.Function so the scoring AND the grad-bearing
+    # forward run the same function.
+    logprobs: torch.Tensor = _ix_logprobs_apply(
+        vocab_parallel_logits,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        tp_group,
+        inference_only,
+        chunk_size,
+    )
 
     if cp_size > 1:
         # we need to gather the logits by context parallelism
@@ -1036,33 +1231,18 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     rolled_targets = rolled_targets.unsqueeze(0)
     vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
 
-    # Apply distributed log probability computation.
-    #
-    # Only use the chunked path when chunking actually splits the sequence into
-    # multiple chunks. When chunk_size >= seq_len the whole sequence is one
-    # chunk, but ChunkedDistributedLogprob still saves the raw
-    # vocab_parallel_logits and recomputes softmax in backward (~3x peak memory
-    # vs DistributedLogprob's ~2x), so chunking actively hurts in that regime.
-    seq_len_local = vocab_parallel_logits.shape[1]
-    if chunk_size is not None and chunk_size < seq_len_local:
-        probs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
-            vocab_parallel_logits,
-            rolled_targets,
-            vocab_start_index,
-            vocab_end_index,
-            chunk_size,
-            group,
-            inference_only,
-        ).contiguous()
-    else:
-        probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
-            vocab_parallel_logits,
-            rolled_targets,
-            vocab_start_index,
-            vocab_end_index,
-            group,
-            inference_only,
-        ).contiguous()
+    # Apply distributed log probability computation. The chunk-size regime choice and the rowinv
+    # dispatch both live in _ix_logprobs_apply -- the ONE dispatch point, outside any
+    # autograd.Function so the scoring AND the grad-bearing forward run the same function.
+    probs: torch.Tensor = _ix_logprobs_apply(
+        vocab_parallel_logits,
+        rolled_targets,
+        vocab_start_index,
+        vocab_end_index,
+        group,
+        inference_only,
+        chunk_size,
+    )
 
     # Remove batch dimension for filtering
     probs = probs.squeeze(0)

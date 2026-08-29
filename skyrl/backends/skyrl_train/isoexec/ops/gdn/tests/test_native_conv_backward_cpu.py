@@ -17,7 +17,6 @@ def _native_conv_backward_stats():
     return dict(G._NATIVE_CONV_BWD_COUNTS)
 
 
-
 def _eager_reference(x, weight, bias, bounds, activation):
     outputs = []
     for start, stop in zip(bounds[:-1], bounds[1:]):

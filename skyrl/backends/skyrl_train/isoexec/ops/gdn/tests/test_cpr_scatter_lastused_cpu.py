@@ -1,6 +1,6 @@
-"""The LRU stamp folded into the fused buffer scatter (``cs_buffer_scatter(last_used=, clock=)``).
+"""The LRU stamp folded into the fused buffer scatter (``cpr_buffer_scatter(last_used=, clock=)``).
 
-WHAT CHANGED AND WHY. ``ChunkSyncedGDN.decode`` ended with two ATen ops that exist only for the
+WHAT CHANGED AND WHY. ``CprGDN.decode`` ended with two ATen ops that exist only for the
 prefill-time LRU: ``self._clock += 1`` and ``self.last_used[rows] = self._clock``. The second is an
 ``index_put_`` -- a single-block kernel writing 512 int64s, positionally measured at 2.90 us per GDN
 layer = 87 us of every decode step at 30 layers, inside the captured graph. The scatter kernel
@@ -13,7 +13,7 @@ together or not at all; the dtypes are the ones the kernel assumes) and the valu
 asserted on a device when there is one.
 
 Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_cs_scatter_lastused_cpu.py -q
+       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_cpr_scatter_lastused_cpu.py -q
 """
 
 import pytest
@@ -21,8 +21,8 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cs_scatter import (  # noqa: E402
-    cs_buffer_scatter,
+from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_scatter import (  # noqa: E402
+    cpr_buffer_scatter,
 )
 
 CUDA = torch.cuda.is_available()
@@ -50,7 +50,7 @@ def _bufs(rows=8, C=64, HV=4, K=128, V=128, N=5, device="cpu"):
 
 
 def _call(d, **kw):
-    return cs_buffer_scatter(
+    return cpr_buffer_scatter(
         d["k"], d["v"], d["g"], d["beta"], d["rows"], d["pos"],
         d["k_buf"], d["v_buf"], d["g_buf"], d["b_buf"], d["chunk_size"], **kw,
     )  # fmt: skip

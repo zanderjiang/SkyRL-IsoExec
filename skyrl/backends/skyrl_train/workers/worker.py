@@ -435,7 +435,9 @@ class Worker(DistributedTorchRayActor):
         # ledger refusal propagates; the helpers themselves swallow internal errors.
         if os.environ.get("SKYRL_ISOEXEC") == "1":
             try:
-                from skyrl.backends.skyrl_train.isoexec.core.adapter import process_adapter
+                from skyrl.backends.skyrl_train.isoexec.core.adapter import (
+                    process_adapter,
+                )
                 from skyrl.backends.skyrl_train.isoexec.core.enforce import (
                     WEIGHT_SYNC,
                     report,

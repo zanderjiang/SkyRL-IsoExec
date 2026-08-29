@@ -42,7 +42,6 @@ import sys
 
 import torch
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
@@ -95,8 +94,7 @@ def _bitwise(name, x, y):
     d = (x.float() - y.float()).abs()
     n_diff = (x != y).sum().item()
     print(
-        f"  FAIL {name}: {n_diff}/{x.numel()} elements differ, "
-        f"max {d.max().item():.3e} mean {d.mean().item():.3e}"
+        f"  FAIL {name}: {n_diff}/{x.numel()} elements differ, " f"max {d.max().item():.3e} mean {d.mean().item():.3e}"
     )
     return False
 
@@ -120,20 +118,34 @@ def test_conv(results):
     idx = torch.tensor([1], dtype=torch.int32, device=DEV)
     has0 = torch.zeros(1, dtype=torch.bool, device=DEV)
     causal_conv1d_fn(
-        mixed[:T].transpose(0, 1).contiguous(), w, bias, conv_states=cs_a,
-        query_start_loc=qsl, cache_indices=idx, has_initial_state=has0,
+        mixed[:T].transpose(0, 1).contiguous(),
+        w,
+        bias,
+        conv_states=cs_a,
+        query_start_loc=qsl,
+        cache_indices=idx,
+        has_initial_state=has0,
         activation="silu",
     )
     y_dec = causal_conv1d_update(
-        mixed[T : T + 1].clone(), cs_a, w, bias, "silu",
+        mixed[T : T + 1].clone(),
+        cs_a,
+        w,
+        bias,
+        "silu",
         conv_state_indices=idx,
     )
 
     cs_b = fresh_states()
     qsl_b = torch.tensor([0, T + 1], dtype=torch.int32, device=DEV)
     y_b = causal_conv1d_fn(
-        mixed[: T + 1].transpose(0, 1).contiguous(), w, bias, conv_states=cs_b,
-        query_start_loc=qsl_b, cache_indices=idx, has_initial_state=has0,
+        mixed[: T + 1].transpose(0, 1).contiguous(),
+        w,
+        bias,
+        conv_states=cs_b,
+        query_start_loc=qsl_b,
+        cache_indices=idx,
+        has_initial_state=has0,
         activation="silu",
     ).transpose(0, 1)
     results.append(_bitwise("T1 conv: prefill-then-update last tok == longer prefill", y_dec[0], y_b[T]))
@@ -143,15 +155,25 @@ def test_conv(results):
     T1, T2 = 19, T + 1 - 19
     cs_c = fresh_states()
     y_c1 = causal_conv1d_fn(
-        mixed[:T1].transpose(0, 1).contiguous(), w, bias, conv_states=cs_c,
+        mixed[:T1].transpose(0, 1).contiguous(),
+        w,
+        bias,
+        conv_states=cs_c,
         query_start_loc=torch.tensor([0, T1], dtype=torch.int32, device=DEV),
-        cache_indices=idx, has_initial_state=has0, activation="silu",
+        cache_indices=idx,
+        has_initial_state=has0,
+        activation="silu",
     ).transpose(0, 1)
     has1 = torch.ones(1, dtype=torch.bool, device=DEV)
     y_c2 = causal_conv1d_fn(
-        mixed[T1 : T + 1].transpose(0, 1).contiguous(), w, bias, conv_states=cs_c,
+        mixed[T1 : T + 1].transpose(0, 1).contiguous(),
+        w,
+        bias,
+        conv_states=cs_c,
         query_start_loc=torch.tensor([0, T2], dtype=torch.int32, device=DEV),
-        cache_indices=idx, has_initial_state=has1, activation="silu",
+        cache_indices=idx,
+        has_initial_state=has1,
+        activation="silu",
     ).transpose(0, 1)
     y_c = torch.cat([y_c1, y_c2], dim=0)
     results.append(_bitwise("T2 conv: chunk1+chunk2 outputs == whole", y_c, y_b))
@@ -189,9 +211,18 @@ def test_core(results, y_conv):
     idx = grid_idx(1, T)
     cu = torch.tensor([0, T], dtype=torch.int32, device=DEV)
     o_a, _ = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, a=a, b=b, dt_bias=dt_bias, q=q, k=k, v=v,
-        initial_state=ssm_a, inplace_final_state=True,
-        cu_seqlens=cu, ssm_state_indices=idx, use_qk_l2norm_in_kernel=True,
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        initial_state=ssm_a,
+        inplace_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=idx,
+        use_qk_l2norm_in_kernel=True,
     )
 
     # --- T3: T sequential single-token calls resuming through the state row ---
@@ -201,10 +232,18 @@ def test_core(results, y_conv):
     idx1 = torch.tensor([1], dtype=torch.int32, device=DEV)  # decode: 1-D [N], row per seq
     for t in range(T):
         o_t, _ = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log, a=a[t : t + 1], b=b[t : t + 1], dt_bias=dt_bias,
-            q=q[:, t : t + 1], k=k[:, t : t + 1], v=v[:, t : t + 1],
-            initial_state=ssm_b, inplace_final_state=True,
-            cu_seqlens=cu1, ssm_state_indices=idx1, use_qk_l2norm_in_kernel=True,
+            A_log=A_log,
+            a=a[t : t + 1],
+            b=b[t : t + 1],
+            dt_bias=dt_bias,
+            q=q[:, t : t + 1],
+            k=k[:, t : t + 1],
+            v=v[:, t : t + 1],
+            initial_state=ssm_b,
+            inplace_final_state=True,
+            cu_seqlens=cu1,
+            ssm_state_indices=idx1,
+            use_qk_l2norm_in_kernel=True,
         )
         outs.append(o_t)
     o_b = torch.cat(outs, dim=1)
@@ -215,18 +254,32 @@ def test_core(results, y_conv):
     T1 = 19
     ssm_c = fresh_ssm()
     o_c1, _ = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, a=a[:T1], b=b[:T1], dt_bias=dt_bias,
-        q=q[:, :T1], k=k[:, :T1], v=v[:, :T1],
-        initial_state=ssm_c, inplace_final_state=True,
+        A_log=A_log,
+        a=a[:T1],
+        b=b[:T1],
+        dt_bias=dt_bias,
+        q=q[:, :T1],
+        k=k[:, :T1],
+        v=v[:, :T1],
+        initial_state=ssm_c,
+        inplace_final_state=True,
         cu_seqlens=torch.tensor([0, T1], dtype=torch.int32, device=DEV),
-        ssm_state_indices=grid_idx(1, T1), use_qk_l2norm_in_kernel=True,
+        ssm_state_indices=grid_idx(1, T1),
+        use_qk_l2norm_in_kernel=True,
     )
     o_c2, _ = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, a=a[T1:], b=b[T1:], dt_bias=dt_bias,
-        q=q[:, T1:], k=k[:, T1:], v=v[:, T1:],
-        initial_state=ssm_c, inplace_final_state=True,
+        A_log=A_log,
+        a=a[T1:],
+        b=b[T1:],
+        dt_bias=dt_bias,
+        q=q[:, T1:],
+        k=k[:, T1:],
+        v=v[:, T1:],
+        initial_state=ssm_c,
+        inplace_final_state=True,
         cu_seqlens=torch.tensor([0, T - T1], dtype=torch.int32, device=DEV),
-        ssm_state_indices=grid_idx(1, T - T1), use_qk_l2norm_in_kernel=True,
+        ssm_state_indices=grid_idx(1, T - T1),
+        use_qk_l2norm_in_kernel=True,
     )
     o_c = torch.cat([o_c1, o_c2], dim=1)
     results.append(_bitwise("T4 core: chunk1+chunk2 == whole (outputs)", o_c, o_a))
@@ -239,9 +292,18 @@ def test_core(results, y_conv):
     kn = l2norm_fwd(k.squeeze(0)).unsqueeze(0)
     ssm_d = fresh_ssm()
     o_d, _ = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, a=a, b=b, dt_bias=dt_bias, q=qn, k=kn, v=v,
-        initial_state=ssm_d, inplace_final_state=True,
-        cu_seqlens=cu, ssm_state_indices=idx, use_qk_l2norm_in_kernel=False,
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=qn,
+        k=kn,
+        v=v,
+        initial_state=ssm_d,
+        inplace_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=idx,
+        use_qk_l2norm_in_kernel=False,
     )
     # INFORMATIONAL, not a gate: the in-kernel l2norm is an rsqrt-MULTIPLY on the fp32 upcast
     # (kernel line ~139) while l2norm_fwd is a separate kernel; if they differ, composition A
@@ -277,8 +339,13 @@ def test_old_vs_native(results, pack):
     idx_grid[0, 0] = 1
     idx_grid[0, T - 1] = 1
     o_old = gdn_recurrent_kernel(
-        qz.unsqueeze(0), kz.unsqueeze(0), v, g.unsqueeze(0), beta.unsqueeze(0),
-        ssm_state=ssm, state_indices=idx_grid.to(DEV),
+        qz.unsqueeze(0),
+        kz.unsqueeze(0),
+        v,
+        g.unsqueeze(0),
+        beta.unsqueeze(0),
+        ssm_state=ssm,
+        state_indices=idx_grid.to(DEV),
         cu_seqlens=torch.tensor([0, T], dtype=torch.int32, device=DEV),
     )
     d = (o_old.float() - o_native.float()).abs()

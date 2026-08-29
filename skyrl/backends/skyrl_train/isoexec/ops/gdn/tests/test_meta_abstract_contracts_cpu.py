@@ -8,9 +8,7 @@ from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_ops import gdn_core, gdn_l2n
 
 
 def test_gdn_l2norm_meta_contract_preserves_tensor_abi_without_loading_cuda_kernel():
-    value = torch.empty_strided(
-        (7, 3, 128), (512, 128, 1), dtype=torch.bfloat16, device="meta"
-    )
+    value = torch.empty_strided((7, 3, 128), (512, 128, 1), dtype=torch.bfloat16, device="meta")
     before = frozenset(sys.modules)
     result = gdn_l2norm(value)
 

@@ -9,8 +9,11 @@ fact that has rotted is wrong identically on both runtimes, so no bitwise gate w
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
+
+from ..contract import STATE_EVENTS
 
 # Attention families.
 ATTN_GQA = "gqa"
@@ -74,12 +77,25 @@ class TopologyAxisFact:
     def __post_init__(self) -> None:
         if self.kind not in ("pinned", "invariant"):
             raise ProfileError(f"topology axis {self.axis!r}: unknown kind {self.kind!r}")
-        if self.kind == "pinned" and (self.degree is None or self.collective_plan is None):
-            raise ProfileError(f"topology axis {self.axis!r}: pinned requires degree and collective_plan")
-        if self.kind == "invariant" and (not self.domain or not self.proof):
+        if self.proof is not None and not self.proof.strip():
+            raise ProfileError(f"topology axis {self.axis!r}: empty proof ref names no gate")
+        if self.kind == "pinned":
+            if self.degree is None or self.collective_plan is None:
+                raise ProfileError(f"topology axis {self.axis!r}: pinned requires degree and collective_plan")
+            if self.degree < 1:
+                raise ProfileError(
+                    f"topology axis {self.axis!r}: pinned degree {self.degree} is not a deployable "
+                    "degree (>= 1); a runtime reporting it would MATCH the claim"
+                )
+        elif not self.domain or not self.proof:
             raise ProfileError(
                 f"topology axis {self.axis!r}: invariant requires a non-empty proven domain AND a "
                 "proof ref (the colocated gate that measured it); an unproven domain is not declarable"
+            )
+        elif len(set(self.domain)) < 2:
+            raise ProfileError(
+                f"topology axis {self.axis!r}: invariance over the single degree "
+                f"{sorted(set(self.domain))} is a tautology, not an invariance claim; pin the axis instead"
             )
 
 
@@ -100,6 +116,13 @@ class StateFact:
                 f"state fact {self.state_id!r}: requires a non-empty invalidated_by and a ref "
                 "naming the existing hook (a claim with no implementing hook is prose)"
             )
+        unknown = sorted(set(self.invalidated_by) - STATE_EVENTS)
+        if unknown:
+            raise ProfileError(
+                f"state fact {self.state_id!r}: unknown lifecycle event(s) {unknown}; the "
+                f"vocabulary is {sorted(STATE_EVENTS)}. An event no boundary observes cannot "
+                "invalidate anything, so declaring it states nothing checkable."
+            )
 
 
 @dataclass(frozen=True)
@@ -116,9 +139,16 @@ class ToleranceFact:
             raise ProfileError(f"tolerance fact {self.case_pair!r}: requires a 2-case pair and bounds")
         for k, v in self.bounds:
             try:
-                float(v)
+                parsed = float(v)
             except (TypeError, ValueError):
                 raise ProfileError(f"tolerance fact {self.case_pair!r}: bound {k}={v!r} is not a decimal string")
+            # "nan"/"inf" parse fine and are exactly the values that make the gate's comparison
+            # against the bound vacuous, so float() alone is not the check.
+            if not math.isfinite(parsed):
+                raise ProfileError(
+                    f"tolerance fact {self.case_pair!r}: bound {k}={v!r} is not a finite threshold; "
+                    "a gate comparing against it admits everything"
+                )
 
 
 @dataclass(frozen=True)
@@ -156,9 +186,9 @@ class ModelProfile:
                         ``norms.rms`` has two impls; the engine's fused twin exists only for this form.
     tensor_parallel:    TP>1 anywhere, i.e. the pik collectives install. At TP=1 they carry no entry.
     gdn_kernel:         which GDN core kernel is pinned. Decides two ops: the ``gdn.core`` kernel pin
-                        and, since chunk_synced owns its own state pool, the engine's ``gdn.state``.
+                        and, since cpr owns its own state pool, the engine's ``gdn.state``.
     gdn_chunk_size:     C, the chunk-boundary period; only reaches the manifest under
-                        ``gdn_kernel="chunk_synced"``, where trainer and engine agree only at equal C.
+                        ``gdn_kernel="cpr"``, where trainer and engine agree only at equal C.
     trainer_nccl_admissions: effective NCCL tuples this profile admits on trainer sites. Empty means
                         a non-pinned trainer manifest must refuse before NCCL initialization.
     """

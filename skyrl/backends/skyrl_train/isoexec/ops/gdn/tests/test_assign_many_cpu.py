@@ -31,10 +31,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_chunk_synced_state import (  # noqa: E402
-    ChunkSyncedGDN,
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import (
+    gdn_recurrent_state as _grs,  # noqa: E402
 )
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_recurrent_state as _grs  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_state import (  # noqa: E402
+    CprGDN,
+)
 
 
 def host_bookkeeping_stats():
@@ -323,7 +325,7 @@ def test_empty_batch_touches_nothing():
 
 
 def test_assign_is_assign_many_of_one():
-    """``cs_apc_adopt`` still calls the single-slot door; it must stay the write-through path."""
+    """``cpr_apc_adopt`` still calls the single-slot door; it must stay the write-through path."""
     old, new = make_pool(capacity=6), make_pool(capacity=6)
     for s in (40, 41, 42):
         assert _assign_legacy(old, s) == new._assign(s)
@@ -424,7 +426,7 @@ def test_inverse_ownership_is_lazily_reconstructed_for_legacy_pool():
 
 
 def test_position_mirror_and_missing_row_fallback_are_value_identical():
-    ly = object.__new__(ChunkSyncedGDN)
+    ly = object.__new__(CprGDN)
     ly.pos = torch.tensor([0, 17, 64, 129], dtype=torch.long)
     ly._row_pos = {1: 17, 2: 64}
 
@@ -441,7 +443,7 @@ def test_position_mirror_and_missing_row_fallback_are_value_identical():
 
 
 def test_unknown_driver_split_clears_stale_decode_positions():
-    ly = object.__new__(ChunkSyncedGDN)
+    ly = object.__new__(CprGDN)
     ly._driver_managed = False
     ly._row_pos = {1: 64}
     ly._slot2row = OrderedDict([(10, 1)])

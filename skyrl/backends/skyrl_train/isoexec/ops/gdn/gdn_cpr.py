@@ -1,4 +1,4 @@
-"""Canonical chunk-synced GDN forward for trainer and engine prefill.
+"""Canonical CPR GDN forward for trainer and engine prefill.
 
 The FLA state pass computes each chunk's boundary state; a fused recurrent scan then computes the
 within-chunk outputs, restarting from the corresponding bf16 boundary snapshot upcast to fp32, while the
@@ -24,12 +24,12 @@ _META_CACHE_MAX = 512
 
 
 def host_meta_enabled() -> bool:
-    """``SKYRL_ISOEXEC_GDN_CS_HOST_META`` (default on): host-built chunk metadata.
+    """``SKYRL_ISOEXEC_GDN_CPR_HOST_META`` (default on): host-built chunk metadata.
 
     Off restores the vendored ``prepare_chunk_indices``/``prepare_chunk_offsets`` path; the two produce
     ``torch.equal`` tensors, so the flag moves time, never bits.
     """
-    return os.environ.get("SKYRL_ISOEXEC_GDN_CS_HOST_META", "1").lower() not in ("0", "false", "no", "")
+    return os.environ.get("SKYRL_ISOEXEC_GDN_CPR_HOST_META", "1").lower() not in ("0", "false", "no", "")
 
 
 def host_chunk_meta(lens, chunk_size: int, device, dtype=torch.int32):
@@ -273,7 +273,7 @@ def _state_pool(h: torch.Tensor, n_chunks: int, device) -> torch.Tensor:
 
 
 def native_matched_prep(k_raw: torch.Tensor, a: torch.Tensor, b: torch.Tensor, A_log, dt_bias):
-    """The v2 boundary-pass prep: eager l2norm and sigmoid gating computed from raw inputs.
+    """The boundary-pass prep: eager l2norm and sigmoid gating computed from raw inputs.
 
     The native-composition core keeps l2norm/gating in-kernel, but the boundary pass needs explicit
     ``k/g/beta``. This single definition is used by the trainer forward, engine prefill and the decode
@@ -307,7 +307,7 @@ def native_matched_prep(k_raw: torch.Tensor, a: torch.Tensor, b: torch.Tensor, A
     return kn, g, beta
 
 
-def gdn_native_chunk_synced_fwd(
+def gdn_native_cpr_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -319,12 +319,12 @@ def gdn_native_chunk_synced_fwd(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
 ) -> torch.Tensor:
-    """v2 canonical trainer/prefill forward: chunk-pass boundary ``h_c`` on the eager matched prep, plus
+    """Canonical native trainer/prefill forward: chunk-pass boundary ``h_c`` on the eager matched prep, plus
     one segmented native (fused_sigmoid) scan with per-chunk initial states.
 
     q/k are raw (un-normalised; compressed GQA heads are fine, both the fused core and the vendored state
     pass support ``Hg != HV``); a/b are the raw gating inputs ``[T, HV]``. Same segmented grid and the same
-    bf16-snapshot/fp32-chain handoff as v1; only the within-chunk evaluator and boundary prep differ.
+    bf16-snapshot/fp32-chain handoff as the eager path; only the within-chunk evaluator and boundary prep differ.
     """
     from .gdn_ops import gdn_native_core_kernel
 
@@ -350,7 +350,7 @@ def gdn_native_chunk_synced_fwd(
     )
 
 
-def gdn_chunk_synced_fwd(
+def gdn_cpr_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

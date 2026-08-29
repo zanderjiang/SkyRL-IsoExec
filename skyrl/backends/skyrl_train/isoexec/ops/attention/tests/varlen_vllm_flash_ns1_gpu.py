@@ -16,9 +16,8 @@ if not torch.cuda.is_available():
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 7)))  # repo root
 
-from torch.nn.attention import activate_flash_attention_impl  # noqa: E402
 import torch.nn.attention.varlen  # noqa: E402,F401
-
+from torch.nn.attention import activate_flash_attention_impl  # noqa: E402
 from vllm.vllm_flash_attn import flash_attn_varlen_func  # noqa: E402
 
 DEV = "cuda"
