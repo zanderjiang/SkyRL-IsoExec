@@ -1,59 +1,8 @@
-"""BITWISE gate for O6 -- the fused zero-centred RMSNorm and GDN gated output norm
-(`isoexec.gdn_fused_outnorm`).
+"""Bitwise gate for the fused zero-centred RMSNorm (K2) and GDN gated output norm (K3).
 
-These kernels are TYPE (a): they must reproduce the eager expressions' exact rounding -- every bf16
-down-cast at the same point -- and win only by not going to HBM between steps. A bitwise-equal
-replacement may be installed on the engine alone, which is what keeps the trainer untouched and the
-zero-KL gate immovable by construction. So the acceptance criterion is `torch.equal`. `allclose`
-would tell us nothing: the wrong reduction tile costs 7 elements in 2,097,152.
-
-What is checked:
-
-  1. K2 -- `fused_rms_norm_gamma` vs `F.rms_norm(x, (N,), None, eps) * (1.0 + weight)`, over EVERY
-     width the production config builds (2048 hidden, 256 attn head_dim, 128 GDN value head) x
-     M in {1, 7, 320, 1280, 8192, 32768}
-     (decode, mixed, prefill) -- plus a 16,384-row adversarial pass per width, because a wrong tile
-     shows up at a rate of ~3e-6 and a small M cannot see it.
-  2. K3 -- `fused_gated_out_norm` vs `_eager_apply_gated_norm`'s expression, with `gate` read from a
-     STRIDED 1544-wide in_proj slice exactly as production does, over the same T sweep.
-  3. THE TILE IS THE CONTRACT -- the deliberately-wrong tile (one warp too wide) is run and asserted
-     to DIFFER. Without this the pinned `_tile_for` could be silently widened for occupancy and
-     every other check here would still pass.
-  4. SiLU FORM -- asserts ATen fp32 `F.silu` is `x / (1 + exp(-x))` and is NOT `x * sigmoid(x)`,
-     which is the form the conv in `gdn_fused_prep` uses. Getting this backwards is a live bug that
-     no shape sweep would catch.
-  5. FFMA CONTRACTION -- the mandatory hazard check, with LIVE POSITIVE CONTROLS so it cannot pass
-     vacuously. Positive control (a): an fp32 gamma makes eager != addcmul in a large fraction of
-     elements, proving the comparison has teeth on this shape. Positive control (b): running the
-     kernel with `enable_fp_fusion=True` changes its output, proving the flag we set is load-bearing
-     here and not a no-op.
-  6. K2a -- there is NO cached gamma, so there is nothing to go stale. `1.0 + weight` is formed in
-     registers from the live parameter, so a weight write must be picked up with no notification at
-     all: asserted for both a REPLACED Parameter object (what vllm_worker._set_on_module does) and an
-     in-place write. This replaced a cached-gamma design whose failure mode -- engine silently serves
-     last step's norm weights, forward-only gate stays green -- an offline bitwise gate structurally
-     cannot see. It had already shipped one such bug here (the staleness stamp never matched, so it
-     refreshed every forward and undid the whole hoist) with all 32 checks passing.
-  6b. CUDA-GRAPH REPLAY across a weight change. Production decode is graph-replayed, which re-runs
-     capture-time kernels against capture-time pointers and skips ALL Python. That is the single
-     biggest structural gap between an eager harness and the live engine, and it is where a cached
-     gamma would fail while every eager check above passed.
-  6c. REPRESENTATIVE INPUTS. A test that passes at max|diff| 0.0 on `randn` and then fails live is a
-     test whose inputs are unrepresentative -- this is the diagnosed gap in O3's suite, which passed
-     58/58 offline and then moved the live gate to 2.07e-02. `randn` rows are well-conditioned; real
-     residual streams carry massive-activation outliers, and an outlier DOMINATES the sum of squares,
-     which is exactly the quantity whose fp32 reduction order this kernel must reproduce. Covers
-     outlier rows, heavy-tailed rows, and near-denormal rows where eps placement decides the answer.
-  6d. BATCH COMPOSITION. Live decode is a ragged 320-sequence batch; this harness runs fixed
-     rectangles. A row alone must be bit-identical to that row inside batches of 1..1000.
-  7. INSTALL -- `install_engine_fused_norms` reaches nested norms, skips non-norms, produces
-     bitwise-identical output, and LEAVES THE CLASS UNTOUCHED. That last one is the whole reason the
-     install is per-instance: the trainer imports and constructs the same class, and a class-level
-     rebind would hand it an engine-only kernel with no grad_fn. No bitwise check can see that,
-     because the kernel is bitwise-correct -- it is the install site that is wrong.
-
-Run: CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=. python skyrl/backends/skyrl_train/isoexec/ops/norms/tests/fused_outnorm_gpu.py
-Exit 0 iff every check is exact.
+These kernels must reproduce the eager expressions' exact rounding, so the criterion is
+``torch.equal``, not ``allclose``. Covers the shape sweep, the pinned tile, SiLU form, FFMA
+contraction, weight freshness under graph replay, representative inputs, and the install site.
 """
 
 import os
@@ -80,16 +29,13 @@ from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (  # noqa
     fused_rms_norm_gamma,
 )
 
-# EVERY norm width Qwen3.5-35B-A3B actually builds, from its config.json -- not a round number I
-# liked. 2048 = hidden (main path, unsharded: sequence_parallel is off); 256 = attn head_dim, the
-# q_norm/k_norm sites; 128 = linear_value_head_dim, the GDN out-norm. THE TILE IS CHOSEN PER WIDTH,
-# so a width that is installed but not gated is a bitwise contract nobody checked. 256 was missing
-# from the first version of this gate while `install_engine_fused_norms` happily swapped it.
+# Every norm width the production config builds: hidden, attn head_dim, GDN value head. The tile is
+# chosen per width, so a width that is installed but not gated is an unchecked bitwise contract.
 PROD_WIDTHS = (2048, 256, 128)
 
 DEV = "cuda"
 EPS = 1e-6
-IN_PROJ = 1544  # the real Qwen3.5-A3B in_proj width `gate` is a last-dim slice of
+IN_PROJ = 1544  # the production in_proj width `gate` is a last-dim slice of
 _fails = []
 _checks = 0
 
@@ -106,7 +52,7 @@ def check(name, a, b):
 
 
 def expect_differs(name, a, b):
-    """A control: these MUST differ, or the thing it protects is not being protected."""
+    """A control: these must differ, or the thing it protects is not being protected."""
     global _checks
     _checks += 1
     if torch.equal(a, b):
@@ -132,7 +78,7 @@ for N in PROD_WIDTHS:
         x = torch.randn(M, N, dtype=torch.bfloat16, device=DEV)
         ref = F.rms_norm(x, (N,), None, EPS) * (1.0 + w)
         check(f"K2 N={N} M={M}", fused_rms_norm_gamma(x, w, EPS), ref)
-    # 3-D input, the sbhd shape the main-path norms actually see
+    # 3-D input, the sbhd shape the main-path norms see
     torch.manual_seed(N)
     x3 = torch.randn(320, 1, N, dtype=torch.bfloat16, device=DEV)
     check(f"K2 N={N} sbhd[320,1,{N}]", fused_rms_norm_gamma(x3, w, EPS), F.rms_norm(x3, (N,), None, EPS) * (1.0 + w))
@@ -144,7 +90,7 @@ for N in PROD_WIDTHS:
 # =================================================================================================
 print("[2] K3 -- fused_gated_out_norm vs _eager_apply_gated_norm, gate read strided")
 DV, HV = 128, 4
-w3 = torch.randn(DV, dtype=torch.bfloat16, device=DEV) * 0.05  # RAW zero-centred weight
+w3 = torch.randn(DV, dtype=torch.bfloat16, device=DEV) * 0.05  # raw zero-centred weight
 
 
 def eager_k3(x, gate):
@@ -233,8 +179,8 @@ check("triton enable_fp_fusion=False == eager", mac(a32, b32, c32, False), eager
 # Positive control (b): the flag we set is load-bearing -- turning it on changes the answer.
 expect_differs("CONTROL enable_fp_fusion True vs False", mac(a32, b32, c32, True), mac(a32, b32, c32, False))
 
-# Positive control (c): the same test on the K3 kernel itself, via a gamma promoted to fp32-valued
-# bf16 -- proving the production kernel's own accumulate is on the protected path.
+# Positive control (c): the same test on the K3 kernel itself, so the production kernel's own
+# accumulate is shown to be on the protected path.
 out_fused = torch.empty(Tb * HV, DV, dtype=torch.bfloat16, device=DEV)
 _gated_out_norm_kernel[(triton.cdiv(Tb * HV, mb),)](
     xb,
@@ -261,11 +207,8 @@ else:
 
 # =================================================================================================
 print("[6] K2a -- there is no cached gamma, so there is nothing to go stale")
-# The spec's K2a caches `1.0 + weight` and invalidates it at the weight-sync boundary. This
-# implementation folds the add into the kernel instead, so a weight write is picked up with no
-# notification at all. Assert that directly: mutate the weight the way a sync does (REPLACING the
-# Parameter object, which is what vllm_worker._set_on_module does) and the very next call must
-# already reflect it, with nothing in between.
+# `1.0 + weight` is formed in registers from the live parameter, so a weight write is picked up
+# with no notification. Asserted for both a replaced Parameter object and an in-place write.
 
 
 class _Norm(torch.nn.Module):
@@ -288,7 +231,7 @@ check(
     F.rms_norm(xk, (2048,), None, EPS) * (1.0 + m.weight),
 )
 with torch.no_grad():
-    m.weight.add_(0.25)  # and an IN-PLACE write, the other thing a sync does
+    m.weight.add_(0.25)  # and an in-place write, the other thing a sync does
 check(
     "K2a picks up an IN-PLACE weight write with no refresh call",
     fused_rms_norm_gamma(xk, m.weight, EPS),
@@ -297,12 +240,8 @@ check(
 
 # =================================================================================================
 print("[6b] CUDA-GRAPH REPLAY after a weight change -- the live decode path, which eager tests miss")
-# Production decode is graph-REPLAYED. A replay re-runs capture-time kernels against capture-time
-# pointers and skips all Python, so anything that depended on host code running between syncs is
-# silently dead on the replay path. This is the single biggest structural difference between this
-# harness and the live engine, and it is where a cached-gamma design would fail while every eager
-# check above passed. Capture, change the weights IN PLACE (a sync writes through the parameter's
-# storage), replay, and demand the new weights.
+# A replay re-runs capture-time kernels against capture-time pointers and skips all Python, so
+# capture, write the weights in place as a sync does, replay, and demand the new weights.
 gm = _Norm(2048)
 static_x = torch.randn(320, 2048, dtype=torch.bfloat16, device=DEV)
 static_out = torch.empty_like(static_x)
@@ -338,17 +277,14 @@ check(
 
 # =================================================================================================
 print("[6c] REPRESENTATIVE INPUTS -- randn is not what a residual stream looks like")
-# A parity test that passes at max|diff| 0.0 on randn and then fails live is a test whose INPUTS are
-# unrepresentative. Real hidden states carry massive-activation outliers (orders of magnitude above
-# the rest of the row), and an outlier dominates a sum of squares -- which is exactly the quantity
-# whose fp32 reduction ORDER this kernel has to reproduce. randn rows are well-conditioned and hide
-# tile mismatches; these do not.
+# Real hidden states carry massive-activation outliers, and an outlier dominates the sum of squares
+# -- the quantity whose fp32 reduction order this kernel must reproduce. randn rows hide that.
 for N in PROD_WIDTHS:
     w = torch.randn(N, dtype=torch.bfloat16, device=DEV) * 0.05
     torch.manual_seed(N)
     M = 8192
     x = torch.randn(M, N, dtype=torch.bfloat16, device=DEV)
-    # one massive activation per row, at a random column, 100-10000x the rest
+    # one massive activation per row, 100-10000x the rest
     cols = torch.randint(0, N, (M,), device=DEV)
     mags = (10.0 ** torch.randint(2, 5, (M,), device=DEV).float()).to(torch.bfloat16)
     x[torch.arange(M, device=DEV), cols] = mags
@@ -367,14 +303,8 @@ for N in PROD_WIDTHS:
 
 # =================================================================================================
 print("[6e] FTZ -- subnormal SiLU quotients, the hazard that shipped past O2's 130-check gate")
-# Triton links libdevice with __CUDA_FTZ, so `libdevice.div_rn` flushes a SUBNORMAL QUOTIENT to zero
-# (64,940/65,536). K3's SiLU is `g / (1 + exp(-g))`: both operands are always normal (the denominator
-# is >= 1, the numerator comes from bf16), but for g below about -88 the QUOTIENT is fp32 subnormal
-# and that is what gets flushed. ATen keeps it.
-#
-# NOTE WHY THIS IS A SEPARATE CHECK: [6c] injects outliers into `x`, the norm input. It never touches
-# `gate`, so it cannot reach this at all. An "adversarial inputs" section is only adversarial for the
-# tensor it perturbs -- that is the same blind spot, one tensor over.
+# Triton links libdevice with __CUDA_FTZ, so `libdevice.div_rn` flushes a subnormal quotient to zero
+# while ATen keeps it. Separate from [6c], which perturbs `x` and never reaches `gate`.
 for lo, hi, name in (
     (-120.0, -80.0, "deep subnormal quotients"),
     (-95.0, -85.0, "the FTZ knee"),
@@ -387,21 +317,8 @@ for lo, hi, name in (
     gg = pg[:, 300 : 300 + HVg * DV].view(Tg, HVg, DV)
     check(f"K3 gate in [{lo:.0f},{hi:.0f}] ({name})", fused_gated_out_norm(xg, gg, w3, EPS), eager_k3(xg, gg))
 
-# The control: `libdevice.div_rn` FTZ is real, but K3's SiLU is STRUCTURALLY IMMUNE to it, and the
-# reason is worth stating because it does NOT generalise to the neighbouring expression.
-#
-#   sigmoid  1/(1+exp(-g)) : numerator 1.0. At g=-88 the denominator is 1.65e38 and the quotient is
-#                            6.1e-39 -- SUBNORMAL. libdevice.div_rn flushes it. EXPOSED.
-#   silu     g/(1+exp(-g)) : numerator |g| ~ 88. The same denominator gives 5.3e-37, which is 45x
-#                            ABOVE the 1.18e-38 boundary; and by g=-88.7 the fp32 denominator has
-#                            OVERFLOWED to inf, so the quotient is exactly -0.0 in both forms. The
-#                            quotient can never land in the subnormal window at all. NOT EXPOSED.
-#
-# So a control built on our own expression proves nothing, and saying "the FTZ check passed" would be
-# the vacuous-control failure §0 warns about. Run BOTH forms through the same kernel: silu must be
-# identical either way (structural immunity) and sigmoid must DIFFER (the check has teeth, and would
-# have fired had K3 been sigmoid-shaped). Measured min|nonzero quotient|: silu 2.6e-37, sigmoid
-# 2.9e-39.
+# K3's silu form `g/(1+exp(-g))` is structurally immune: its quotient never lands in the subnormal
+# window, unlike sigmoid's `1/(1+exp(-g))`. Run both so the immunity claim has a control with teeth.
 import triton.language as _tl  # noqa: E402
 from triton.language.extra import libdevice as _ld  # noqa: E402
 
@@ -438,10 +355,8 @@ print(
 
 # =================================================================================================
 print("[6d] BATCH COMPOSITION -- a row's output must not depend on its neighbours")
-# Live decode is a ragged 320-sequence batch whose composition changes every step; this harness runs
-# fixed rectangles. The kernels are row-independent by construction (the reduction is along the
-# feature axis only), so assert exactly that rather than trusting it: a row computed alone must be
-# bit-identical to the same row inside a batch, and inside a batch of a different size.
+# The reduction is along the feature axis only, so a row computed alone must be bit-identical to
+# the same row inside a batch of any size. Live decode's batch composition changes every step.
 for N in PROD_WIDTHS:
     w = torch.randn(N, dtype=torch.bfloat16, device=DEV) * 0.05
     torch.manual_seed(N + 1)
@@ -485,7 +400,7 @@ toy = _Toy()
 with torch.no_grad():
     toy.a.weight.normal_(0, 0.05)
     toy.inner.b.weight.normal_(0, 0.05)
-# Capture eager answers from a PRISTINE instance of the same class before installing anything.
+# Capture eager answers from a pristine instance of the same class before installing anything.
 pristine_a = ZeroCenteredTorchRMSNorm(2048, EPS, params_dtype=torch.bfloat16)
 pristine_b = ZeroCenteredTorchRMSNorm(128, EPS, params_dtype=torch.bfloat16)
 with torch.no_grad():
@@ -507,9 +422,8 @@ else:
 check("install: swapped forward == eager (N=2048)", toy.a(xa), ref_a)
 check("install: swapped forward == eager (N=128)", toy.inner.b(xb2), ref_b)
 
-# THE POINT OF PER-INSTANCE INSTALL: the CLASS must be untouched, or the trainer -- which imports
-# and constructs this very class -- inherits an engine-only kernel. That is the install_fused_combine
-# failure verbatim, and it is invisible to every bitwise check because the kernel is bitwise-correct.
+# The point of the per-instance install: the class must be untouched, or the trainer -- which
+# constructs this very class -- inherits an engine-only kernel with no grad_fn.
 _checks += 1
 if ZeroCenteredTorchRMSNorm.forward is not type(pristine_a).forward or hasattr(pristine_a, "_ix_fused_norm"):
     _fails.append("install leaked onto the CLASS -- the trainer would get the kernel too")

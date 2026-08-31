@@ -311,15 +311,9 @@ def setup_envvars_for_vllm(kwargs, bundle_indices, standalone_harness: bool = Fa
         # dispatcher-preserving configuration and the pin itself must both verify, or it raises.
         # NO-OP ON EVERY SHIPPING PATH TODAY (no class is compile-eligible -> "inert").
         assert_compilation_admissible(kwargs)
-        # isoexec Phase 2: build + log the composition contract hashes on the ENGINE side. Must
-        # equal the trainer's [ISOEXEC-CONTRACT] identities (same code+model+arch -> same hash); a
-        # mismatch across the two logs is a composition split-brain. The fatal assert runs
-        # worker-side at weight-sync receiver init; the build here stays fail-soft for everything
-        # environmental (no isoexec package, an import that needs a runtime this process lacks)
-        # EXCEPT ContractBuildError under SKYRL_ISOEXEC=1. That error is the declaration itself
-        # refusing the composition about to run and it names the fix; demoting it to a warning
-        # leaves an unrelated guard further down as the only thing that stops the run, with the
-        # actionable message buried in a worker log.
+        # isoexec Phase 2: build + log the ENGINE-side contract hashes; they must equal the
+        # trainer's [ISOEXEC-CONTRACT] identities. Fail-soft except ContractBuildError under
+        # SKYRL_ISOEXEC=1, which names the actual fix; the fatal assert runs worker-side.
         if os.environ.get("SKYRL_ISOEXEC"):
             _fatal_build_error = ()
             try:

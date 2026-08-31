@@ -1,8 +1,6 @@
 """Exact identities for the process-wide NCCL channel composition.
 
-An uncapped communicator and one capped at eight channels are different implementations, so the normalization
-lives here and model admission, trainer census, and engine census cannot give them the same name. This module
-is deliberately CUDA- and torch-free: it describes process environment state, it does not create communicators.
+CUDA- and torch-free by design: describes process environment state, never creates communicators.
 """
 
 from __future__ import annotations
@@ -101,11 +99,7 @@ def requested_trainer_identity(env: Mapping[str, str] | None = None) -> str:
 
 
 def requested_engine_identity(env: Mapping[str, str] | None = None) -> str:
-    """Resolve the neutralized engine channel policy (whose cap defaults to eight).
-
-    vLLM deliberately retains ``NCCL_ALGO=allreduce:tree`` while removing the one-channel floor.
-    This differs from the trainer's ``cap8`` tuple and therefore has a distinct identity.
-    """
+    """Resolve the neutralized engine channel policy (cap defaults to eight)."""
     src = os.environ if env is None else env
     unpin = str(src.get("SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN", "0")).strip()
     if unpin != "1":
@@ -133,8 +127,7 @@ def census(impl_id: str, constants: Mapping[str, str | None]) -> str:
 def assert_contract_matches(view, sites, impl_id: str, constants: Mapping[str, str | None]) -> None:
     """Fail closed when an active runtime's exact tuple differs from its contract entries.
 
-    ``view`` is the contract's ``{(op, site) -> {impl_id, pinned_constants, ...}}`` projection
-    (``core.process_contract.cached_contract_view``).
+    ``view`` is the ``{(op, site) -> {impl_id, pinned_constants, ...}}`` contract projection.
     """
     if view is None:
         raise RuntimeError("active NCCL composition cannot be admitted because the process contract is unavailable")
@@ -153,7 +146,7 @@ def assert_contract_matches(view, sites, impl_id: str, constants: Mapping[str, s
         else:
             per_site[site] = None
     problems = [p for p in per_site.values() if p]
-    # Reporter: the runtime NCCL tuple vs the contract, per site. Fail-safe, verdict unchanged.
+    # Report runtime tuple vs contract per site; fail-safe, verdict unchanged.
     try:
         from ...core import enforce
 
@@ -167,8 +160,7 @@ def assert_contract_matches(view, sites, impl_id: str, constants: Mapping[str, s
     except Exception:  # pragma: no cover - never fatal
         pass
     if problems:
-        # Through the one demotion helper, like the sibling pik plan check: the violations are
-        # already in the ledger above, and a debug run must reach its trace.
+        # Go through the demotion helper so a debug run still reaches its trace.
         from ...core.enforce import refuse
 
         refuse(

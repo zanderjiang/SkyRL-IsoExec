@@ -1,10 +1,7 @@
-"""Manifest-era capabilities, proven to hold on the ExecutionContract build path.
+"""Manifest-era capabilities on the ExecutionContract build path.
 
-Runs on tiny synthetic registries so the assertions are about the machinery (refusals,
-classification, pins, identity axes, delivery, extensions, handshake, fingerprint), not about the
-qwen3.5 content the sibling test files already pin down. Process-global state (extension registry,
-cached contract, fingerprint recorder, env vars) is saved and restored around every test that
-touches it.
+Runs on tiny synthetic registries so the assertions are about the machinery, not the qwen3.5
+content the sibling test files pin down. Process-global state is restored around every test.
 """
 
 import dataclasses
@@ -68,8 +65,8 @@ def _registry():
             rounding=RoundingSchedule({"block": 128, "leaves": PER_MODEL, "mode": OneOf("tree", "flat"), "eps": 1e-6}),
         )
     )
-    # Every default-selected impl is proven on both archs so the arch-rotation test can build on
-    # sm100; "twin" stays sm90-only, which is what the arch-admission refusal is tested against.
+    # Default-selected impls are proven on both archs so the arch-rotation test can build on
+    # sm100; "twin" stays sm90-only, for the arch-admission refusal.
     mm.add_impl(
         ImplSpec(
             "twin",
@@ -170,7 +167,7 @@ def test_registry_refuses_duplicates():
 
 
 def test_same_key_reassignment_is_a_single_entry():
-    # selections are keyed by (op, site): a re-assigned key last-wins, so a duplicate cannot exist
+    # Selections are keyed by (op, site): a re-assigned key last-wins, so no duplicate can exist.
     sel = _selections()
     sel[("alpha.mm", "trainer_fwd")] = entry("ref", pinned={"block": 128})
     c = _build(sel=sel)
@@ -276,7 +273,7 @@ def test_selection_function_refuses_proof():
 
 
 def test_mapping_selections_recheck_classification():
-    # dict-shaped selections bypass Selection.__post_init__; the build re-checks them
+    # Dict-shaped selections bypass Selection.__post_init__; the build re-checks them.
     for bad in (
         {"impl_id": "ref", "classification": DEPLOYMENT},
         {"impl_id": "ref", "neutrality_proof": "run-1"},
@@ -384,7 +381,7 @@ def test_allow_non_accelerator_escape():
 
 
 def test_impl_outside_its_supported_archs_refuses():
-    # twin is proven on sm90 only; evidence is arch-scoped, so sm100 has nothing behind it.
+    # twin is proven on sm90 only, and evidence is arch-scoped.
     sel = _with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128}))
     msg = _refuses(ContractBuildError, _build, sel=sel, arch="sm100")
     assert "twin" in msg and "supported_archs" in msg and "sm100" in msg
@@ -416,7 +413,7 @@ def test_impl_change_rotates_numerical_policy():
     base = _build().identities
     ids = _build(sel=_with("alpha.mm", SITES, entry("twin", pinned={"block": 128}))).identities
     assert ids.numerical_policy != base.numerical_policy
-    assert ids.semantic == base.semantic  # same op vocabulary: the model still MEANS the same
+    assert ids.semantic == base.semantic  # same op vocabulary
 
 
 def test_version_bump_rotates_numerical_policy():
@@ -430,7 +427,7 @@ def test_constant_change_rotates_numerical_policy():
 
 
 def test_deployment_only_change_rotates_deployment_not_function():
-    # symmetric impl at every site: the neutrality proof lives only in the deployment half
+    # Symmetric impl at every site: the neutrality proof lives only in the deployment half.
     def sel(proof):
         s = _selections()
         for site in TRAINER:
@@ -446,8 +443,8 @@ def test_deployment_only_change_rotates_deployment_not_function():
 
 
 def test_group_proof_is_function_bearing_for_asymmetric_ops():
-    # documented behavior: when sites resolve to DIFFERENT impls the single neutrality proof
-    # becomes the group discharge carried by the FUNCTION entries too, so it rotates numerical_policy
+    # When sites resolve to different impls the neutrality proof becomes the group discharge
+    # carried by the function entries too, so it rotates numerical_policy.
     ids = _build(sel=_with("alpha.pin", ENGINE, entry("unpinned", cls=DEPLOYMENT, proof="gate-run-8"))).identities
     assert ids.numerical_policy != _build().identities.numerical_policy
 
@@ -550,7 +547,7 @@ def test_subsumed_op_never_expects_an_installed_key():
     assert {("alpha.core", s) for s in SITES} <= named
     assert not [k for k in named if k[0] == "alpha.sub"]
     assert next(e for e in c.composition if e.impl.id == "fused_all").region == ("alpha.core", "alpha.sub")
-    # the registry itself still declares alpha.sub sites, so a registry-as-installed check refuses them
+    # The registry still declares alpha.sub sites, so a registry-as-installed check refuses them.
     msg = _refuses(ContractDeliveryError, validate_contract_against_installed, c, reg, reg)
     assert "alpha.sub" in msg
 

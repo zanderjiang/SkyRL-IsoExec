@@ -1,41 +1,8 @@
-"""The ONE dispatch point for the rowinv logprob, and what it owes when rowinv cannot serve.
+"""The one dispatch point for the rowinv logprob, and what it owes when rowinv cannot serve.
 
-``_ix_logprobs_apply`` sits in the two ``from_parallel_logits_to_logprobs*`` wrappers, OUTSIDE any
-autograd.Function. That placement is the load-bearing fact this file pins: an in-Function hook can
-serve only ``inference_only=True`` (a Function applied inside another Function's forward cannot
-carry its backward out), which would improve the reported scoring gate while the grad-bearing
-training forward -- the objective actually optimized -- kept the old ATen schedule, and would split
-scoring and training onto different functions. Asserted here, all CPU:
-
-  * AN UNIMPORTABLE ROWINV IS BYTE-FOR-BYTE TODAY'S PATH: rowinv is the composed default, so
-    the only remaining "not serving" state is the import shim. With it, the dispatch returns
-    bitwise-identical tensors to calling the incumbent Functions directly, in both chunk regimes
-    and both grad modes, and rowinv is never consulted (a consulting dispatch trips a planted
-    bomb). The contract still names rowinv, so this state is not silent: the census stays
-    served=0 and the engagement boundary refuses at the next weight sync;
-  * BOTH GRAD MODES ARE SERVED: the dispatch consults rowinv for ``inference_only=True`` AND
-    ``False``, and a served result carries gradient back to the input -- the exact thing the
-    in-Function shape could not do;
-  * THE CHUNK WALK IS THE IDENTITY ON A ROW-INDEPENDENT FUNCTION: chunked and unchunked dispatch
-    agree bitwise. The stand-in used here is row-independent by construction (per-element ops and
-    a fixed column loop); that the REAL kernel's function is row-independent is pinned separately
-    -- the expression by ``test_rowinv_leaftree_cpu.py``, the kernel by ``rowinv_gpu.py`` -- so
-    this test asserts exactly the slice the dispatch owns: slicing (native dtype through --
-    rowinv widens in-kernel, exactly), target alignment, concatenation;
-  * NO MID-TENSOR FUNCTION MIX: a decline on any chunk, a graph-free chunk under grad (the shape
-    of rowinv's probe-failure fallback), or a census latch after the walk each abandon rowinv for
-    the WHOLE call and the incumbent serves, bit-for-bit;
-  * ONE DISPATCH POINT, structurally: an AST scan asserts both wrappers route through
-    ``_ix_logprobs_apply`` and neither Function's forward references rowinv -- a future edit that
-    reintroduces a second dispatch has to delete this test to land.
-
-TP here is world=1 over a single-rank gloo group: the dispatch's TP behaviour is rowinv's own
-(vote/decline unanimity lives inside rowinv and is gated by ``rowinv_tp_dist.py``); what the
-dispatch owes TP is only that it calls or abandons identically on every rank, which follows from
-its inputs (rowinv's verdicts) being TP-unanimous.
-
-Run (CPU only):
-    uv run --extra dev pytest skyrl/backends/skyrl_train/isoexec/ops/logprobs/tests/test_rowinv_dispatch_cpu.py -q
+``_ix_logprobs_apply`` sits in the two ``from_parallel_logits_to_logprobs*`` wrappers, outside any
+autograd.Function, so it can serve both grad modes. CPU-only; world=1 over a single-rank gloo
+group, since the dispatch's TP behaviour is rowinv's own.
 """
 
 from __future__ import annotations
@@ -103,13 +70,10 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 
 
 def _rowwise_standin(logits_chunk: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """A row-independent sampled-logprob stand-in: per-element ops plus a FIXED column loop.
+    """A row-independent sampled-logprob stand-in: per-element ops plus a fixed column loop.
 
-    Runs in whatever dtype it is handed (the dispatch now passes the native bf16 chunk through).
-
-    Row-independent by construction -- no op here can see how many rows sit alongside -- which is
-    the property the real kernel earns via one program per (row, leaf). Differentiable, so the
-    grad tests below exercise the dispatch's backward path end to end.
+    Runs in whatever dtype it is handed, and is differentiable so the grad tests below exercise
+    the dispatch's backward path end to end.
     """
     m = logits_chunk.max(dim=-1).values
     e = torch.exp(logits_chunk - m.unsqueeze(-1))
@@ -171,12 +135,10 @@ def test_dispatch_consults_rowinv_for_both_grad_modes(monkeypatch):
     out_score = M._ix_logprobs_apply(logits, target, 0, K, dist.group.WORLD, True, None)
     out_train = M._ix_logprobs_apply(logits, target, 0, K, dist.group.WORLD, False, None)
     assert len(seen) == 2, "rowinv must be consulted for inference_only=True AND False"
-    # inference_only mirrors the incumbent contract: no backward is offered there, so the rowinv
-    # attempt runs with grad off; the training forward keeps grad on.
+    # inference_only offers no backward, so the rowinv attempt runs with grad off; the training
+    # forward keeps grad on.
     assert seen[0][1] is False and seen[1][1] is True
-    # both declined -> both served by the incumbent, which still owes the training forward a
-    # graph. (No requires_grad claim on out_score: the incumbent Function keeps a grad_fn under
-    # inference_only=True too -- it skips only the saving -- and the dispatch mirrors it exactly.)
+    # Both declined, so the incumbent serves -- and still owes the training forward a graph.
     assert out_train.requires_grad
     direct = M.DistributedLogprob.apply(logits, target.clone(), 0, K, dist.group.WORLD, True).contiguous()
     assert torch.equal(_bits(out_score.detach().float()), _bits(direct.detach().float()))
@@ -194,7 +156,7 @@ def test_grad_flows_through_a_served_dispatch(monkeypatch):
         out.sum().backward()
         assert logits.grad is not None and bool(torch.isfinite(logits.grad).all())
         assert bool((logits.grad != 0).any()), "gradient must actually reach the input"
-        # scoring mode: same function, no graph -- the incumbent's inference_only contract
+        # scoring mode: same function, no graph
         got = M._ix_logprobs_apply(logits.detach(), target, 0, K, dist.group.WORLD, True, chunk_size)
         assert not got.requires_grad
 
@@ -212,8 +174,7 @@ def test_chunked_walk_equals_unchunked_bitwise(monkeypatch):
     for chunk_size in (4, 5, 13, 64):
         walked = M._ix_logprobs_apply(logits, target, 0, K, dist.group.WORLD, True, chunk_size)
         assert torch.equal(_bits(whole), _bits(walked)), f"chunk_size={chunk_size} changed the bits"
-    # and the walk is exactly the stand-in applied whole: slicing/cat added nothing (the chunk
-    # reaches the callee in its native dtype; nothing widens in the dispatch any more)
+    # and the walk is exactly the stand-in applied whole: slicing/cat added nothing.
     direct = _rowwise_standin(logits, target)
     assert torch.equal(_bits(whole), _bits(direct))
 
@@ -237,9 +198,8 @@ def test_mid_walk_decline_abandons_rowinv_for_the_whole_call(monkeypatch):
 
 
 def test_graph_free_chunk_under_grad_falls_back_whole(monkeypatch):
-    # The shape of rowinv's probe-failure fallback: it returns the REFERENCE's tensor, which
-    # carries no graph. Under grad that would be a silent zero-gradient chunk; the dispatch must
-    # treat it as a decline and let the incumbent serve the whole call, graph included.
+    # Rowinv's probe-failure fallback returns the reference's graph-free tensor; under grad the
+    # dispatch must treat that as a decline rather than yield a silent zero-gradient chunk.
     def graph_free(logits_chunk, target, *, reference, **kw):  # noqa: ARG001
         with torch.no_grad():
             return _rowwise_standin(logits_chunk, target)
@@ -253,9 +213,8 @@ def test_graph_free_chunk_under_grad_falls_back_whole(monkeypatch):
 
 
 def test_census_latch_after_the_walk_falls_back_whole(monkeypatch):
-    # A probe failure on the LAST chunk returns incumbent bits for that chunk and latches the
-    # census (stats()["agreed"] is False) without any later chunk to decline: the only mixed-bits
-    # escape hatch, closed by the post-walk latch check.
+    # A probe failure on the LAST chunk latches the census with no later chunk left to decline:
+    # the only mixed-bits escape hatch, closed by the post-walk latch check.
     def served(logits_chunk, target, *, reference, **kw):  # noqa: ARG001
         return _rowwise_standin(logits_chunk, target)
 
@@ -271,11 +230,7 @@ def test_census_latch_after_the_walk_falls_back_whole(monkeypatch):
 # structure: one dispatch point, and it stays that way
 # =================================================================================================
 def test_single_dispatch_point_ast():
-    """Both wrappers route through _ix_logprobs_apply; neither Function's forward knows rowinv.
-
-    A future edit that adds a second dispatch -- a direct ``.apply`` back in a wrapper, or a
-    rowinv hook back inside a Function -- has to delete this test to land.
-    """
+    """Both wrappers route through _ix_logprobs_apply; neither Function's forward knows rowinv."""
 
     def calls_in(fn) -> list:
         tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))

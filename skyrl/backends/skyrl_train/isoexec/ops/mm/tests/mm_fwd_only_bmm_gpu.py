@@ -1,32 +1,8 @@
 """SKYRL_ISOEXEC_MM_FWD_ONLY_BMM: the forward is untouched, the backward is on cuBLAS.
 
-The bmm half of the wave-2A forward-only scoping (``ops/mm/mm_fwd_scope.py``).  The mm half's
-contract is repeated verbatim here on ``aten::bmm``:
-
-  * EVERY forward keeps vLLM's Triton ``bmm_kernel``, **bit for bit** -- engine no_grad, trainer
-    grad-enabled, and the checkpoint RE-forward that runs on the autograd thread inside a graph task
-    and therefore looks exactly like a backward to the discriminator;
-  * only a REAL backward falls through to cuBLAS.
-
-Every assertion below is made non-vacuous by test 0, which first proves that at these shapes the two
-kernels DISAGREE bitwise.  Without that, "forward bits unchanged" would pass on a stack where the
-scoping never fired at all.
-
-  0. non-vacuity        Triton bmm != cuBLAS bmm bitwise at the test shapes.
-  1. forward no_grad    flag ON == flag OFF, bitwise (the engine's prefill/decode shape).
-  2. forward grad-on    flag ON == flag OFF, bitwise (the trainer's training/scoring forward).
-  3. recompute          megatron ``tensor_parallel.checkpoint``: the re-forward's bmm output is
-                        bitwise equal to the ORIGINAL forward's, and the re-entry hook fired.
-  4. backward provenance  torch.profiler: the forward emits ``bmm_kernel`` and no cuBLAS GEMM; the
-                        backward emits cuBLAS GEMM kernels and no ``bmm_kernel``.  With the flag OFF
-                        the backward emits ``bmm_kernel``.
-  5. determinism        two identical fwd+bwd give bitwise-identical grads.
-  6. custom Function    a ``Function.backward`` that calls ``torch.ops.aten.bmm`` (the shape
-                        ``moe_indexed_bmm``'s wgrad has) is routed to cuBLAS, and is deterministic.
-
-RUN (one GPU, ~15 s):
-  CUDA_VISIBLE_DEVICES=1 HF_HOME=/mnt/local_storage/hf \
-  PYTHONPATH=. python skyrl/backends/skyrl_train/isoexec/ops/mm/tests/mm_fwd_only_bmm_gpu.py
+Every forward -- no_grad, grad-enabled, and the checkpoint re-forward on the autograd thread --
+must keep vLLM's Triton ``bmm_kernel`` bit for bit; only a real backward falls through to cuBLAS.
+Test 0 first proves the two kernels disagree at these shapes, so the rest is non-vacuous.
 """
 
 import os
@@ -38,8 +14,7 @@ os.environ.setdefault("MASTER_PORT", os.environ.get("ISOEXEC_BMM_TEST_PORT", "12
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")
 os.environ.setdefault("LOCAL_RANK", "0")
-# The A/B is done IN PROCESS: the OFF arm runs first, then the flag is flipped and the scope
-# installed.  Start from a clean OFF so an inherited environment cannot skip the baseline.
+# The A/B runs in process: start from a clean OFF so an inherited env cannot skip the baseline.
 os.environ["SKYRL_ISOEXEC_MM_FWD_ONLY_BMM"] = "0"
 
 import torch  # noqa: E402
@@ -49,16 +24,8 @@ if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA de
     raise SystemExit(0)
 
 DEV = "cuda"
-# SHAPE SELECTION IS LOAD-BEARING, and the reason is a finding worth recording: at the pinned
-# ``CUBLAS_WORKSPACE_CONFIG`` H100 cuBLAS runs bf16 bmm on ``nvjet_sm90_*_64x*`` kernels whose
-# K-step is 64 -- the SAME step Triton's ``BLOCK_SIZE_K`` uses -- so at most bf16 shapes the two
-# kernels are bitwise IDENTICAL (swept: 0/8.4M mismatches at [2,2048,2048,2048], 0 at
-# [4,512,4096,512], 0 at [64,8,8192,64], even with the K-ranges scaled across 8 decades).  A
-# "forward bits unchanged" assertion on those shapes would pass on a stack where the scoping never
-# fired at all.  So the cases below are chosen from the sweep's DIVERGENT corner:
-#   * fp32 (Triton BLOCK_SIZE_K=32 vs cuBLAS's 64) -- diverges on ~100% of elements;
-#   * bf16 [3,1000,333,777] -- ragged M/K/N, the one bf16 shape in the sweep that diverges.
-# Test 0 re-proves the divergence in-process rather than trusting this comment.
+# Shape selection is load-bearing: at most bf16 shapes H100 cuBLAS and Triton share a K-step of 64
+# and agree bitwise, which would make the assertions vacuous. These are from the divergent corner.
 CASES = [
     (3, 1000, 333, 777, torch.bfloat16),
     (8, 128, 1224, 192, torch.float32),
@@ -82,10 +49,8 @@ def _bitcmp(x, y):
 
 
 def _operands(seed=0):
-    """Operands whose K-ranges are scaled across exponents, so the ORDER of the K reduction is
-    observable in the low bits.  Triton's fixed BLOCK_SIZE_K walk and cuBLAS's tiling then produce
-    different roundings -- which is what makes the bitwise assertions in this file mean something.
-    """
+    """Operands whose K-ranges are scaled across exponents, so the order of the K reduction is
+    observable in the low bits."""
     torch.manual_seed(seed)
     out = []
     for B, M, K, N, dt in CASES:
@@ -98,9 +63,7 @@ def _operands(seed=0):
     return out
 
 
-# --------------------------------------------------------------------------------------------
-# forward captures -- the three contexts every one of which must stay on the Triton kernel
-# --------------------------------------------------------------------------------------------
+# forward captures -- the three contexts that must all stay on the Triton kernel
 def capture_fwd_nograd():
     with torch.no_grad():
         return [torch.ops.aten.bmm(a, b).clone() for a, b in _operands()]
@@ -116,11 +79,9 @@ def capture_fwd_grad():
 
 
 def capture_fwd_recompute():
-    """Original forward AND checkpoint re-forward, via megatron's own ``tensor_parallel.checkpoint``.
+    """Original forward and checkpoint re-forward, via megatron's ``tensor_parallel.checkpoint``.
 
-    The body appends its bmm output on every invocation, so ``seen[0]`` is the original forward
-    (main thread, graph task -1) and ``seen[1]`` is the RE-forward (autograd thread, inside a graph
-    task -- indistinguishable from a backward kernel without the re-entry hook).
+    ``seen[0]`` is the original forward; ``seen[1]`` is the re-forward on the autograd thread.
     """
     from megatron.core import tensor_parallel
 
@@ -142,9 +103,7 @@ def capture_fwd_recompute():
     return per_case
 
 
-# --------------------------------------------------------------------------------------------
 # profiler provenance
-# --------------------------------------------------------------------------------------------
 _TRITON_BMM = "bmm_kernel"
 
 
@@ -159,7 +118,7 @@ def _kernels(fn):
     """CUDA kernel names launched by ``fn``."""
     from torch.profiler import ProfilerActivity, profile
 
-    fn()  # warm up: autotuning / cublas handle creation must not land in the trace
+    fn()  # warm up: autotuning / handle creation must not land in the trace
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn()
@@ -194,7 +153,6 @@ def _fwd_bwd_kernels():
     return fwd_k, bwd_k
 
 
-# --------------------------------------------------------------------------------------------
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
     from vllm.model_executor.layers import batch_invariant as bi
@@ -204,7 +162,7 @@ def main():
 
     from skyrl.backends.skyrl_train.isoexec.ops.mm import mm_fwd_scope as S
 
-    # ---- 0. non-vacuity: the two kernels must actually disagree, or nothing below means anything
+    # ---- 0. non-vacuity: the two kernels must actually disagree
     print("\n[0] non-vacuity: Triton bmm vs cuBLAS bmm at the test shapes")
     diffs = []
     for a, b in _operands():
@@ -215,7 +173,7 @@ def main():
         f"mismatched elements per case: {diffs}",
     )
 
-    # ---- OFF arm (vLLM's unscoped aten::bmm) -------------------------------------------------
+    # ---- OFF arm (vLLM's unscoped aten::bmm)
     print("\n[1-3] capturing the OFF arm (vLLM's unscoped aten::bmm)")
     assert not S.mm_fwd_only_bmm_enabled()
     off_nograd = capture_fwd_nograd()
@@ -228,7 +186,7 @@ def main():
         f"{sum(_TRITON_BMM in k for k in off_bwd_k)} bmm_kernel launches in the backward",
     )
 
-    # ---- flip ON -----------------------------------------------------------------------------
+    # ---- flip ON
     os.environ["SKYRL_ISOEXEC_MM_FWD_ONLY_BMM"] = "1"
     installed = S.install_bmm_scope()
     print(f"\n[bmm-scope-test] install_bmm_scope() -> {installed}", flush=True)
@@ -236,24 +194,24 @@ def main():
     if not installed:
         return _report()
 
-    # ---- 1. forward under no_grad ------------------------------------------------------------
+    # ---- 1. forward under no_grad
     print("\n[1] forward under no_grad (the engine's prefill/decode context)")
     on_nograd = capture_fwd_nograd()
     bad = [_bitcmp(x, y) for x, y in zip(on_nograd, off_nograd)]
     check("no_grad forward bitwise ON == OFF", all(b == 0 for b in bad), f"mismatches per case: {bad}")
 
-    # ---- 2. forward with grad enabled --------------------------------------------------------
+    # ---- 2. forward with grad enabled
     print("\n[2] forward with grad enabled (the trainer's training/scoring forward)")
     on_grad = capture_fwd_grad()
     bad = [_bitcmp(x, y) for x, y in zip(on_grad, off_grad)]
     check("grad-enabled forward bitwise ON == OFF", all(b == 0 for b in bad), f"mismatches per case: {bad}")
 
-    # ---- 3. checkpoint recompute -------------------------------------------------------------
+    # ---- 3. checkpoint recompute
     print("\n[3] checkpoint RE-forward on the autograd thread (the one path the live gate cannot see)")
     on_recompute = capture_fwd_recompute()
     check(
         "the recompute re-entry hook FIRED",
-        S._recompute_fired["n"] > 0,  # accessor stripped publicly; the counter survives
+        S._recompute_fired["n"] > 0,
         "0 means the re-forward ran unmarked -- do not trust anything below it",
     )
     check("checkpoint body ran twice per case (original + re-forward)", all(len(s) == 2 for s in on_recompute))
@@ -270,7 +228,7 @@ def main():
         f"mismatches per case: {bad_ab}",
     )
 
-    # ---- 4. backward provenance --------------------------------------------------------------
+    # ---- 4. backward provenance
     print("\n[4] kernel provenance: forward Triton, backward cuBLAS")
     on_fwd_k, on_bwd_k = _fwd_bwd_kernels()
     check(
@@ -294,7 +252,7 @@ def main():
         f"backward kernels: {sorted(set(on_bwd_k))}",
     )
 
-    # ---- 5. determinism of a full fwd+bwd ----------------------------------------------------
+    # ---- 5. determinism of a full fwd+bwd
     print("\n[5] run-to-run determinism of fwd+bwd")
 
     def grads():
@@ -313,7 +271,7 @@ def main():
         all(_bitcmp(x, y) == 0 and _bitcmp(x, z) == 0 for x, y, z in zip(g1, g2, g3)),
     )
 
-    # ---- 6. a custom Function whose backward calls aten::bmm (the moe_indexed_bmm wgrad shape) --
+    # ---- 6. a custom Function whose backward calls aten::bmm
     print("\n[6] custom autograd Function whose backward calls torch.ops.aten.bmm")
 
     class _F(torch.autograd.Function):

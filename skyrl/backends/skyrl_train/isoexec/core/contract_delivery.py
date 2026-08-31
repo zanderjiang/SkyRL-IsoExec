@@ -1,8 +1,7 @@
 """Deliver the ExecutionContract as the artifact both runtimes read.
 
-Canonical-bytes file plus a hash carried in ``ISOEXEC_CONTRACT_HASH`` for cross-check, and
-installed-key validation: every installed (op, site) must carry an explicit entry, absence means
-"no such site", never "default".
+Canonical-bytes file plus a hash carried in ``ISOEXEC_CONTRACT_HASH`` for cross-check. Every
+installed (op, site) must carry an explicit entry; absence means "no such site", never "default".
 """
 
 from __future__ import annotations
@@ -40,10 +39,7 @@ def write_contract_file(contract: ExecutionContract, path: str) -> str:
 def load_contract(path: str, expected_hash_env: str = CONTRACT_HASH_ENV) -> ExecutionContract:
     """Read a delivered contract and cross-check it against the env var.
 
-    The file's self-consistency (stored identities == recomputed) is always enforced -- debug mode
-    demotes the env cross-check, never this, because a tampered file is not a kernel mix. When the
-    env var is set it must additionally equal the file's numerical_policy identity; a demoted
-    mismatch is still recorded against ``build_valid:contract``, so the artifact is not green.
+    File self-consistency is always enforced; debug mode demotes only the env cross-check.
     """
     from . import enforce
 

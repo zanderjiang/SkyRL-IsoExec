@@ -1,19 +1,7 @@
 """CPU guards for the GDN CPR state pool (`_state_pool`) and the op-count instrument.
 
-WHAT IS BEING GUARDED. The pool build used to be three full-size passes --
-
-    h_flat = h.reshape(...).to(torch.float32)      # a second full-size fp32 buffer
-    pool   = torch.zeros(n_chunks + 1, ...)        # a memset of rows that are all overwritten
-    pool[1 : n_chunks + 1] = h_flat[:n_chunks]
-
--- and is now one ``empty`` + a one-row ``zero_`` + one ``copy_`` that performs the widening cast
-itself. The claim is BITWISE-NEUTRAL BY CONSTRUCTION on a gate-critical forward, so the tests do
-not check a tolerance: they check ``torch.equal`` against the old expression, on bf16 payloads
-chosen to include the values a rounding bug would move (signed zeros, denormals, inf, NaN).
-
-They also check the SAVING, in the unit in which it is real. This is not an op-count win -- at the
-dispatcher it is +1 op -- it is a device-traffic and peak-memory win, so the test measures elements
-written, not calls. A claim that is not measured in its own unit is a banner, not evidence.
+`_state_pool` must be bitwise-identical to the three-pass expression it replaced, so the tests
+assert ``torch.equal``, and measure the saving as elements written rather than op count.
 """
 
 from __future__ import annotations
@@ -82,13 +70,7 @@ def test_partial_pool_takes_only_the_first_n_chunks_rows():
 
 
 def test_the_two_full_size_passes_are_gone_and_the_memset_is_one_row():
-    """The claim, measured rather than asserted -- and stated in the unit that is actually true.
-
-    At the DISPATCHER this change is op-neutral (+1: a ``select`` + ``zero_`` for row 0 replaces the
-    single ``zeros``). What it removes is DEVICE TRAFFIC and peak memory: the full-size ``_to_copy``
-    that materialised a second fp32 copy of the whole pool, and the memset of rows that are then
-    all overwritten. So the assertions are on elements touched, not on a count.
-    """
+    """The full-size widening cast is gone and the memset covers exactly one row."""
     h = _h(n_rows=6)
     with count_ops() as before:
         _reference(h, 6, "cpu")

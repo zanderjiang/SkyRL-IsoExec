@@ -1,8 +1,7 @@
-"""End-to-end ContractAdapter lifecycle, in-process and CPU-only: the complete trainer flow, the
-complete engine flow, and the paired handshake -- every phase boundary crossed through the REAL
-adapter sequence (build -> check_all_claims -> install -> INSTALL close -> first forward ->
-weight sync -> gate), with only the GPU-touching installers stubbed. The final enforcement.json
-and the [ISOEXEC-ENFORCE] summary counts are asserted, not just the return values.
+"""End-to-end ContractAdapter lifecycle (CPU-only): trainer flow, engine flow, paired handshake.
+
+Crosses every phase boundary through the real adapter sequence with only the GPU-touching
+installers stubbed, asserting the final enforcement.json and [ISOEXEC-ENFORCE] summary counts.
 """
 
 import json
@@ -25,11 +24,11 @@ from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
 )
 from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContractAdapter
 
-# torch-first, as in production: workers load torch long before any isoexec module.
+# torch-first, as in production: workers load torch before any isoexec module.
 from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
 
-# CPU-only harness (a live production run owns the GPUs): the real adapter build path reads
-# core/arch.ARCH, so point it at the production accelerator instead of the sentinel.
+# The real adapter build path reads core/arch.ARCH; on a CPU-only host point it at the
+# production accelerator instead of the sentinel.
 if arch_mod.ARCH == arch_mod.NON_ACCELERATOR_ARCH:
     arch_mod.ARCH = "sm90"
 
@@ -52,8 +51,7 @@ _CONTRACT = _clean_build()
 
 
 class _fresh:
-    """Reset ledger + recorder + cached contract + process adapter AND strip every ISOEXEC env var
-    (restored on exit), so the real in-test contract build reflects code defaults."""
+    """Reset ledger/recorder/contract/adapter and strip ISOEXEC env vars so the build sees defaults."""
 
     def __enter__(self):
         self._env = {k: v for k, v in os.environ.items() if k.startswith(("SKYRL_ISOEXEC", "ISOEXEC_"))}
@@ -112,8 +110,7 @@ def _mk_engine(install_fn=lambda: None, tp=8):
 
 
 def _stub_install(side):
-    """The GPU work stubbed, the reporting real: record every contract-named install for this side
-    exactly as the runtime installers do, then the install-time fingerprint pass."""
+    """GPU work stubbed, reporting real: record every contract-named install for this side."""
 
     def _install():
         view = pc.cached_contract_view()

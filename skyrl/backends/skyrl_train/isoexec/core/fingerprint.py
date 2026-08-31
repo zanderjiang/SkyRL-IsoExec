@@ -1,11 +1,7 @@
 """First-forward install fingerprint: what the adapter actually installed, per (op, site).
 
-The contract says which impl should serve each (op, site); this records the module and qualname of
-what really got bound, so the two can be compared. That catches the case a config hash cannot: the
-flag arrived and the contract agreed, but the install never happened or bound a different impl.
-Install sites call ``record_install`` / ``record_installs`` as they bind, and ``log_fingerprint``
-warns on every disagreement against the contract's per-(op, site) view
-(``process_contract.cached_contract_view``). Recording and logging are fail-soft: never fatal.
+Install sites call ``record_install`` as they bind; ``log_fingerprint`` compares the records
+against the contract's per-(op, site) view. Recording and logging are fail-soft: never fatal.
 """
 
 from __future__ import annotations
@@ -21,9 +17,7 @@ Key = Tuple[str, str]  # (op, site)
 
 @dataclass
 class ResolvedFingerprint:
-    """What the adapter records was actually installed per (op, site): module, qualname, pinned
-    constants. Stronger than hashing the config -- it catches "the flag arrived but the install did
-    not happen"."""
+    """What was actually installed per (op, site): module, qualname, pinned constants."""
 
     installed: Dict[Key, dict] = field(default_factory=dict)
 
@@ -31,9 +25,7 @@ class ResolvedFingerprint:
         return frozenset(self.installed.keys())
 
 
-# The site vocabulary, as tuples an install site can spell in one word. Kept here rather than in
-# models/policy.py so an op folder never imports the derivation to describe itself, and so the
-# coverage test can resolve these names statically.
+# The site vocabulary, as tuples an install site can spell in one word.
 TRAINER_SITES = ("trainer_fwd", "trainer_score")
 ENGINE_SITES = ("engine_prefill", "engine_decode")
 ALL_SITES = TRAINER_SITES + ENGINE_SITES
@@ -41,15 +33,13 @@ SCORE_ONLY = ("trainer_score",)
 PREFILL_ONLY = ("engine_prefill",)
 DECODE_ONLY = ("engine_decode",)
 
-# The impl_id recorded when the install a site was asked for did not happen: the flag was off, the
-# rebind found nothing, the guard declined. It is a value rather than silence, so "the manifest
-# names fused and nobody installed it" is visible instead of merely unrecorded.
+# The impl_id recorded when a requested install did not happen. A value rather than silence, so a
+# skipped install is visible instead of merely unrecorded.
 NOT_INSTALLED = "NOT_INSTALLED"
 
 _RECORDER: "FingerprintRecorder | None" = None
 _LOGGED_TAGS: set = set()
-#: (op, site, impl_id, pins) already attested to the obligation ledger. Guards the per-forward
-#: recorders from re-reporting a fact the ledger already holds; see record_install.
+#: (op, site, impl_id, pins) already attested to the obligation ledger.
 _ATTESTED: set = set()
 
 
@@ -81,25 +71,14 @@ def recorder() -> FingerprintRecorder:
 
 
 def record_install(op: str, site: str, impl_id: str, obj=None, pinned=None) -> None:
-    """Record that ``op`` at ``site`` was installed as ``impl_id``; ``obj`` supplies module and
-    qualname. Fail-soft: a recording error is swallowed rather than breaking an install."""
+    """Record that ``op`` at ``site`` was installed as ``impl_id``; fail-soft."""
     try:
         recorder().record(op, site, impl_id, obj, pinned)
     except Exception as e:  # pragma: no cover - never fatal
         logger.warning(f"[ISOEXEC-FINGERPRINT] record_install({op},{site}) skipped: {e}")
         return
-    # The attestation ledger: a record's existence is what discharges install_attest@INSTALL
-    # (NOT_INSTALLED included -- attesting a non-install is the record; the comparator decides
-    # whether it violates the contract). Fail-safe, separately from the record itself.
-    #
-    # ATTESTED ONCE PER DISTINCT FACT. An install is a process-wide fact, but some recorders sit on
-    # a per-forward path (gdn_gptmodel._state rebinds on a (data_ptr, shape) change and re-records
-    # every call), and after the INSTALL phase closes each repeat is a LATE record -- which logs an
-    # error AND rewrites the whole enforcement.json. Measured on a live engine: 61,834 repeats of
-    # the same gdn.state attestation rewriting an 11 MB artifact per GDN layer per forward, with the
-    # ledger growing unboundedly, i.e. quadratic; generation ran >=25x slower than baseline.
-    # Keying on (op, site, impl_id, pins) keeps the semantics -- the record's EXISTENCE is what
-    # discharges the obligation, and a genuine drift changes impl_id or the pins and so re-reports.
+    # A record's existence discharges install_attest@INSTALL. Attested once per distinct
+    # (op, site, impl_id, pins), or per-forward recorders re-report after the phase closes.
     try:
         key = (op, site, impl_id, repr(sorted(pinned.items())) if isinstance(pinned, dict) else repr(pinned))
         if key in _ATTESTED:
@@ -114,11 +93,7 @@ def record_install(op: str, site: str, impl_id: str, obj=None, pinned=None) -> N
 
 
 def record_installs(op: str, sites, impl_id: str, obj=None, pinned=None) -> None:
-    """``record_install`` for the common case of one impl serving several sites.
-
-    A rebind is a process-wide fact, so which sites it serves is a property of the runtime rather
-    than of the call; spelling it ``record_installs(op, ENGINE_SITES, ...)`` keeps that readable.
-    """
+    """``record_install`` for the common case of one impl serving several sites."""
     for site in (sites,) if isinstance(sites, str) else sites:
         record_install(op, site, impl_id, obj, pinned)
 
@@ -126,11 +101,8 @@ def record_installs(op: str, sites, impl_id: str, obj=None, pinned=None) -> None
 def pin_disagreements(want_pins, got_pins) -> list:
     """Per-key disagreements between the contract's pinned constants and the recorded ones.
 
-    The contract's pins are the claim, so every key it names must be recorded and must agree; a key
-    the install reports and the contract does not pin is the install's own detail. Values compare
-    by the registry's pin equality, since a pin round-trips through JSON (a declared tuple arrives
-    as a list) and a bool is never an int. Pure and import-light: an install site can call it
-    directly to compare what it is about to bind.
+    Only keys the contract pins are checked; comparison uses the registry's JSON-tolerant pin
+    equality (a declared tuple arrives as a list, and a bool is never an int).
     """
     from .registry import pin_values_equal
 
@@ -145,12 +117,7 @@ def pin_disagreements(want_pins, got_pins) -> list:
 
 
 def log_fingerprint_once(view=None, tag: str = "default") -> dict:
-    """``log_fingerprint``, at most once per ``tag`` in this process.
-
-    Adapters call this both at the end of their install sequence and at first forward: the two
-    moments see different things -- a lazily built state pool does not exist at install time -- and
-    neither alone covers every op.
-    """
+    """``log_fingerprint``, at most once per ``tag`` in this process."""
     try:
         if tag in _LOGGED_TAGS:
             return []
@@ -164,9 +131,8 @@ def log_fingerprint_once(view=None, tag: str = "default") -> dict:
 def missing_from_fingerprint(view) -> list:
     """Contract keys that nothing recorded -- the instrumentation's own blind spots.
 
-    Distinct from a mismatch: a mismatch says the contract is wrong about an op, this says nobody
-    can tell. Only INFO, because both runtimes build the complete contract, so an op whose site
-    belongs to the other runtime is legitimately unrecorded here.
+    Informational only: both runtimes build the complete contract, so sites belonging to the other
+    runtime are legitimately unrecorded here.
     """
     entries = view or {}
     rec = recorder().installed
@@ -174,11 +140,10 @@ def missing_from_fingerprint(view) -> list:
 
 
 def log_fingerprint(view=None, tag: str = "default") -> dict:
-    """Log the recorded install fingerprint and return the list of disagreements with ``view``.
+    """Log the recorded install fingerprint and return the disagreements with ``view``.
 
-    ``view`` is the contract's ``{(op, site) -> {impl_id, pinned_constants, ...}}`` projection.
-    Warns on every recorded (op, site) whose installed impl_id or pins disagree with the contract,
-    or that the contract does not name at all. An empty list means the instrumented installs match.
+    ``view`` is the contract's ``{(op, site) -> {impl_id, pinned_constants, ...}}`` projection;
+    an empty result means the instrumented installs match it.
     """
     rec = recorder().installed
     logger.warning("[ISOEXEC-FINGERPRINT] (%s) recorded %d instrumented install(s)", tag, len(rec))
@@ -194,8 +159,8 @@ def log_fingerprint(view=None, tag: str = "default") -> dict:
         )
     problems = []
     if view is not None:
-        # Each per-key verdict also lands in the obligation ledger (fail-safe): the comparator
-        # itself stays log-only; the FIRST_FORWARD boundary is what refuses per the severity table.
+        # Per-key verdicts land in the obligation ledger; the comparator itself stays log-only,
+        # the FIRST_FORWARD boundary is what refuses.
         try:
             from . import enforce
         except Exception:  # pragma: no cover - a broken ledger must not break the comparator
@@ -213,8 +178,8 @@ def log_fingerprint(view=None, tag: str = "default") -> dict:
                     f"({got['module']}.{got['qualname']})"
                 )
             elif "pinned_constants" in got:
-                # Only when the recorder reported pins: an install that reports none is a blind
-                # spot (missing_from_fingerprint's business), not evidence that the pins agree.
+                # Only when the recorder reported pins: reporting none is a blind spot, not
+                # evidence that the pins agree.
                 bad = pin_disagreements(want.get("pinned_constants"), got["pinned_constants"])
                 if bad:
                     problem = (

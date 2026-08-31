@@ -1,117 +1,8 @@
 """Order-invariant tensor digests for debug-mode region tracing.
 
-The digest must be computed on-GPU with no device-to-host copy of the tensor (only the final
-8-byte scalar crosses), must be bitwise-exact on equality, and must not depend on the reduction
-tree that computes it. Float reductions fail the last requirement by construction; integer
-addition mod 2**64 is associative and commutative, so bitcasting the tensor to integers and
-reducing with wrapping int64 arithmetic gives a digest that is identical under any chunking,
-any reduction order, any device. (Verified on this torch: int64 add/mul wrap two's-complement
-on CPU and CUDA, and ``sum`` over arbitrary splits is exact mod 2**64.)
-
-Schemes considered:
-
-  (a) plain bitcast + int64 sum -- order-invariant but permutation-blind (commutative sum) and
-      low-entropy (a +1/-1 pair of flips cancels). Rejected.
-  (b) weighted modular sum -- ``digest = sum_i w_i * x_i mod 2**64`` with ``w_i`` a fixed
-      pseudorandom stream indexed by *absolute position*, forced odd. Position-sensitive, one
-      fused pass, chunking-invariant because the weights are position-keyed, and because every
-      ``w_i`` is odd (hence invertible mod 2**64) ANY single-position difference changes the
-      digest deterministically, not probabilistically. Multi-position collisions require
-      ``sum w_i d_i == 0 mod 2**64``: ~2**-64 for pseudorandom weights, non-adversarial. CHOSEN.
-  (c) chunked/Merkle -- (b) applied per segment of the first non-unit dim, localizing which rows
-      diverge, at the cost of more digest values. Available as :func:`segment_digests`, wired
-      into the trace by ``SKYRL_ISOEXEC_DEBUG_SEGMENTS`` and read back by ``compare.py``.
-  (d) library options -- none in torch or in-tree.
-
-The weight stream is one splitmix64 per GROUP of :data:`_GROUP` consecutive positions,
-decorrelated inside the group by xor with ``lane * _LANE`` and forced odd:
-
-    w_i = (splitmix64((i >> 3) ^ salt) ^ ((i & 7) * _LANE)) | 1
-
-One splitmix64 per element measured 868 GB/s on an H100 (3.1x the tensor's read time);
-amortizing it over 8 elements reaches 1309-1966 GB/s (1.5-2.1x read time) with the same
-guarantees: weights stay position-keyed (so chunking-invariance holds), stay odd (so a
-single-position difference is still *deterministically* detected), and stay pairwise distinct (so
-a permutation is still detected). Cancellation of a two-position fault inside one group needs
-``d*(w_a - w_b) == 0 mod 2**64``; both weights are odd so their difference is even, and for a
-16-bit ``d`` that needs ~48 trailing zeros in the difference -- probability ~2**-47, and the lane
-constant is odd so consecutive lanes never share a weight. Weights of *different* groups are
-independent splitmix64 outputs, as before.
-
-Cost, MEASURED on one idle H100 SM90 (medians; ``read`` is ``copy_`` halved, since a copy moves
-the tensor twice). GPU time of the kernel alone:
-
-    shape                       MB   kernel ms    GB/s   read ms   x read   ladder (all rungs)
-    [512,2048]    decode        2.1     0.0347      60    0.0097     3.6x   1.04x  (5 rungs)
-    [10240,2048]  trainer      41.9     0.0411    1020    0.0197     2.1x   2.44x  (5 rungs)
-    [16384,2048]  prefill      67.1     0.0512    1309    0.0277     1.9x   2.81x  (5 rungs)
-    [512,151936]  logits bf16 155.6     0.0841    1850    0.0567     1.5x   3.53x  (5 rungs)
-    [512,151936]  logits fp32 311.2     0.1583    1966    0.1081     1.5x   3.41x  (8 rungs)
-    [16384,128]   router        8.4     0.0358     234    0.0102     3.5x   1.23x  (8 rungs)
-
-Small tensors are launch-latency bound, not bandwidth bound, hence the 3.5x on 2MB. The WHOLE
-call, including the ``.item()`` device-to-host sync a caller pays per digest, against the eager
-implementation this replaced (same shapes):
-
-    shape                     digest ms   was      x     ladder ms   was      seg256 ms   was
-    [512,2048]    decode          0.116   0.292   2.5x       0.146   1.421        0.120   0.559
-    [10240,2048]  trainer         0.118   2.453  20.7x       0.208  12.266        0.179  10.223
-    [16384,2048]  prefill         0.129   3.873  29.9x       0.256  19.355        0.223  16.321
-    [512,151936]  logits bf16     0.166   8.833  53.3x       0.406  44.426        0.177   8.913
-    [512,151936]  logits fp32     0.242   8.882  36.7x       0.671  72.177        0.243   8.968
-    [16384,128]   router          0.116   0.317   2.7x       0.170   2.469        0.199  16.776
-
-The fixed floor (a 1-element tensor, wall clock) is 98-101us, down from 285us. It is now almost
-entirely the synchronous round trip: ~22us of triton launch and ~40us of D2H-after-launch, both
-irreducible while each digest reads its own result back. The remaining win available is to defer
-the read: the kernels accumulate into a per-device arena, so a whole flush's digests could be
-read in ONE D2H, which would take the per-record cost to ~28us. Not done here -- an arena wrap
-must not clear a slot whose value has not been read yet, and a silently wrong digest is worse
-than a slow one.
-
-A 110-record forward (30 gdn.core + 40 moe.router x 2 outputs, TP=8): 12.8ms decode and 13.0ms
-prefill on the trainer, against 38.2ms and 93.7ms for the eager path (and 199.3ms for the
-engine's prefill shapes) -- 3-15x.
-
-Peak temp memory is 8 int64 per digest (an arena slot); the eager fallback allocates
-``chunk_numel`` int64 elements at a time (default 2**22 -> 32MB).
-
-The k-ladder is computed in ONE pass: the int view is loaded once, the position weight once, and
-every rung's mask is applied to that same register, so the whole ladder costs 1.0-3.5x a single
-digest instead of 5-8x. ``segment_digests`` likewise issues one kernel for all segments.
-
-Triton is the digest backend on CUDA; CPU tensors, a torch build without triton, and
-``SKYRL_ISOEXEC_DEBUG_DIGEST=eager`` take the pure-torch path (0.35-11ms at the shapes above --
-correct, just 3-70x slower). The two are required to be BIT-IDENTICAL and
-``tests/test_thash_gpu.py`` pins that across dtypes, shapes, chunkings, rungs, segmentations and
-devices, all three against an independent pure-Python reference.
-
-Dtype coverage: every dtype in :data:`_DTYPE_TABLE` is digested through a same-size integer view,
-which is why fp8, the unsigned widths and complex are cheap to support -- the bits are the bits.
-Anything else raises ``TypeError`` and the caller (``trace.py``) turns that into an explicit
-``unrecordable`` record rather than dropping the output.
-
-Mantissa-truncation ladder: for a float tensor, masking the mantissa to its top ``k`` bits before
-digesting yields a digest of the tensor "rounded" (truncated toward zero in magnitude) to k-bit
-precision. Two implementations whose outputs agree to ~2**-k relative error then match at rung k
-and diverge at finer rungs, so comparing ladders brackets the divergence magnitude without
-exchanging tensors. Rung sets are per dtype (:data:`LADDER_BY_MANTISSA`): fp32/fp64 carry deep
-rungs because a 1-ULP fp32 difference is 2**-23 relative and a ladder that stops at 2**-6 would
-overstate it by five orders of magnitude. bf16 cannot go past k=6 -- with 7 explicit mantissa
-bits its own ULP is 2**-8 relative, so "matches at k=6" is already "within a few ULP" and is the
-tightest statement the format can express.
-
-Ladder caveats, stated honestly, because the comparator's wording depends on them:
-  * The bound is a MAX over elements: one bad element breaks a whole rung.
-  * Truncation is a step function, so two values straddling a truncation boundary diverge at
-    every rung even when numerically close. With many elements perturbed (the realistic "two
-    kernels round differently everywhere" case) some element straddles every boundary, the whole
-    ladder saturates, and the honest verdict is "not bounded by the ladder" -- NOT "large".
-  * NaN payloads and -0.0 vs +0.0 are compared bitwise, by design.
-  * The digest is position-keyed, so a permutation of the same values (a batch-order or token
-    ordering bug) is detected but is indistinguishable from a value change: it breaks every rung
-    exactly as a catastrophic numerical fault would. ``segment_digests`` narrows this -- a
-    permutation confined to one slab shows up as one differing segment.
+``digest = sum_i w_i * (x_i & mask) mod 2**64`` over the tensor's integer bitcast, ``w_i`` an odd
+position-keyed pseudorandom weight: identical under any chunking, reduction order or device.
+Masking float mantissas to their top ``k`` bits gives a ladder that brackets divergence magnitude.
 """
 
 from __future__ import annotations
@@ -144,10 +35,8 @@ _DTYPE_TABLE = {
     torch.bool: (torch.uint8, 0x1, None),
 }
 
-# Widths torch grew later, or that only some builds carry. Same treatment, appended so the
-# codes of the dtypes above never move. Complex views land on int64 with twice the elements
-# (two components per value); position-keyed weighting handles that with no special case, but
-# there is no meaningful mantissa rung, so complex gets no ladder.
+# Widths torch grew later, or that only some builds carry; appended so the codes above never move.
+# Complex views land on int64 with twice the elements and get no mantissa ladder.
 for _name, _view, _mask, _mbits in (
     ("float8_e4m3fn", torch.int8, 0xFF, 3),
     ("float8_e5m2", torch.int8, 0xFF, 2),
@@ -164,8 +53,8 @@ for _name, _view, _mask, _mbits in (
         _DTYPE_TABLE[_dt] = (_view, _mask, _mbits)
 del _name, _view, _mask, _mbits, _dt
 
-# mantissa bits -> truncation rungs, finest first. Rungs are ~4 apart in the fine region so a
-# non-matching/matching rung pair brackets the relative error within a factor of 16.
+# mantissa bits -> truncation rungs, finest first. Rungs are ~4 apart so a matching/non-matching
+# pair brackets the relative error within a factor of 16.
 LADDER_BY_MANTISSA: Dict[int, Tuple[int, ...]] = {
     2: (1, 0),  # float8_e5m2
     3: (2, 1, 0),  # float8_e4m3
@@ -279,14 +168,13 @@ def preload(device: Optional[torch.device] = None) -> bool:
 def _int_view(t: torch.Tensor) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
     """(flat same-size-int tensor in logical row-major order, unsigned mask, mantissa bits).
 
-    ``.contiguous()`` fixes the element order to the logical one, so a transposed view and its
+    ``.contiguous()`` fixes element order to the logical one, so a transposed view and its
     contiguous twin digest identically iff their logical contents match.
     """
     if t.dtype not in _DTYPE_TABLE:
         raise TypeError(f"tensor_digest: unsupported dtype {t.dtype}")
     view_dtype, mask, mbits = _DTYPE_TABLE[t.dtype]
-    # Each of these is a real dispatch (~1.5us), and this runs on every recorded output, so only
-    # the ones the tensor actually needs are issued.
+    # Each of these is a real dispatch (~1.5us) on every recorded output, so only issue what's needed.
     flat = t.detach() if t.requires_grad else t
     if not flat.is_contiguous():
         flat = flat.contiguous()
@@ -298,8 +186,7 @@ def _int_view(t: torch.Tensor) -> Tuple[torch.Tensor, Optional[int], Optional[in
 def _and_mask(unsigned_mask: Optional[int], mbits: Optional[int], k: Optional[int]) -> Tuple[int, int]:
     """(signed int64 mask applied after the upcast, mantissa bits kept).
 
-    Truncating in the view dtype and then masking off the sign extension is the same bit pattern
-    as masking once with the intersection, which is what lets one kernel argument carry both.
+    Truncation and sign-extension masking intersect into one mask, so one kernel argument carries both.
     """
     m = _U64 if unsigned_mask is None else unsigned_mask
     kept = mbits
@@ -364,12 +251,10 @@ def tensor_digest(
     seed: int = 0,
     chunk_numel: int = DEFAULT_CHUNK_NUMEL,
 ) -> int:
-    """64-bit order-invariant digest of ``t``'s logical contents (scheme (b) above).
+    """64-bit order-invariant digest of ``t``'s logical contents.
 
-    ``k`` truncates float mantissas to k bits first (None = full precision). Equal tensors (same
-    shape, dtype, logical values) digest identically on any device under any chunking; any
-    single-element difference changes the digest; a permutation of distinct elements changes it
-    with probability ~1 - 2**-64.
+    ``k`` truncates float mantissas to k bits first (None = full precision). Equal tensors digest
+    identically on any device under any chunking; any single-element difference changes the digest.
     """
     iv, umask, mbits = _int_view(t)
     mask, kept = _and_mask(umask, mbits, k)
@@ -386,9 +271,9 @@ def digest_ladder(
 ) -> Dict[str, str]:
     """Digests at full precision plus a ladder of mantissa truncations, as ``{"full": hex, "k6": hex, ...}``.
 
-    ``ks`` defaults to :func:`ladder_for` (per dtype). Non-float dtypes get only ``"full"``.
-    Rungs >= the dtype's mantissa width are dropped (they would duplicate ``"full"``). Every rung
-    is a mask over the SAME loaded value, so the whole ladder is one pass, not one pass per rung.
+    ``ks`` defaults to :func:`ladder_for` (per dtype); non-float dtypes get only ``"full"``, and
+    rungs >= the dtype's mantissa width are dropped. The bound is a max over elements: with many
+    elements perturbed every rung breaks and the ladder bounds nothing rather than saying "large".
     """
     iv, umask, mbits = _int_view(t)
     rungs: List[Optional[int]] = [None]
@@ -409,12 +294,9 @@ def digest_ladder(
 def segment_axis(t: torch.Tensor) -> int:
     """Dim :func:`segment_digests` slices along: the first with extent > 1 (0 for a flat/1-elem).
 
-    Slicing dim 0 is useless for the shapes the GDN door actually produces -- the trainer's
-    ``[1, T, H, D]`` has one segment covering the whole tensor. Every dim before the first
-    non-unit one has extent 1, so the contiguous layout is exactly ``[shape[axis], rest]`` and
-    segmenting along ``axis`` needs no reshape. Both sides then slice the same logical axis (T
-    for the GDN door), so segment i covers the same slab of tokens on both -- the digests still
-    fold the shape, which is what keeps a shape difference its own divergence kind.
+    Every earlier dim has extent 1, so the contiguous layout is exactly ``[shape[axis], rest]``
+    and no reshape is needed; both sides slice the same logical axis, so segment i covers the
+    same slab on both.
     """
     for i, d in enumerate(t.shape):
         if d > 1:
@@ -430,11 +312,10 @@ def segment_digests(
     seed: int = 0,
     chunk_numel: int = DEFAULT_CHUNK_NUMEL,
 ) -> List[str]:
-    """Scheme (c): one digest per ``rows_per_segment`` slab of :func:`segment_axis`.
+    """One digest per ``rows_per_segment`` slab of :func:`segment_axis`.
 
-    Weights are keyed by the position WITHIN the segment and the segment is salted by its
-    absolute start offset, so segment i is reproducible on its own; each segment is additionally
-    finalized with its own header, so segments are directly comparable one-to-one.
+    Weights are keyed by position within the segment and salted by its absolute start offset, so
+    each segment is reproducible on its own and segments compare one-to-one.
     """
     if t.dim() == 0 or t.numel() == 0:
         return [f"{tensor_digest(t, k=k, seed=seed, chunk_numel=chunk_numel):016x}"]
@@ -442,7 +323,7 @@ def segment_digests(
     mask, kept = _and_mask(umask, mbits, k)
     axis = segment_axis(t)
     rows = t.shape[axis]
-    row_numel = iv.numel() // rows  # ints per row of `axis` -- from the view, so complex slabs right
+    row_numel = iv.numel() // rows  # ints per row of `axis`, from the view so complex slabs are right
     seg_numel = max(1, rows_per_segment) * row_numel
     nseg = (rows + max(1, rows_per_segment) - 1) // max(1, rows_per_segment)
     head = _header(t, kept, seed)
@@ -464,12 +345,9 @@ def segment_digests(
 def iter_tensor_outputs(out, *, max_depth: int = MAX_OUTPUT_DEPTH) -> Iterable[Tuple[str, Optional[torch.Tensor]]]:
     """Enumerate a region call's tensor outputs as ``(path, tensor)``, descending containers.
 
-    Paths are dotted strings ("0", "1.0", "logits") so nested tuples and dict outputs stay
-    distinguishable in the record key -- a bare tensor is path "0". Tuples, lists and dicts are
-    descended up to ``max_depth``; a container found at the depth limit yields ``(path, None)``
-    so the caller records it as unrecordable instead of dropping it silently. Non-tensor leaves
-    (ints, strings, None) are skipped -- a call whose outputs contain no tensor at all yields
-    nothing, which the caller likewise reports rather than swallows.
+    Paths are dotted strings ("0", "1.0", "logits"); a bare tensor is path "0". A container found
+    at ``max_depth`` yields ``(path, None)`` so the caller records it as unrecordable instead of
+    dropping it silently; non-tensor leaves are skipped.
     """
 
     def walk(obj, path: str, depth: int):

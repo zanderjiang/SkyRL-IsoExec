@@ -1,11 +1,7 @@
 """Shared batch-invariant GDN ops -- one implementation used by both the engine and the trainer.
 
-The two runtimes must execute the same code for every op, and that code must be batch- and
-context-invariant. ``gdn_causal_conv`` expresses the width-4 causal depthwise conv as a sum of shifted
-scaled copies -- all elementwise, so token t depends on tokens t-3..t and nothing else -- accumulating
-in fp32 and rounding once, rather than picking one of vLLM's two fused kernels (prefill vs decode do
-not agree bitwise). ``gdn_l2norm`` delegates to vLLM's row-local ``l2norm_fwd``, and ``gdn_chunk`` is
-the chunked delta-rule kernel with autotune configs pinned (see ``gdn_batch_invariant``).
+Both runtimes must execute the same code for every op, and that code must be batch- and
+context-invariant.
 """
 
 from __future__ import annotations
@@ -17,33 +13,15 @@ import torch
 from ...autofuse.bwd_compile import call_region
 
 
-# Which delta-rule kernel the whole stack runs on. The requirement is only that the trainer, engine
-# prefill and engine decode all evaluate the core with the SAME kernel; the two ways to satisfy that
-# trade cost in opposite directions:
-#
-#   "chunk"      everything runs the chunked-parallel kernel that training wants. Decode then re-runs
-#                the chunk kernel over the whole open chunk every step (~C/2 token-rows of work per
-#                decoded token) and keeps an open-chunk buffer per live request per layer.
-#   "recurrent"  everything runs the recurrent kernel that decode wants. Decode is native (one
-#                token-row, no buffers), while training and prefill pay for a scan that is sequential
-#                in T and launches one tiny program per (sequence, head, v-block).
-#
-# Both are bitwise; which is faster end to end depends on the rollout/train mix, so the kernel is a
-# switch rather than a decision baked into the call sites.
-#
-# The chunk kernel needs its autotuner pinned to be invariant. The recurrent kernel is invariant by
-# construction: its grid is (1, NV, N*HV), so no reduction crosses a sequence; each program carries the
-# state in fp32 registers and walks tokens in a plain `for` loop, which is prefix invariance; and it
-# does not autotune, with `do_not_specialize=["N", "T"]` so decode (T=1) and prefill (T=P) run the same
-# compiled kernel. Chaining prefill -> decode is then bitwise as long as the state round-trips exactly,
-# which it does because the ssm state is stored in fp32.
+# Which delta-rule kernel the whole stack runs on; trainer, prefill and decode must all agree.
+# "chunk" needs its autotuner pinned; "recurrent" is invariant by construction (grid (1, NV, N*HV),
+# fp32 register state, no autotune, `do_not_specialize=["N", "T"]`).
 def gdn_kernel_mode() -> str:
     """The delta-rule kernel this process runs. Read at call time; every GDN site must agree.
 
-    Vocabulary, default and parsing live in ``core/gdn_kernel_env`` -- the same answer the
-    DECLARATION site (models/qwen3_5) hashes into the contract. They used to be parsed separately
-    here, which is how ``SKYRL_ISOEXEC_GDN_KERNEL=CPR`` made both runtimes derive the same
-    WRONG contract and the handshake MATCH.
+    Vocabulary, default and parsing live in ``core/gdn_kernel_env``, the same answer the declaration
+    site hashes into the contract; parsing it a second time here would let both sides agree on a
+    wrong contract.
     """
     from ...core.gdn_kernel_env import gdn_kernel_mode as _mode
 
@@ -58,33 +36,19 @@ def cpr_mode() -> bool:
     return gdn_kernel_mode() == "cpr"
 
 
-# Minimal vLLM mamba pages under cpr (engine memory only; moves no bits). cpr never
-# reads vLLM's native GDN state pages -- CprGDN keeps its own private pools and uses the vLLM
-# pages only as a slot-id source -- yet those full-size pages dominate the KV pool, because vLLM pads
-# the mamba page up to one attention page and bumps the attention block size until it covers the real
-# state. Every live request then pins memory nothing reads, starving attention KV into preemption.
-#
-# With this flag both state-shape sources (config-time page sizing and the runtime MambaSpec, which
-# must agree or vLLM's page unification asserts) report GDN_CPR_MIN_STATE_SHAPES, so the mamba page
-# collapses to one minimal attention page. Everything cpr needs from the pages survives,
-# because it never depended on their size: slot ids stay unique per live request per kv-cache group,
-# stable for the request's lifetime, positive for live requests, and a freed id is only re-issued to a
-# request that then prefills. Scoped to cpr with private pools: recurrent mode and
-# SKYRL_ISOEXEC_GDN_NATIVE_STATE=1 read the native pages for real state and keep full shapes.
+# Minimal vLLM mamba pages under cpr (engine memory only; moves no bits), since cpr uses those pages
+# only as a slot-id source. Both state-shape sources must agree or vLLM's page unification asserts.
 _CPR_MIN_PAGES_ENV = "SKYRL_ISOEXEC_GDN_CPR_MIN_PAGES"
 
-# (conv-like, ssm-like) minimal shapes. Two entries so the (conv, ssm) kv_cache tuple structure
-# survives (gdn_engine_patch/gdn_gptmodel read kv_cache[1].shape[0] as a capacity fallback).
-# Sized 16 bytes each so the runner's strided carve-out keeps the second (fp32) tensor aligned
-# for ANY state-dtype combination (gpu_model_runner asserts storage_offset % dtype_size == 0).
+# Two entries so the (conv, ssm) kv_cache tuple structure survives; 16 bytes each so the runner's
+# strided carve-out keeps the fp32 tensor aligned (storage_offset % dtype_size == 0 is asserted).
 GDN_CPR_MIN_STATE_SHAPES = ((1, 8), (1, 1, 4))
 
 
 def gdn_cpr_min_pages() -> bool:
     """True iff vLLM's native GDN state pages should be MINIMAL (slot-id source only).
 
-    Read at call time like every mode flag. Only true in cpr-with-private-pools mode:
-    recurrent/native-state compositions store REAL state in those pages.
+    Only in cpr-with-private-pools mode; recurrent/native-state store REAL state in those pages.
     """
     if os.environ.get(_CPR_MIN_PAGES_ENV, "0").lower() in ("", "0", "false", "no"):
         return False
@@ -97,11 +61,8 @@ def gdn_cpr_min_pages() -> bool:
     return not native_state_enabled()
 
 
-# Swap the conv (only) to the native vLLM pair -- causal_conv1d_fn on the trainer/prefill,
-# causal_conv1d_update at decode -- while l2norm/gating/core stay the isoexec composition. The native
-# pair is one varlen launch instead of the eager per-sequence loop. The flag must flip both runtimes in
-# one run: the two convs round differently (bias in the fp32 accumulator vs added after the taps), so a
-# one-sided flip moves the forward on one side only.
+# Swap only the conv to the native vLLM pair. The flag MUST flip both runtimes in one run: the two
+# convs round differently (bias in the fp32 accumulator vs added after the taps).
 _NATIVE_CONV_ENV = "SKYRL_ISOEXEC_GDN_NATIVE_CONV"
 
 
@@ -132,10 +93,6 @@ def gdn_causal_conv(
 
     Returns:
         ``y [T, D]``, and ``final_state [D, W-1]`` when requested.
-
-    Every op below is elementwise over the token axis, so ``y[t]`` is a pure function of
-    ``x[t-W+1 .. t]``; slicing a prefix, changing the batch, or splitting the sequence into chunks
-    cannot change it.
     """
     if x.ndim != 2:
         raise ValueError(f"gdn_causal_conv expects x=[T, D], got {tuple(x.shape)}")
@@ -182,10 +139,7 @@ def gdn_causal_conv_batched(
 ) -> torch.Tensor:
     """Batched :func:`gdn_causal_conv`: ``x [N, T, D]``, ``initial_state [N, D, W-1]`` -> ``y [N, T, D]``.
 
-    The same elementwise shifted-sum expression with a leading batch dim, so ``y[i]`` is
-    bitwise-identical to ``gdn_causal_conv(x[i], ..., initial_state[i])``: every op is elementwise over
-    (batch, token) and fp32-accumulated in the same fixed order. This lets chunk-consistent decode run
-    one conv over all open chunks instead of a per-slot python loop.
+    ``y[i]`` is bitwise-identical to the unbatched call: same elementwise ops, same fp32 accumulation order.
     """
     if x.ndim != 3:
         raise ValueError(f"gdn_causal_conv_batched expects x=[N, T, D], got {tuple(x.shape)}")
@@ -222,10 +176,8 @@ L2NORM_EPS = 1e-6
 class _GdnL2NormAutograd(torch.autograd.Function):
     """vLLM's ``l2norm_fwd`` in the forward, autograd of the same expression in the backward.
 
-    ``l2norm_fwd`` is a bare Triton launch writing into ``torch.empty_like(x)``, so its result carries
-    no autograd history and backprop through it would silently deliver zero gradient to q and k while
-    the loss still fell. Forward keeps the kernel (bitwise with the engine); backward differentiates
-    ``x * rsqrt(sum(x^2) + eps)``, the expression the kernel evaluates.
+    The bare kernel carries no autograd history, so backprop through it would silently deliver ZERO
+    gradient to q and k while the loss still fell.
     """
 
     @staticmethod
@@ -250,9 +202,7 @@ class _GdnL2NormAutograd(torch.autograd.Function):
 def gdn_l2norm(x: torch.Tensor) -> torch.Tensor:
     """Row-local L2 normalisation, via the same kernel the engine and trainer both import.
 
-    Meta/FakeTensor execution is the official compiler-adapter surface for this opaque manual op.
-    It describes only the output tensor contract; it neither decomposes nor reimplements the
-    arithmetic, and therefore cannot become an AUTOFUSE candidate itself.
+    The meta branch describes only the output tensor contract; it never reimplements the arithmetic.
     """
     if x.device.type == "meta":
         return torch.empty_strided(tuple(x.shape), tuple(x.stride()), dtype=x.dtype, device="meta")
@@ -272,12 +222,7 @@ def fla_chunk_size() -> int:
 def _gdn_chunk_fwd(
     q, k, v, g, beta, initial_state, output_final_state, cu_seqlens, chunk_indices=None, chunk_offsets=None
 ):
-    """The bitwise forward: vLLM's vendored FLA chunk kernel with pinned autotune configs.
-
-    ``chunk_indices``/``chunk_offsets`` may be supplied by the caller. They are a pure function of
-    ``cu_seqlens``, so chunk-consistent decode, where every GDN layer in a step is handed the same
-    cu_seqlens, computes them once per step rather than once per layer.
-    """
+    """The bitwise forward: vLLM's vendored FLA chunk kernel with pinned autotune configs."""
     from vllm.model_executor.layers.fla.ops.chunk import chunk_gated_delta_rule
     from vllm.model_executor.layers.fla.ops.index import (
         prepare_chunk_indices,
@@ -290,13 +235,8 @@ def _gdn_chunk_fwd(
     pin_fla_autotune_configs()  # idempotent; must be in effect before the first launch
 
     if cu_seqlens is not None and chunk_indices is None:
-        # `prepare_chunk_indices` is `@tensor_cache`d on tensor identity and vLLM recycles its
-        # metadata buffers, so feeding it the caller's tensor can hand back a chunk map built for a
-        # previous batch's cu_seqlens. The recompute is expensive (a `.tolist()` device sync plus one
-        # CPU arange per sequence), so a fresh clone per call is wrong in the other direction.
-        # `fla_stable_clone` keeps the trap shut -- a recycled buffer has a different id or a bumped
-        # _version -- while giving every layer of a forward the same object, so FLA's cache hits.
-        # Callers that already know the chunk map should pass it in and skip all of this.
+        # `prepare_chunk_indices` is `@tensor_cache`d on identity and vLLM recycles metadata buffers,
+        # so the caller's tensor can return a stale map; `fla_stable_clone` shuts that trap.
         from .packed_meta_cache import fla_stable_clone
 
         cu_fresh = fla_stable_clone(cu_seqlens)
@@ -321,13 +261,8 @@ def _gdn_chunk_fwd(
 def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
     """Differentiable fp32 chunked delta rule for a batch of equal-length sequences.
 
-    ``q..beta``: ``[B, T, H, D]``. B>1 is the micro_*_batch_size_per_gpu>1 trainer micro-forward;
-    every sequence is advanced independently (the batch dim never enters a reduction), so row
-    values match B=1 exactly.
-
-    This is the megatron ``torch_chunk_gated_delta_rule`` reference, unchanged except that it takes
-    ``initial_state`` in the kernel's ``[N, H, V, K]`` layout. It exists only to supply a
-    vector-Jacobian product (see :class:`_GdnChunkAutograd`); it never runs in the forward.
+    The megatron ``torch_chunk_gated_delta_rule`` reference, except that ``initial_state`` arrives in
+    the kernel's ``[N, H, V, K]`` layout. Supplies a VJP only; it never runs in the forward.
     """
     q, k, v, beta, g = (x.transpose(1, 2).contiguous().float() for x in (q, k, v, beta, g))
     _, num_heads, T, k_dim = k.shape
@@ -349,11 +284,8 @@ def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
     eye_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), 0)
     g = g.cumsum(dim=-1)
     decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().tril()
-    # A is strictly lower triangular, and the inverse (I - A)^-1 is only ever used for the two matmuls
-    # below -- which is a triangular solve. One batched `solve_triangular` (unitriangular, since I - A
-    # has a unit diagonal by construction) replaces the reference's forward-substitution python loop.
-    # This function is the VJP reference and never runs in the forward, so agreement to fp32 rounding
-    # is enough; the backward only has to be the gradient of the forward to floating-point accuracy.
+    # One batched `solve_triangular` (unitriangular: I - A has a unit diagonal) replaces the
+    # reference's forward-substitution loop. VJP-only, so fp32-level agreement suffices.
     A = -((k_beta @ k.transpose(-1, -2)) * decay_mask).masked_fill(eye_mask, 0)
     eye = torch.eye(chunk_size, dtype=A.dtype, device=A.device)
     rhs = torch.cat([v_beta, k_beta * g.exp().unsqueeze(-1)], dim=-1)
@@ -364,9 +296,8 @@ def _torch_chunk_gdr_one(q, k, v, g, beta, initial_state, chunk_size):
     else:
         state = initial_state.transpose(-1, -2).float()  # [N,H,V,K] -> [N,H,K,V]
 
-    # The chunk loop below is sequential (each step carries `state`) but launch-bound rather than
-    # compute-bound, so everything that does not depend on `state` is hoisted and computed batched
-    # across all chunks, leaving three matmuls inside the loop.
+    # The chunk loop is sequential but launch-bound, so everything independent of `state` is hoisted
+    # and batched across chunks, leaving three matmuls inside the loop.
     strict_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), 1)
     attn_all = (q @ k.transpose(-1, -2) * decay_mask).masked_fill(strict_mask, 0)  # [.., NC, C, C]
     qg_all = q * g.exp().unsqueeze(-1)  # [.., NC, C, K]
@@ -400,11 +331,8 @@ def _torch_chunk_gdr(q, k, v, g, beta, initial_state, cu_seqlens, chunk_size):
 class _GdnChunkAutograd(torch.autograd.Function):
     """Bitwise kernel forward + reference VJP backward.
 
-    vLLM vendors FLA's chunk kernel for inference only: it defines a ``forward`` and no ``backward``,
-    so autograd raises as soon as the trainer backprops through it. The forward must stay that exact
-    kernel -- it is why decode and training agree bitwise -- so the backward instead differentiates
-    :func:`_torch_chunk_gdr`, the fp32 torch reference for the same function, at the same inputs. That
-    gradient need only be the gradient of the forward to floating-point accuracy.
+    The vendored chunk kernel defines no ``backward``. The forward must stay that exact kernel (it is
+    why decode and training agree bitwise); the backward differentiates the fp32 torch reference.
     """
 
     @staticmethod
@@ -422,8 +350,7 @@ class _GdnChunkAutograd(torch.autograd.Function):
         from .gdn_fla_backward import fla_backward_enabled, fla_chunk_vjp
 
         if fla_backward_enabled():
-            # FLA's fused Triton backward, correct to floating-point accuracy; only the forward, which
-            # is unchanged, needs to be bitwise. The reference VJP below is the fallback.
+            # FLA's fused Triton backward; only the forward needs to be bitwise.
             grads = fla_chunk_vjp(q, k, v, g, beta, do, initial_state, ctx.cu_seqlens, ctx.chunk_size)
             return (*grads, None, None, None)
         with torch.enable_grad():
@@ -449,16 +376,9 @@ def gdn_chunk(
 ):
     """`chunk_gated_delta_rule` with pinned configs. q/k must already be L2-normalised.
 
-    Returns ``(o, final_state)``. ``final_state`` is meaningful only when the trailing chunk of each
-    sequence is FULL -- for a partial chunk it is the state after that partial chunk, which is not a
-    point on the chunk grid.
-
-    ``chunk_indices``/``chunk_offsets`` are an optional precomputed chunk map for ``cu_seqlens``
-    (see :func:`_gdn_chunk_fwd`); omit them and they are derived, at the cost of a GPU sync.
-
-    Under ``torch.no_grad`` (both rollout paths and the trainer's scoring forward) this is exactly
-    the vLLM kernel. When a gradient is required it routes through :class:`_GdnChunkAutograd`, whose
-    forward is that same kernel -- so the training forward stays bitwise equal to the rollout.
+    Returns ``(o, final_state)``; ``final_state`` is meaningful only when each sequence's trailing
+    chunk is FULL, since a partial chunk's state is not a point on the chunk grid. Omitting
+    ``chunk_indices``/``chunk_offsets`` derives them at the cost of a GPU sync.
     """
     needs_grad = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
@@ -490,28 +410,16 @@ def gdn_recurrent_kernel(
 ) -> torch.Tensor:
     """The raw fused recurrent delta-rule scan. Advances ``ssm_state`` IN PLACE. Returns ``o``.
 
-    This is the single forward every runtime shares in ``recurrent`` mode: the trainer, the engine's
-    prefill and the engine's decode all land here.
-
     Args:
         q, k: ``[B, T, H, K]``, already L2-normalised and GQA-expanded to ``H == HV``.
         v: ``[B, T, HV, V]``; g, beta: ``[B, T, HV]``.
-        ssm_state: the fp32 state POOL, ``[S, HV, V, K]``. Rows are addressed by ``state_indices``,
-            never by position -- see below. Written in place.
-        state_indices: which row of the pool each (sequence, token) reads/writes.
-            ``[N]`` for a one-token-per-sequence decode; ``[N, Tmax]`` otherwise.
+        ssm_state: the fp32 state POOL, ``[S, HV, V, K]``, written in place.
+        state_indices: pool row per (sequence, token); ``[N]`` for one-token decode, else ``[N, Tmax]``.
+            Never None -- the kernel's token-offset path would need a per-token state array.
         cu_seqlens: ``[N+1]`` int32 for a packed batch (then ``B == 1``); None for ``[B, T, ...]``.
 
-    ``state_indices`` is never None. The kernel's other path addresses the state by the sequence's
-    token offset, which would make ``initial_state`` a per-token ``[T, HV, V, K]`` array -- hundreds of
-    KB per token per layer. The continuous-batching path indexes by row instead, so it is used
-    unconditionally, including in training where the pool is a throwaway ``[N+1]`` scratch.
-
-    The kernel stores the running state after every token (there is no final-state-only flag) but skips
-    the store when the index is <= 0. A caller that wants only the final state therefore zeroes every
-    column of ``state_indices`` except each sequence's last real token, and the state is written once
-    per sequence. The skip cannot perturb ``o``: the state lives in registers and the store is
-    write-only.
+    The kernel stores state after every token but skips index <= 0, so zeroing every column except each
+    sequence's last real token writes the state once per sequence. The skip cannot perturb ``o``.
     """
     from vllm.model_executor.layers.fla.ops.fused_recurrent import (
         fused_recurrent_gated_delta_rule,
@@ -536,11 +444,8 @@ def gdn_recurrent_kernel(
 def _recurrent_scratch_state(q, v, cu_seqlens):
     """A throwaway state pool + index map for a forward that wants no state in and none out.
 
-    That is every training call: sequences start from a zero state and nothing downstream reads the
-    final one. Row 0 of the pool is unused because the kernel treats index <= 0 as "skip this lane", so
-    sequence n lives at row n+1. Only column 0 of the index map is set: it is what the initial-state
-    load reads (it must be a valid row, or the kernel returns immediately), and it makes the kernel
-    perform exactly one throwaway state store per sequence instead of one per token.
+    Row 0 is unused (the kernel skips index <= 0), so sequence n lives at row n+1, and only column 0
+    of the index map is set -- it must be a valid row or the kernel returns immediately.
     """
     if cu_seqlens is not None:
         N = cu_seqlens.numel() - 1
@@ -551,10 +456,8 @@ def _recurrent_scratch_state(q, v, cu_seqlens):
 
     HV, V, K = v.shape[-2], v.shape[-1], q.shape[-1]
     ssm_state = q.new_zeros(N + 1, HV, V, K, dtype=torch.float32)
-    # Stride-stable index grid. The kernels take the grid's row stride as a tl.constexpr, so every
-    # distinct stride is a separate Triton compile; an [N, Tmax] allocation would recompile for every
-    # distinct max sequence length. Allocating a power-of-2-bucketed row width and handing out a
-    # [:, :Tmax] view keeps the values and semantics identical while the stride takes ~log2 values.
+    # Stride-stable index grid: the kernels take the row stride as a tl.constexpr, so a power-of-2
+    # bucketed width plus a [:, :Tmax] view keeps values identical while the stride takes ~log2 values.
     pad = max(64, 1 << (Tmax - 1).bit_length())
     idx = torch.zeros(N, pad, dtype=torch.int32, device=q.device)
     idx[:, 0] = torch.arange(1, N + 1, dtype=torch.int32, device=q.device)
@@ -564,10 +467,7 @@ def _recurrent_scratch_state(q, v, cu_seqlens):
 class _GdnRecurrentAutograd(torch.autograd.Function):
     """Recurrent kernel forward + the SAME fp32 chunked reference VJP the chunk path uses.
 
-    The chunked and the recurrent delta rule are two evaluation strategies for one mathematical
-    function, so a VJP of that function is a VJP of either. Differentiating the recurrent scan directly
-    would also mean a T-long sequential python loop in the backward, whereas ``_torch_chunk_gdr`` stays
-    chunked and batched, so only the forward differs between the two modes.
+    Chunked and recurrent are two evaluations of one function, so a VJP of either serves both.
     """
 
     @staticmethod
@@ -586,8 +486,7 @@ class _GdnRecurrentAutograd(torch.autograd.Function):
         from .gdn_fla_backward import fla_backward_enabled, fla_chunk_vjp
 
         if fla_backward_enabled():
-            # The chunk VJP is a valid gradient of the recurrent forward: same function, two
-            # evaluations. See the class docstring.
+            # The chunk VJP is a valid gradient of the recurrent forward: same function.
             grads = fla_chunk_vjp(q, k, v, g, beta, do, None, ctx.cu_seqlens, ctx.chunk_size)
             return (*grads, None, None)
         with torch.enable_grad():
@@ -605,12 +504,8 @@ _NATIVE_KERNELS_ENV = "SKYRL_ISOEXEC_GDN_NATIVE_KERNELS"
 def gdn_native_kernels_enabled() -> bool:
     """True iff the GDN core runs vLLM's native fused kernels on BOTH the trainer and the engine.
 
-    The native composition is ``causal_conv1d_fn``/``causal_conv1d_update`` for the conv and
-    ``fused_sigmoid_gating_delta_rule_update`` for the core, with l2norm, GQA mapping and fp32
-    ``exp(A_log)`` sigmoid gating all in-kernel. It is not bitwise-equal to the eager isoexec
-    composition (in-kernel rsqrt-multiply l2norm vs ``l2norm_fwd``, bf16- vs fp32-exp gating,
-    bias-in-accumulator conv), so the flag must flip both runtimes in the same run; each reads it at
-    call time. Requires recurrent mode and native state.
+    Not bitwise-equal to the eager isoexec composition, so the flag must flip both runtimes in one
+    run. Requires recurrent mode and native state.
     """
     return os.environ.get(_NATIVE_KERNELS_ENV, "0").lower() not in ("", "0", "false", "no")
 
@@ -618,18 +513,12 @@ def gdn_native_kernels_enabled() -> bool:
 def gdn_native_core_kernel(q, k, v, a, b, A_log, dt_bias, *, ssm_state, state_indices, cu_seqlens):
     """The raw native GDN core: vLLM's ``fused_sigmoid_gating_delta_rule_update``. Returns ``o``.
 
-    ``q, k``: raw (un-normalised) ``[B, T, H, K]``. ``H`` may be the GQA-compressed head count (the
-    kernel maps ``i_h = i_hv // (HV // H)``) or already expanded to ``HV``; the mapped values are the
-    same bits either way, so the engine's compressed heads and Megatron's expanded heads agree.
-    ``a``/``b`` are the raw gating inputs ``[T, HV]``, from which the kernel computes
-    ``g = -exp(fp32(A_log)) * softplus(a + dt_bias)`` and ``beta = sigmoid(b)`` in fp32 in-kernel.
-    ``state_indices``: ``[N]`` for one-token decode, else ``[N, Tmax]`` with column 0 the
-    initial-state row and the last real token's column the final-state row (0 skips). Advances
-    ``ssm_state`` in place.
+    ``q, k`` are raw ``[B, T, H, K]`` with ``H`` either GQA-compressed or expanded to ``HV`` (same bits
+    either way); ``a``/``b`` are the raw gating inputs ``[T, HV]``. ``state_indices`` is ``[N]`` for
+    one-token decode, else ``[N, Tmax]``. Advances ``ssm_state`` in place.
 
-    One varlen call equals T sequential decode calls bitwise, including the fp32 state round-trip, and
-    a chunk split at any token boundary is exact -- which is what makes chunked prefill and align-mode
-    prefix caching exact under this kernel.
+    One varlen call equals T sequential decode calls bitwise, and a chunk split at any token boundary
+    is exact -- which is what makes chunked prefill and align-mode prefix caching exact here.
     """
     from .gdn_native_core_bv64 import maybe_native_core_bv64
 
@@ -672,9 +561,7 @@ def gdn_native_core_kernel(q, k, v, a, b, A_log, dt_bias, *, ssm_state, state_in
 def _eager_native_composition(q, k, v, a, b, A_log, dt_bias, cu_seqlens, chunk_size):
     """Differentiable fp32 eager equivalent of the native composition, for the VJP only.
 
-    Mirrors what the fused kernel computes -- rsqrt-multiply l2norm, fp32 ``exp(A_log)`` gating --
-    then runs the fp32 chunked reference for the scan. It never runs in the forward, so it does not
-    have to be bitwise, only a faithful function whose gradient is the gradient of the forward.
+    Never runs in the forward, so it need only be faithful, not bitwise.
     """
     qn = q.float() * torch.rsqrt((q.float() ** 2).sum(-1, keepdim=True) + 1e-6)
     kn = k.float() * torch.rsqrt((k.float() ** 2).sum(-1, keepdim=True) + 1e-6)
@@ -696,10 +583,8 @@ def _eager_native_composition(q, k, v, a, b, A_log, dt_bias, cu_seqlens, chunk_s
 class _GdnNativeCoreAutograd(torch.autograd.Function):
     """Native fused-kernel forward + eager fp32 reference VJP.
 
-    Same trade as :class:`_GdnChunkAutograd` / :class:`_GdnRecurrentAutograd`: the forward is the exact
-    engine kernel, the backward differentiates a faithful eager fp32 equivalent. Because gating and
-    l2norm are in-kernel here, ``a``/``b``/``A_log``/``dt_bias`` are forward inputs and get their grads
-    from the same eager recompute.
+    Gating and l2norm are in-kernel here, so ``a``/``b``/``A_log``/``dt_bias`` are forward inputs and
+    take their grads from the eager recompute.
     """
 
     @staticmethod
@@ -720,11 +605,8 @@ class _GdnNativeCoreAutograd(torch.autograd.Function):
         from .gdn_fla_backward import fla_backward_enabled, fla_chunk_vjp
 
         if fla_backward_enabled():
-            # FLA's fused Triton backward for the scan, chained through the elementwise prep grads:
-            # rebuild the kernel's in-kernel prep (l2norm, GQA expand, fp32 gating) as a differentiable
-            # eager graph, take the scan's grads at the detached intermediates via fla_chunk_vjp, then
-            # backprop the prep graph to reach the raw leaves -- including A_log/dt_bias, whose grads
-            # flow only through here now that gating is in-kernel.
+            # FLA's fused scan backward chained through an eager rebuild of the in-kernel prep, which
+            # is the only path A_log/dt_bias grads have now that gating is in-kernel.
             HV = v.shape[-2]
             with torch.enable_grad():
                 leaves = [t.detach().requires_grad_(True) for t in (q, k, a, b, A_log, dt_bias)]
@@ -767,11 +649,9 @@ class _GdnNativeCoreAutograd(torch.autograd.Function):
 
 
 class _GdnNativeCprAutograd(_GdnNativeCoreAutograd):
-    """Trainer door: native CPR forward with the same native-composition VJP.
+    """Trainer door: native CPR forward with the backward inherited from the native core.
 
-    The backward is inherited verbatim from :class:`_GdnNativeCoreAutograd`, because native
-    CPR is another evaluation strategy of the same delta-rule function (fused_sigmoid within
-    chunks, chunk-pass boundary states on the eager matched prep).
+    Native CPR is another evaluation of the same delta-rule function, so that VJP applies as-is.
     """
 
     @staticmethod
@@ -789,10 +669,8 @@ class _GdnNativeCprAutograd(_GdnNativeCoreAutograd):
 def gdn_native_cpr(q, k, v, a, b, A_log, dt_bias, *, cu_seqlens=None):
     """Training/scoring entry for the NATIVE CPR composition (raw q/k + raw a/b).
 
-    Accepts both the packed layout (B==1 plus cu_seqlens) and the padded ``[B, T, ...]`` layout the
-    scoring path sends (no cu_seqlens); a padded batch is flattened to B independent packed sequences of
-    length T, which is what the recurrent/native [B, T] kernels do to each batch row. The reshapes are
-    graph ops, so grads flow through them.
+    A padded ``[B, T, ...]`` batch is flattened to B independent packed sequences, matching what the
+    ``[B, T]`` kernels do per row; the reshapes are graph ops, so grads flow through them.
     """
     unbatch = None
     if cu_seqlens is None:
@@ -824,9 +702,7 @@ def gdn_native_cpr(q, k, v, a, b, A_log, dt_bias, *, cu_seqlens=None):
 def gdn_native_core(q, k, v, a, b, A_log, dt_bias, *, cu_seqlens=None):
     """Training/scoring entry for the native composition: zero initial state, no state out.
 
-    The trainer-facing twin of :func:`gdn_recurrent` for ``SKYRL_ISOEXEC_GDN_NATIVE_KERNELS=1``.
-    Under ``no_grad`` (scoring, rollout probes) this is exactly the engine kernel; with a gradient
-    it routes through :class:`_GdnNativeCoreAutograd`, whose forward is that same kernel.
+    Under ``no_grad`` this is exactly the engine kernel; the autograd path's forward is the same kernel.
     """
     needs_grad = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in (q, k, v, a, b, A_log, dt_bias)
@@ -871,14 +747,10 @@ def _native_conv_backward_rows() -> int:
 
 
 def _conv_vjp_dz_chunk(xw, wf, pos, seq_starts, taps):
-    """One row-chunk of the conv preactivation, in explicit ascending tap order.
+    """One row-chunk of the conv preactivation, in explicit ascending tap order. BACKWARD-ONLY.
 
-    Backward-only: reachable only from :func:`_native_conv_vjp`. ``xw`` is the window ``x[lo:stop]``
-    with ``lo`` the earliest row any tap of this chunk can read, and ``pos``/``seq_starts`` are already
-    rebased by ``lo``. Windowing keeps the compiled artifact's shape key stable across bins (it depends
-    on ``chunk_rows`` and ``taps``, not the bin's token count), avoiding a per-bin recompile. The
-    rebase preserves values: ``source_local < 0`` can only occur when ``lo == 0``, where local and
-    global indices coincide.
+    ``xw`` is ``x[lo:stop]`` with ``pos``/``seq_starts`` rebased by ``lo``, which keeps the compiled
+    shape key independent of the bin's token count. ``source_local < 0`` only occurs when ``lo == 0``.
     """
     acc = torch.zeros((pos.shape[0], xw.shape[1]), dtype=torch.float32, device=xw.device)
     for tap in range(taps):
@@ -903,13 +775,8 @@ def _conv_vjp_act_chunk(z, dyc, silu):
 def _conv_vjp_dxdw_chunk(xw, dzw, wf, pos_x, seq_starts_x, pos_z, seq_ends_z, taps):
     """One row-chunk of ``dx`` plus this chunk's ``dw`` partial. BACKWARD-ONLY.
 
-    Two windows, both rebased so the shape key does not carry the bin's token count: ``xw`` is
-    ``x[lo:stop]`` (taps reach backwards) and ``dzw`` is ``dz[start:hi]`` (they reach forwards). The
-    forward clamp to ``dzw.shape[0] - 1`` is the local spelling of the global ``clamp(max=total-1)``
-    and can only fire on the final chunk.
-
-    Returns ``(dxf, dw_partial)`` shaped like ``wf``; the caller folds it with one ``dwf.add_`` per
-    chunk, so every ``dw[:, tap]`` accumulates its chunks in ascending row order.
+    Both windows are rebased so the shape key does not carry the bin's token count. The caller folds
+    ``dw_partial`` with one ``dwf.add_`` per chunk, keeping ``dw[:, tap]`` in ascending row order.
     """
     rows, channels = pos_x.shape[0], xw.shape[1]
     dxf = torch.zeros((rows, channels), dtype=torch.float32, device=xw.device)
@@ -934,12 +801,8 @@ def _conv_vjp_dxdw_chunk(xw, dzw, wf, pos_x, seq_starts_x, pos_z, seq_ends_z, ta
 def _native_conv_vjp(dy, x, weight, bias, cu_seqlens, activation):
     """Atomics-free packed depthwise-conv VJP, generic in tap count and sequence lengths.
 
-    One output element has one owner. ``dx[token, channel]`` gathers its at-most-W future
-    cotangents in a fixed tap loop; ``dw[channel, tap]`` uses deterministic chunk reductions.
-    Sequence boundaries come from device-side integer comparisons, so there is no D2H read or
-    Python loop over packed sequences. The recomputed preactivation/dz is the only additional
-    full-size fp32 buffer; dx accumulation, shifted gathers, and activation temporaries are
-    row-chunked before writing the required return dtype.
+    Every output element has one owner: ``dx`` gathers in a fixed tap loop and ``dw`` uses
+    deterministic chunk reductions, so there is no atomic, no D2H read and no per-sequence loop.
     """
     if activation not in (None, "silu", "swish"):
         raise ValueError(f"unsupported activation {activation!r}")
@@ -956,13 +819,8 @@ def _native_conv_vjp(dy, x, weight, bias, cu_seqlens, activation):
     starts = bounds.index_select(0, sequence)
     ends = bounds.index_select(0, sequence + 1)
 
-    # Recompute the preactivation in explicit tap order. Backward-only, so it need not reproduce the
-    # fused forward's rounding, but it is the same fp32 expression.
-    #
-    # The three per-chunk bodies are module-level functions so they can be routed through
-    # ``call_region`` (autofuse/bwd_compile). Each `dz` element still accumulates its taps in ascending
-    # tap order onto a zero start, and each `dw[:, tap]` still accumulates its chunks in ascending row
-    # order; ``call_region`` runs the eager body verbatim when backward compilation is off.
+    # Recompute the preactivation in explicit ascending tap order; each `dw[:, tap]` likewise
+    # accumulates its chunks in ascending row order. ``call_region`` runs the eager body verbatim.
     dz = torch.empty((total, channels), dtype=torch.float32, device=x.device)
     for start in range(0, total, chunk_rows):
         stop = min(start + chunk_rows, total)
@@ -989,9 +847,8 @@ def _native_conv_vjp(dy, x, weight, bias, cu_seqlens, activation):
         if dbf is not None:
             dbf.add_(adjusted.sum(dim=0))
 
-    # Gather, never scatter: each dx element has exactly one owner. Each row chunk finishes in fp32 and
-    # is written out in the return dtype, avoiding a second full-size fp32 tensor. Tap order per dx
-    # element is unchanged, and dw[:, tap] chunks are still added in ascending row order.
+    # Gather, never scatter: each dx element has exactly one owner. Row chunks finish in fp32 and are
+    # written out in the return dtype, avoiding a second full-size fp32 tensor.
     dx = torch.empty_like(x)
     dwf = torch.zeros_like(wf)
     for start in range(0, total, chunk_rows):
@@ -1021,10 +878,8 @@ def _native_conv_vjp(dy, x, weight, bias, cu_seqlens, activation):
 def _native_conv_channel_last_input(x: torch.Tensor) -> torch.Tensor:
     """Return vLLM's ``[D, T]`` channel-last causal-conv view of ``x [T, D]``.
 
-    ``causal_conv1d_fn`` selects its fast prefill kernel only when the channel dimension has stride one.
-    A row-major ``[T, D]`` tensor already has that storage, so the transpose is a zero-copy ``[D, T]``
-    view with strides ``(1, D)``; compacting after the transpose gives strides ``(T, 1)`` and selects
-    the much slower channel-first kernel. A non-row-major input is normalized before the transpose.
+    ``causal_conv1d_fn`` picks its fast prefill kernel only when the channel dim has stride one, so
+    the transpose must stay a zero-copy view -- compacting after it selects the much slower kernel.
     """
     if x.ndim != 2:
         raise ValueError(f"native GDN conv expects x=[T, D], got {tuple(x.shape)}")
@@ -1044,15 +899,13 @@ def _native_conv_channel_last_input(x: torch.Tensor) -> torch.Tensor:
 class _GdnNativeConvAutograd(torch.autograd.Function):
     """vLLM ``causal_conv1d_fn`` forward + default-OFF atomics-free analytic conv VJP.
 
-    The kernel and the eager conv compute the same mathematical function, differing only in rounding
-    (fp32 accumulator preloaded with bias vs bias added after the taps), so the analytic gradient is the
-    gradient of the kernel forward to floating-point accuracy.
+    Kernel and eager conv compute the same function, differing only in rounding, so either gradient
+    is the gradient of the kernel forward to floating-point accuracy.
     """
 
     @staticmethod
     def forward(ctx, x, weight, bias, cu_seqlens, activation):
-        # x [T, D] packed; one varlen kernel launch for the whole batch, where the eager path loops
-        # sequences in python.
+        # x [T, D] packed; one varlen kernel launch for the whole batch.
         from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 
         from .packed_meta_cache import causal_conv1d_metadata
@@ -1062,16 +915,13 @@ class _GdnNativeConvAutograd(torch.autograd.Function):
             W = weight.shape[-1]
             metadata = causal_conv1d_metadata(cu_seqlens)
             if metadata is None:
-                # Exact cache-off fallback: retain vLLM's original per-call construction so the
-                # packed-meta flag remains a clean causal ablation.
+                # Cache-off fallback: vLLM's original per-call construction, kept exact.
                 scratch = x.new_zeros(N + 1, x.shape[-1], W - 1)
                 idx = torch.arange(1, N + 1, dtype=torch.int32, device=x.device)
                 has0 = torch.zeros(N, dtype=torch.bool, device=x.device)
             else:
-                # Every has-initial-state bit is false, so the kernel never reads conv_states for
-                # the output: it synthesizes the width-1 zero prefix in registers and only WRITES
-                # final states that this stateless trainer call discards. Empty storage therefore
-                # removes an unobservable memset without changing output or persistent state.
+                # Every has-initial-state bit is false, so the kernel never READS conv_states; it only
+                # writes final states this stateless call discards, making the memset unobservable.
                 scratch = x.new_empty(N + 1, x.shape[-1], W - 1)
                 idx = metadata.cache_indices
                 has0 = metadata.has_initial_state
@@ -1157,11 +1007,8 @@ def gdn_recurrent(
 ):
     """Training/prefill-shaped recurrent delta rule: sequences start at zero, no state comes back.
 
-    The trainer-facing twin of :func:`gdn_chunk`: same signature and ``(o, final_state)`` return, so the
-    ``fla`` shim can route Megatron at either one. Under ``no_grad`` this is exactly the vLLM kernel;
-    with a gradient it routes through :class:`_GdnRecurrentAutograd`, whose forward is that same kernel.
-    The engine does not come through here -- it owns a real state pool and calls
-    :func:`gdn_recurrent_kernel` directly.
+    Same ``(o, final_state)`` contract as :func:`gdn_chunk` so the shim can route Megatron at either.
+    The engine does not come through here; it owns a state pool and calls the kernel directly.
     """
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
@@ -1183,9 +1030,7 @@ def gdn_recurrent(
 class _GdnCprAutograd(torch.autograd.Function):
     """Chunk-synced forward plus the same fp32 chunked reference VJP the other modes use.
 
-    Chunk-synced is another evaluation strategy of the same delta-rule function (boundary states by the
-    chunk state pass, within-chunk outputs by the recurrent scan), so a VJP of the function is a VJP of
-    this evaluation and FLA's fused chunk backward applies as-is.
+    Another evaluation of the same delta-rule function, so FLA's fused chunk backward applies as-is.
     """
 
     @staticmethod
@@ -1228,8 +1073,7 @@ def gdn_cpr(
 ):
     """Training/scoring-shaped CPR forward: same ``(o, final_state)`` contract as its twins.
 
-    The engine does not come through here -- it owns a real state pool and runs
-    ``CprGDN.prefill``/``.decode``, which evaluate the same canonical function incrementally.
+    The engine does not come through here; it runs ``CprGDN.prefill``/``.decode`` against a state pool.
     """
     if initial_state is not None or output_final_state:
         raise NotImplementedError(
@@ -1238,9 +1082,8 @@ def gdn_cpr(
         )
     if cu_seqlens is None:
         if q.shape[0] != 1:
-            # Padded [B, T, ...] layout (the scoring path): flatten to B independent packed sequences,
-            # the same treatment the sibling [B, T] kernels give batch rows. Reshapes are graph ops, so
-            # grads flow.
+            # Padded [B, T, ...] scoring layout: flatten to B independent packed sequences, matching
+            # the sibling kernels. Reshapes are graph ops, so grads flow.
             B, T = q.shape[0], q.shape[1]
             q = q.reshape(1, B * T, *q.shape[2:])
             k = k.reshape(1, B * T, *k.shape[2:])
@@ -1285,11 +1128,9 @@ def gdn_core(
 ):
     """:func:`gdn_chunk` or :func:`gdn_recurrent`, per :func:`gdn_kernel_mode`. The trainer's door.
 
-    ``SKYRL_ISOEXEC_GDN_TRAINER_KERNEL`` (unset by default) overrides the kernel for this door only; the
-    engine's decode/prefill reach RecurrentGDN / CprGDN directly and keep
-    ``SKYRL_ISOEXEC_GDN_KERNEL``. Setting it to ``chunk`` while the engine runs ``recurrent`` deliberately
-    relaxes the GDN core so the rollout-vs-train gap measures the chunk-vs-recurrent mismatch. That is
-    not a IsoExec configuration."""
+    ``SKYRL_ISOEXEC_GDN_TRAINER_KERNEL`` overrides the kernel for this door only, deliberately
+    relaxing the core for ablations; a run using it is not an IsoExec configuration.
+    """
     if any(t.device.type == "meta" for t in (q, k, v, g, beta)):
         if not all(t.device.type == "meta" for t in (q, k, v, g, beta)):
             raise ValueError("gdn_core abstract contract requires all operands on meta")
@@ -1361,9 +1202,7 @@ def gdn_gate_and_beta(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """g = -exp(A_log) * softplus(a + dt_bias) in fp32; beta = sigmoid(b). Elementwise -> invariant.
 
-    Mirrors megatron ``GatedDeltaNet._compute_g_and_beta`` exactly (fp32 g, beta in the input dtype).
-    ``A_log.exp()`` is taken in the parameter's own dtype rather than upcast first, because megatron
-    stores A_log in ``params_dtype`` (bf16) and exponentiates before the fp32 multiply, and
+    ``A_log.exp()`` is taken in the parameter's own dtype rather than upcast first, matching megatron:
     ``exp(bf16(x)).float()`` is not ``exp(float(x))``.
     """
     g = -A_log.exp() * torch.nn.functional.softplus(a.float() + dt_bias.float())

@@ -1,10 +1,7 @@
-"""The ContractAdapter: systematic claim dispatch, unknown-kind refusal, per-runtime facts, the
-migrated checkers' golden behavior, and the adapter INSTALL sequence closing with exactly the
-pre-adapter ledger counts.
+"""ContractAdapter: claim dispatch, unknown-kind refusal, per-runtime facts, checker goldens.
 
-The property under test is the runtime completion of the schema-side rule: every claim on the
-contract reaches a registered checker, and a claim kind with NO checker refuses -- a "prose claim"
-(validated, hashed, silently unchecked) is unrepresentable.
+Invariant: every claim on the contract reaches a registered checker, and a claim kind with no
+checker refuses rather than being silently unchecked.
 """
 
 import dataclasses
@@ -81,8 +78,7 @@ def _refuses(fn, *a, **kw) -> str:
 
 
 def test_registry_covers_every_production_claim_kind():
-    # Every field of the Claims schema owes a registered checker, and each checker is a
-    # ClaimChecker (kind + check). This is the dispatch table the adapter drives.
+    # Every field of the Claims schema owes a registered ClaimChecker.
     kinds = {f.name for f in dataclasses.fields(Claims)}
     assert kinds == {"topology", "state", "tolerances"}
     assert set(ad.CLAIM_CHECKERS) == kinds
@@ -109,14 +105,13 @@ def test_dispatch_completeness_every_claim_reaches_its_checker():
             assert led[f"domain_check:{t.axis}"][-1].result == "ok"
         for s in _CONTRACT.claims.state:
             assert led[f"hook_exists:{s.state_id}"][-1].result == "ok"
-        # The gate WIRING attests ok but is deliberately NOT ledger-reported: gate@STEP1 must still
-        # require the real STEP-time run, not an INSTALL-time attest.
+        # Gate wiring attests ok but is not ledger-reported: gate@STEP1 must require the real
+        # STEP-time run, not an INSTALL-time attest.
         assert "gate:engine_decode|trainer_score" not in led
 
 
 def test_unknown_claim_kind_is_a_refusal():
-    # A synthetic claim kind with no registered checker: validated shape, hashed content, and --
-    # without this property -- silently unchecked at runtime. The adapter refuses it instead.
+    # Guards against a claim kind with no registered checker being silently unchecked at runtime.
     ExtClaims = dataclasses.make_dataclass(
         "ExtClaims",
         [("provenance", tuple, dataclasses.field(default=()))],
@@ -181,7 +176,7 @@ def test_per_runtime_facts_shape():
         tp_size=8,
         install_fn=lambda: None,
     )
-    facts = v.runtime_facts()  # mpu uninitialized in this process -> CP falls back to 1, as the site did
+    facts = v.runtime_facts()  # mpu uninitialized here -> CP falls back to 1
     assert {k: facts[k] for k in ("TP", "PP", "CP", "SP")} == ENGINE_FACTS
     assert facts["world"] == 8 and "arch" in facts
     assert v.side == "engine" and v.build_failsoft is False
@@ -243,8 +238,7 @@ def test_tolerance_checker_attests_gate_wiring():
         (t,) = _CONTRACT.claims.tolerances
         r = chk.check(t, {})
         assert r.result == enforce.OK and "resolve" in r.evidence
-        # A TIGHTENED cached claim re-wires the gate (the pre-migration reading-back property):
-        # the checker sees the limits resolve from whatever claim the process cached.
+        # A tightened cached claim re-wires the gate: limits resolve from the cached claim.
         tightened = ToleranceClaim(
             case_pair=t.case_pair, bounds=(("abs_diff_mean_max", "5.0e-6"), ("abs_diff_max_max", "1.0e-4"))
         )
@@ -261,15 +255,7 @@ def test_tolerance_checker_attests_gate_wiring():
 
 
 def test_adapter_install_sequence_matches_pre_adapter_ledger_counts():
-    """The migrated trainer INSTALL flow must close with EXACTLY the pre-adapter counts.
-
-    Golden, measured 2026-08-21 on the pre-change tree (simulated trainer flow: contract build ->
-    assert_topology_within_claims -> record_install x trainer sites -> install_boundary) under the
-    production env: [ISOEXEC-ENFORCE] side=trainer ok=36 refused=0 logged=0 missing=0 excepted=0.
-    Re-measured at 37 when rowinv became the composed logprob: the training forward gained a
-    logprob case, so one more install attest is recorded. The shape of the golden -- everything
-    ok, nothing refused, logged, missing or excepted -- is what this pins, not the integer.
-    """
+    """Trainer INSTALL closes with the golden ledger counts: all ok, nothing refused or missing."""
     from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
         MegatronContractAdapter,
     )
@@ -307,7 +293,7 @@ def test_boundary_delegates_first_forward_and_weight_sync():
     )
 
     with _fresh():
-        # Trainer stamp flow: report + WEIGHT_SYNC close, exactly what the worker.py site did.
+        # Trainer stamp flow: report + WEIGHT_SYNC close.
         m = MegatronContractAdapter(qwen3_5.MODEL, megatron_config=SimpleNamespace(), install_fn=lambda: None)
         h = pc.contract_hash()
         assert m.on_weight_sync(h) is True

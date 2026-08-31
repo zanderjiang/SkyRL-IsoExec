@@ -1,17 +1,8 @@
 """Debug mode: per-region output tracing that localizes train/inference mismatch.
 
-Enforcement mode proves agreement; debug mode explains disagreement. With
-``SKYRL_ISOEXEC_DEBUG_TRACE`` set, region outputs are digested on-device (``thash``), recorded
-per process (``trace``, hooks in ``install``), and compared offline (``compare``) into a map of
-where divergence first arises and roughly how large it is. Entirely inert when the env is unset.
-See ``INTEGRATION.md`` for the call sites and flag registration this package deliberately does
-not perform itself.
-
-Re-exports are lazy (PEP 562, matching the isoexec package) and this module imports nothing, so
-the comparator CLI stays stdlib-only: it must run on a machine with no torch and no CUDA/TE. The
-fully qualified ``python -m skyrl...debug.compare`` form cannot deliver that -- ``-m`` imports the
-``isoexec`` package first and its ``__init__`` installs runtime guards -- so the supported offline
-invocations run ``compare.py`` by path or put ``isoexec/`` on PYTHONPATH. See ``compare.py``.
+Regions are digested on-device (``thash``), recorded per process (``trace``/``install``), compared
+offline (``compare``). Inert unless ``SKYRL_ISOEXEC_DEBUG_TRACE`` is set; re-exports are lazy and
+this module imports nothing, so the comparator CLI stays stdlib-only (no torch, no CUDA).
 """
 
 _LAZY = {

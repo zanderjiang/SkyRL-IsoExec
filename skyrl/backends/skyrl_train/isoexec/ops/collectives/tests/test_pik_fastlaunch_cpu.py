@@ -1,29 +1,8 @@
 """CPU guarantees for pik's memoized Triton launcher (``pik/fastlaunch.py``).
 
-WHAT CAN BE PINNED WITHOUT A GPU. The lever removes no arithmetic -- it removes Triton's per-call
-RE-DERIVATION of a constant. So what has to hold is a state machine and a key algebra, and both are
-CPU-testable in full:
-
-  1. FLAG OFF IS THE UNTOUCHED CALL. ``launch(kern, grid, *a, **kw)`` is exactly
-     ``kern[grid](*a, **kw)``: same object, same args, same kwargs, once.
-  2. THE KEY IS A SUPERSET OF TRITON'S SPECIALIZATION INPUTS. Two calls collide only if the kernel
-     identity, every non-tensor argument, the launch kwargs, and every tensor's (type, dtype,
-     16-byte alignment) agree. Change any one and the key must move -- otherwise a shape class
-     could inherit another's compiled kernel, which is the ONLY way this lever could move a bit.
-  3. ADMISSION LAUNCHES ONCE, ON THE ORIGINAL PATH. The first call at a class issues through
-     ``kern[grid]`` and nothing else; the pin is built from what THAT call resolved.
-  4. THE FAST PATH REPLAYS THE RESOLVED ARGUMENT VECTOR with only the tensor slots re-bound, and
-     ``served`` counts it. Engagement is a count, never a banner.
-  5. FAIL-CLOSED. A pin that cannot be built, or that raises once built, is a loud PERMANENT
-     per-class rejection back to the untouched call -- never an exception into the model.
-
-Triton's own resolution (``binder`` -> ``compute_cache_key`` -> ``kernel_cache``) needs a live CUDA
-driver, so it is stubbed here. Live-operand behavior requires a separate GPU qualification on the
-target Triton runtime.
-
-Run (CPU only):
-    uv run --isolated --extra dev python -m pytest \
-        skyrl/backends/skyrl_train/isoexec/ops/collectives/tests/test_pik_fastlaunch_cpu.py -q
+Gates the state machine and key algebra: flag-off is the untouched call, the key is a superset of
+Triton's specialization inputs, admission launches once, and an unpinnable class fails closed.
+Triton's own resolution needs a live CUDA driver and is stubbed here.
 """
 
 from __future__ import annotations
@@ -39,10 +18,8 @@ import torch
 _HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[7]))  # repo root
 
-# pik is only importable under its canonical TOP-LEVEL name (codegen emits `from pik.gemm import
-# ...` into generated kernel modules), and importing the package initialises an arch profile off a
-# live GPU. ``fastlaunch`` deliberately has NO intra-pik imports -- only ``os`` and ``torch`` -- so
-# a CPU test loads the file directly and exercises the module exactly as the runtime would.
+# Importing the pik package initialises an arch profile off a live GPU. ``fastlaunch`` has no
+# intra-pik imports, so a CPU test loads the file directly.
 _SRC = _HERE.parents[1] / "pik" / "fastlaunch.py"
 
 
@@ -63,9 +40,7 @@ def fl(monkeypatch):
     return mod
 
 
-# ----------------------------------------------------------------------------------------------
-# a fake Triton surface: exactly the attributes fastlaunch touches, and nothing else
-# ----------------------------------------------------------------------------------------------
+# A fake Triton surface: exactly the attributes fastlaunch touches, and nothing else.
 class FakeCompiled:
     """Stands in for ``triton.compiler.CompiledKernel``: named, and callable through ``[grid]``."""
 
@@ -117,9 +92,7 @@ def _install_resolver(mod, jit, compiled, argv_of):
     return seen
 
 
-# ----------------------------------------------------------------------------------------------
 # 1. flag off is the untouched call
-# ----------------------------------------------------------------------------------------------
 def test_flag_off_is_the_untouched_bracket_call(monkeypatch):
     monkeypatch.delenv("SKYRL_ISOEXEC_PIK_FASTLAUNCH", raising=False)
     mod = _fastlaunch_module()
@@ -137,9 +110,7 @@ def test_flag_off_is_the_untouched_bracket_call(monkeypatch):
     assert mod.fastlaunch_counts()["admitted"] == 0
 
 
-# ----------------------------------------------------------------------------------------------
-# 2. the key algebra -- the ONLY way this lever could ever move a bit
-# ----------------------------------------------------------------------------------------------
+# 2. the key algebra -- the only way this lever could move a bit
 def test_key_separates_every_specialization_input(fl):
     k = object()
     a = torch.zeros(64, dtype=torch.float32)
@@ -152,8 +123,8 @@ def test_key_separates_every_specialization_input(fl):
     assert fl._key(k, (a, 1024, 8), {"BLOCK": 1024, "num_warps": 8}) != base  # num_warps
     assert fl._key(k, (a.to(torch.float64), 1024, 8), {"BLOCK": 1024, "num_warps": 4}) != base  # dtype
 
-    # ALIGNMENT: Triton specializes a pointer on divisibility by 16. A misaligned view must not
-    # inherit an aligned view's pin -- this is the case that would silently run the wrong kernel.
+    # Triton specializes a pointer on divisibility by 16: a misaligned view must not inherit an
+    # aligned view's pin, or it silently runs the wrong kernel.
     buf = torch.zeros(64, dtype=torch.float32)
     aligned = buf[0:16]
     while buf.data_ptr() % 16 != 0:  # pragma: no cover -- torch's allocator aligns, belt and braces
@@ -164,8 +135,7 @@ def test_key_separates_every_specialization_input(fl):
 
 
 def test_key_is_insensitive_to_the_tensor_object_itself(fl):
-    """Two distinct tensors with the same dtype and alignment ARE one shape class -- that is the
-    whole point (the pin re-binds tensor slots per call). Anything finer would never serve."""
+    """Two tensors with the same dtype and alignment are one shape class; the pin re-binds slots."""
     k = object()
     a = torch.zeros(64)
     b = torch.zeros(64)
@@ -173,9 +143,7 @@ def test_key_is_insensitive_to_the_tensor_object_itself(fl):
     assert fl._key(k, (a, 5), {}) == fl._key(k, (b, 5), {})
 
 
-# ----------------------------------------------------------------------------------------------
 # 3./4. admission launches once on the original path; the fast path replays and counts
-# ----------------------------------------------------------------------------------------------
 def test_admission_then_serve(fl):
     compiled = FakeCompiled()
     jit = FakeJIT(["p", "o", "n", "BLOCK"], compiled)
@@ -219,9 +187,7 @@ def test_callable_grid_is_resolved_once_and_replayed(fl):
     assert fl.fastlaunch_counts()["served"] == 1
 
 
-# ----------------------------------------------------------------------------------------------
 # 5. fail-closed, both halves
-# ----------------------------------------------------------------------------------------------
 def test_unpinnable_class_is_a_permanent_loud_rejection(fl, capsys):
     compiled = FakeCompiled()
     jit = FakeJIT(["p", "o"], compiled)
@@ -278,22 +244,12 @@ def test_a_real_kernel_error_is_not_swallowed(fl):
         fl.launch(kern, (1,), torch.zeros(8))
 
 
-# ----------------------------------------------------------------------------------------------
-# retention: a pin must not keep the admission-time OPERANDS alive
-# ----------------------------------------------------------------------------------------------
+# retention: a pin must not keep the admission-time operands alive
 def test_pin_retains_no_tensor_from_the_admitting_call(fl):
-    """A pin is a template for the SCALAR half of the argument vector -- nothing more.
+    """A pin templates only the scalar half of the argument vector.
 
-    This is a memory contract, not a speed one. ``_PINS`` has no size cap and no eviction, so any
-    tensor a pin stores is retained for the life of the PROCESS. Two of pik's GEMM schedules hand
-    the layer input activation into the launch, and the ``no_grad`` around it suppresses new graph
-    nodes without clearing an existing ``grad_fn`` -- so a stored operand can drag a whole
-    micro-batch's autograd graph across the scoring -> policy_train boundary and never release it.
-    That is the 2026-08-15 production OOM.
-
-    Nothing reads the stored tensors: every tensor position is covered by ``slots`` (a tensor that
-    cannot be mapped REFUSES the pin) and is refilled from the live call before use. So the
-    contract is simply that none survive.
+    ``_PINS`` has no eviction, so a stored operand would be retained (with its autograd graph)
+    for the life of the process. Tensor positions are refilled from the live call.
     """
     compiled = FakeCompiled()
     jit = FakeJIT(["p", "o", "n", "BLOCK"], compiled)
@@ -307,7 +263,7 @@ def test_pin_retains_no_tensor_from_the_admitting_call(fl):
     assert not any(
         isinstance(v, torch.Tensor) for v in pin.argv
     ), "a pin must hold no tensor from the admitting call -- _PINS is never evicted"
-    # the scalar half IS still the memo, and the tensor positions are exactly the mapped slots
+    # the scalar half is still the memo; tensor positions are exactly the mapped slots
     assert pin.argv[2:] == [8, 1024], "every non-tensor argument must still be replayed verbatim"
     assert {i for i, _ in pin.slots} == {0, 1}
     assert all(pin.argv[i] is None for i, _ in pin.slots)
@@ -322,7 +278,7 @@ def test_pin_retains_no_tensor_from_the_admitting_call(fl):
 
 
 def test_pin_does_not_keep_the_admitting_operand_alive(fl):
-    """The retention contract, observed the only way that cannot be faked: through a weakref."""
+    """The retention contract, observed through a weakref."""
     import gc
     import weakref
 
@@ -335,7 +291,7 @@ def test_pin_does_not_keep_the_admitting_operand_alive(fl):
     ref = weakref.ref(p0)
     fl.launch(jit, (3,), p0, o0, 8, BLOCK=1024)
 
-    # FakeCompiled records every launch's argv, so drop that too -- the subject is _PINS.
+    # FakeCompiled records every launch's argv, so drop that too; the subject is _PINS.
     compiled.launches.clear()
     del p0, o0
     gc.collect()
@@ -343,9 +299,7 @@ def test_pin_does_not_keep_the_admitting_operand_alive(fl):
     assert fl.fastlaunch_counts()["pins"] == 1, "and the pin itself must survive"
 
 
-# ----------------------------------------------------------------------------------------------
 # the flag is registered, default OFF, and reaches both actor channels
-# ----------------------------------------------------------------------------------------------
 def test_flags_registered_default_off_and_forwarded():
     from skyrl.backends.skyrl_train.isoexec.core.flags import (
         ENGINE,

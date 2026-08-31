@@ -1,16 +1,7 @@
 """Declarative registry entries for the logprobs family.
 
-The last op on the IsoExec path: the sampled-token log-probability that generation returns and the
-trainer scores against.
-
-``logprobs.log_softmax`` is the manual fp32 log-softmax and gather. vLLM's own fused Triton kernel
-inlines log(softmax(.)) and never calls aten, so it bypasses the batch-invariant
-``aten::_log_softmax`` and diverges from the trainer on a few tokens; the engine is patched to run
-the trainer's exact formulation, ``(x - amax(x)) - log(sum(exp(x - amax(x))))`` in fp32, then gather.
-
-``logprobs.lm_head_slice`` applies the output layer to the sampled rows only. vLLM samples one token
-per sequence, so running lm_head and the full fp32 vocab gather on every token is wasted prefill.
-Engine-only, and a pure row selection: it changes which rows are computed, not the logprob value.
+``logprobs.log_softmax`` is the manual fp32 log-softmax and gather run at all four sites;
+``logprobs.lm_head_slice`` applies the output layer to the sampled rows only (engine-only).
 """
 
 from __future__ import annotations
@@ -19,13 +10,8 @@ from ...core.registry import PER_MODEL, ImplSpec, OpSpec, RoundingSchedule
 
 
 def register(reg) -> None:
-    # logprobs.log_softmax -- manual fp32 amax/exp/sum/log/gather, one function at engine + trainer.
-    # ``rowinv_leaftree`` is the SELECTED impl at all four sites and the only one any composition
-    # names. The two aten-order impls below stay REGISTERED because they still execute: rowinv
-    # declines structurally (unsupported layout, wrong arch, missing kernel) and the caller falls
-    # back to them, so deregistering would leave the registry unable to describe code that runs.
-    # Registration is not selection -- only selected entries reach the contract and the identity
-    # hashes -- so an unselected impl costs nothing but keeps the fallback nameable.
+    # logprobs.log_softmax -- manual fp32 amax/exp/sum/log/gather at engine + trainer.
+    # ``rowinv_leaftree`` is selected; ``aten_reference`` stays registered as the decline fallback.
     reg.register_op(
         OpSpec(
             name="logprobs.log_softmax",
@@ -54,11 +40,8 @@ def register(reg) -> None:
             )
         )
         .add_impl(
-            # THE DEFAULT: the row-count- and TP-invariant leaf-tree denominator, one function at
-            # ALL FOUR sites, composed unconditionally. Not an execution twin of aten_reference --
-            # it REPLACES the incumbent on both runtimes at once, so it carries no
-            # bitwise_equal_to claim; running one side on the incumbent is not a legal asymmetry
-            # but a broken composition, which is why no flag can produce it any more.
+            # The default: row-count- and TP-invariant leaf-tree denominator at all four sites.
+            # It replaces the incumbent on both runtimes at once, so it claims no bitwise twin.
             ImplSpec(
                 impl_id="rowinv_leaftree",
                 version=1,
@@ -66,10 +49,8 @@ def register(reg) -> None:
                 rounding=RoundingSchedule(
                     machine_assertable={
                         "compute_dtype": "fp32",
-                        # G = SKYRL_ISOEXEC_PIK_LEAVES; 8 on every shipped recipe, but a
-                        # per-deployment fact (>= max TP either side runs), so the MODEL pins the
-                        # value and the impl declares only that it IS pinned. Same key name as
-                        # collectives:pik_tree / moe.combine:pik_leaf_tree.
+                        # G = SKYRL_ISOEXEC_PIK_LEAVES: a per-deployment fact (>= max TP either
+                        # side runs), so the model pins the value and the impl declares only that.
                         "leaves": PER_MODEL,
                         "block": 4096,  # the fixed per-leaf tile of the Kahan exp sum (rowinv.py BLOCK)
                         "accum": "kahan_fp32",

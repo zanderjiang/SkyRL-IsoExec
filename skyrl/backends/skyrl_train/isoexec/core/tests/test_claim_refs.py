@@ -1,8 +1,7 @@
 """Claim refs resolve to real in-tree code, or they refuse.
 
-The hook half is what ``StateHookChecker`` attests with; the two faults it used to miss are a ref
-that escapes the package (``../`` reaches any file on the host) and a ``def`` that is only text
-inside a docstring. The proof half is what discharges an asymmetric region at build time.
+Guards two easily-missed faults: a ref that escapes the package via ``../``, and a ``def`` that is
+only text inside a docstring.
 """
 
 import os

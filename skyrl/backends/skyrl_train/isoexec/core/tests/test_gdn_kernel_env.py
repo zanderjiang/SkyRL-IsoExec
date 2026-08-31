@@ -1,8 +1,7 @@
 """One parser for SKYRL_ISOEXEC_GDN_KERNEL, and the contract build that follows it.
 
-The fault this closes: the declaration site matched the env value case-sensitively against one
-literal and fell back silently, so ``SKYRL_ISOEXEC_GDN_KERNEL=CPR`` made BOTH runtimes
-derive the same wrong contract -- identical hashes, handshake green, cpr executing.
+Guards against the silent case-sensitive fallback that let both runtimes derive the same wrong
+contract -- identical hashes, handshake green, cpr executing.
 """
 
 import os

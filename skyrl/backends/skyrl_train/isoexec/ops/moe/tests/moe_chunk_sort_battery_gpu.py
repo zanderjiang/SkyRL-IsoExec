@@ -1,49 +1,8 @@
 """Certification + measurement battery for the one-gather chunk sort (SKYRL_ISOEXEC_MOE_CHUNK_SORT).
 
-THE QUESTION. the private trainer-halo analysis report measured our MoE permutation halo at >= 2.58x
-native per token and named its owner: native runs permute / chunk-sort / unpermute in four to six
-FUSED TransformerEngine kernels where we run ~30 generic ATen ops. the private TE-permute analysis report
-then established that (a) TE cannot be installed in this venv and must not be, and (b) of that fused
-family exactly ONE op is copy-only in both directions -- ``sort_chunks_by_index`` -- and it needs no
-TE at all, because a chunk reordering is a bijection on rows and is therefore one ``index_select``.
-
-This battery decides that empirically at the shapes the alltoall dispatcher actually runs.
-
-GATES (a shape must pass ALL of them to be admissible)
-  1. FORWARD BITS vs the path in production today -- megatron ``moe_utils.sort_chunks_by_idxs``'s
-     non-fused branch, ``torch.cat`` over a python loop of ``torch.split`` slices -- on tokens and on
-     probs, over ragged/empty/skewed chunk vectors and two magnitude populations.
-  2. ROW PROVENANCE. The map applied to an index marker must reproduce megatron's row ordering
-     exactly. This is the gate that matters: a random payload can pass on a wrong-but-symmetric map,
-     and a wrong permutation would silently re-group every expert's rows downstream.
-  3. BACKWARD BITS. Autograd through both forms with ONE shared cotangent, ``torch.equal`` on the
-     input gradient and on the probs gradient. Gradients carry no zero-KL contract -- which is
-     exactly why a wrong one would be invisible, and why this is a gate and not a hope.
-  4. SIGNED ZEROS + NaN PAYLOADS survive both directions. This is why the VJP is an inverse GATHER
-     and never ``index_add_``: ``0.0 + (-0.0) == +0.0``.
-  5. BIJECTIVITY: the map is a permutation of ``arange(n)`` and the inverse restores the input bits.
-  6. DETERMINISM: repeated identical calls, plus a NON-VACUITY control -- a deliberately perturbed
-     chunk order MUST differ, or the bit-compare is proving nothing.
-  7. PRODUCTION ADMISSION: the shipped ``chunk_sort_ready()`` admits the live GLM-4.7-Flash AND
-     Qwen3.5 DAPO shapes. A green battery over a configuration production would never admit proves
-     nothing (the MM_CUBLASLT "self-check probes the table, not the model" trap,
-     the private grouped-GEMM analysis, Section 7.2 M2).
-  7a. GRAD CONTEXT. Admission must not depend on the caller's grad mode. Every MoE forward on this
-     stack runs under ``torch.no_grad()`` (scoring wraps the forward; training pins
-     ``recompute_granularity=full``, so every layer enters through ``CheckpointFunction``), and gate
-     3 runs autograd. Unfixed, that raised, cached a PERMANENT rejection, and the flag printed
-     INSTALLED on ten pids with zero ADMITTED lines for its entire life.
-  7b. KEY SHAPE. The admission key must carry no data-dependent axis. With the row count in it, the
-     ~2-3 ms probe ran on essentially every one of the ~20,480 calls per forward to save ~147 us.
-  7c. CENSUS. An install banner is not engagement; only a served count is. Drive the INSTALLED
-     wrapper and assert the counter moves and its output is bit-equal to megatron's.
-  8. PERF: gather vs megatron's cat at the live shapes, forward and forward+backward, plus the D2H
-     sync count. NOTE the OFF-side form: megatron HOISTS the ``torch.split`` out of the
-     comprehension (``moe_utils.py:569-570``). Inlining it -- as the flags.py registry quotation
-     does -- re-splits per chunk and inflates OFF by ~500x. ``_reference`` has the hoisted form.
-     Neither this gate nor ``knob_bench.py`` charges anything for admission, and
-     ``knob_bench.py:183`` additionally hoists ``gather_map`` out of its timed region where
-     production calls it per call -- so treat both as ON-side OVERSTATEMENTS.
+A chunk reordering is a bijection on rows, so it is one ``index_select``; the gates below check
+forward/backward bits, row provenance, bijectivity, admission, census and perf against megatron's
+``torch.cat`` expression at the shapes the alltoall dispatcher runs.
 
 Usage:
   source /mnt/local_storage/env.sh
@@ -60,7 +19,7 @@ os.environ.setdefault("SKYRL_ISOEXEC_MOE_CHUNK_SORT", "1")
 
 import torch
 
-if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
+if not torch.cuda.is_available():  # needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
 
@@ -68,17 +27,14 @@ from skyrl.backends.skyrl_train.isoexec.ops.moe import moe_chunk_sort as C
 
 DEV = "cuda"
 
-# The live GLM-4.7-Flash DAPO trainer shape, read off `probeB_dapo/prof/rank0_train_0.json.gz` via
-# private trainer-halo analysis, Section 2.1: EP=8, 8 local experts, so num_splits = 8*8 = 64;
-# h=2048; T=6874 tokens/microbatch at topk=4 -> 27,496 routed rows.
+# The live GLM-4.7-Flash DAPO trainer shape: EP=8 x 8 local experts -> 64 splits, h=2048,
+# 6874 tokens/microbatch at topk=4 -> 27,496 routed rows.
 LIVE_SPLITS = 64
 LIVE_HIDDEN = 2048
 LIVE_ROWS = 27496
 
-# The Qwen3.5 DAPO arm, which is where the 49 s/step of CatArrayBatchedCopy + SplitWithSizesBackward0
-# was attributed. EP=32 x 8 local experts -> num_splits = 256; h=2048; ~16,752 routed rows per
-# microbatch. Gate 7 must admit THIS too: a battery green only on the GLM 64/27496 shape is the
-# "self-check probes the table, not the model" trap all over again.
+# The Qwen3.5 DAPO arm: EP=32 x 8 local experts -> 256 splits, h=2048, ~16,752 routed rows.
+# Gate 7 must admit this shape too, not just the GLM one.
 QWEN_SPLITS = 256
 QWEN_HIDDEN = 2048
 QWEN_ROWS = 16752
@@ -103,7 +59,7 @@ def bitne(a, b):
 
 
 # ------------------------------------------------------------------------------------------------
-# Chunk-vector populations. Each is a (split_sizes, sorted_idxs) pair on device.
+# Chunk-vector populations: each is a (split_sizes, sorted_idxs) pair on device.
 # ------------------------------------------------------------------------------------------------
 def layouts(n_splits, total, seed):
     g = torch.Generator().manual_seed(seed)
@@ -131,8 +87,7 @@ def layouts(n_splits, total, seed):
 
     res = []
     for name, ss in out:
-        # megatron's `sort_input_by_local_experts` is a fixed EP-derived reordering; a random
-        # permutation is a strictly harder instance of the same shape.
+        # megatron's reordering is a fixed EP-derived one; a random permutation is harder
         si = torch.randperm(n_splits, generator=g)
         res.append((name, ss.to(DEV), si.to(DEV), int(ss.sum())))
     return res
@@ -141,8 +96,7 @@ def layouts(n_splits, total, seed):
 def populations(n, h, dtype, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     yield "randn", torch.randn(n, h, generator=g, device=DEV, dtype=dtype)
-    # A subnormal/underflow population makes bf16 rounding and signed zeros live. A copy must not
-    # care; a copy that secretly went through an accumulate would.
+    # an underflow population makes bf16 rounding and signed zeros live: a pure copy must not care
     yield "underflow", (torch.randn(n, h, generator=g, device=DEV, dtype=dtype) * (2.0**-9))
 
 
@@ -248,8 +202,7 @@ def gate_6_determinism_and_nonvacuity():
         a, _ = C.sort_chunks_gather(x, ss, si, None)
         b, _ = C.sort_chunks_gather(x, ss, si, None)
         check(f"determinism {name}", bitne(a, b) == 0)
-        # Non-vacuity: rotate the chunk order. Unless every chunk is empty or identical, this must
-        # move bits -- otherwise gates 1-5 are comparing a map against itself.
+        # non-vacuity: a rotated chunk order must move bits, else the bit-compare proves nothing
         si2 = torch.roll(si, 1)
         c, _ = C.sort_chunks_gather(x, ss, si2, None)
         moved = bitne(a, c)
@@ -259,7 +212,7 @@ def gate_6_determinism_and_nonvacuity():
 def _live_layout(splits, rows, ep_rows=8):
     ss = torch.full((splits,), rows // splits, dtype=torch.long, device=DEV)
     ss[-1] += rows - int(ss.sum())
-    # megatron's `sort_input_by_local_experts` reordering: (ep, local_experts) transposed.
+    # megatron's `sort_input_by_local_experts` reordering: (ep, local_experts) transposed
     si = torch.arange(splits, device=DEV).reshape(splits // ep_rows, ep_rows).T.reshape(-1)
     return ss, si
 
@@ -277,13 +230,13 @@ def gate_7_production_admission():
             ok = C.chunk_sort_ready(x, ss, si, p)
             check(f"admission {tag} {dtype} splits={splits} h={hidden} rows={rows}", ok)
 
-    # And a shape it must REFUSE rather than crash on: a bogus sorted_idxs.
+    # a shape it must refuse rather than crash on
     x = torch.randn(1024, 128, device=DEV, dtype=torch.bfloat16)
     bad_ss = torch.tensor([512, 512], device=DEV)
     bad_si = torch.tensor([0, 0], device=DEV)  # not a permutation
     refused = not C.chunk_sort_ready(x, bad_ss, bad_si, None)
     check("refuses a non-permutation sorted_idxs (fail-closed)", refused)
-    # ... and refusing it must NOT write off the shape, now that the key is shape-only.
+    # refusing it must not write off the shape, since the key is shape-only
     good_ss = torch.tensor([512, 512], device=DEV)
     good_si = torch.tensor([1, 0], device=DEV)
     y = torch.randn(1024, 128, device=DEV, dtype=torch.bfloat16)
@@ -294,14 +247,8 @@ def gate_7_production_admission():
 
 
 def gate_7a_admission_under_no_grad():
-    """REGRESSION, defect A. Every MoE forward on this stack is under ``torch.no_grad()``: scoring
-    wraps the whole forward (``megatron_worker.py:1020``) and training does too, because the arms pin
-    ``recompute_granularity=full`` / ``recompute_num_layers=1`` so every layer enters through
-    megatron's ``CheckpointFunction.forward`` (``tensor_parallel/random.py:580-581``). Gate (iii)
-    runs autograd; unfixed it raised "element 0 of tensors does not require grad", the shape was
-    written off PERMANENTLY, and the backward recompute -- which does run under ``enable_grad``
-    (``random.py:620``) -- found the key already poisoned. That is why this op printed INSTALLED on
-    ten pids and never once printed ADMITTED."""
+    """Regression: admission must not depend on the caller's grad mode. Every MoE forward here runs
+    under ``torch.no_grad()``, and a probe that raises there used to cache a permanent rejection."""
     print("\n[GATE 7a] admission is independent of the caller's grad context", flush=True)
     ss, si = _live_layout(QWEN_SPLITS, QWEN_ROWS)
     for dtype in (torch.bfloat16, torch.float32):
@@ -319,7 +266,7 @@ def gate_7a_admission_under_no_grad():
             got, gotp = C.sort_chunks_gather(x, ss, si, p)
         check(f"fwd bits under no_grad {dtype}", bitne(ref, got) == 0 and bitne(refp, gotp) == 0)
 
-    # The whole production predicate, end to end: a fresh shape admitted from inside a no_grad.
+    # the production predicate end to end: a fresh shape admitted from inside a no_grad
     C._STATE.pop(C.admission_key(torch.empty(1, 512, device=DEV, dtype=torch.bfloat16), ss), None)
     ss2, si2 = _live_layout(QWEN_SPLITS, QWEN_ROWS)
     x2 = torch.randn(QWEN_ROWS, 512, device=DEV, dtype=torch.bfloat16)
@@ -329,10 +276,8 @@ def gate_7a_admission_under_no_grad():
 
 
 def gate_7b_key_is_shape_only():
-    """REGRESSION, defect B. ``num_tokens`` is the routed-row count of one microbatch on one layer,
-    so keying on it re-ran the ~2-3 ms five-gate probe on essentially every one of the ~20,480 calls
-    per forward to save ~147 us each -- a large net LOSS. Two different row counts at the same
-    (splits, hidden, dtype) must hit the SAME cache entry, and the second must not probe."""
+    """Regression: two row counts at the same (splits, hidden, dtype) must hit the same cache entry
+    and the second must not re-run the ~2-3 ms probe."""
     print("\n[GATE 7b] the admission key carries no data-dependent axis", flush=True)
     splits, hidden = QWEN_SPLITS, QWEN_HIDDEN
     rows_a, rows_b = QWEN_ROWS, QWEN_ROWS + 1024
@@ -357,14 +302,12 @@ def gate_7b_key_is_shape_only():
     dt_us = (time.perf_counter() - t0) * 1e6
     check(f"second call at rows={rows_b} is served from the cache", ok_b)
     check("no new cache entry for a new row count", len(C._STATE) == n0 + 1, f"({len(C._STATE)} entries)")
-    # The probe costs ~2-3 ms. The precondition path is host integers on `splits` elements.
+    # the probe costs ~2-3 ms; the precondition path is host integers on `splits` elements
     check("the cached path did not re-probe", dt_us < 500.0, f"({dt_us:.1f} us for the second call)")
 
 
 def gate_7c_wrapper_census():
-    """An INSTALL banner is not engagement -- only a served count is. With a shape-only key ADMITTED
-    prints ~2 lines per rank for a whole run, so the census is what an arm's acceptance is read
-    from. Drive the INSTALLED wrapper (not the raw helper) and assert the counter moves."""
+    """Drives the installed wrapper (not the raw helper) and asserts the served counter moves."""
     print("\n[GATE 7c] the installed wrapper keeps a served/declined census", flush=True)
     try:
         installed = C.install_chunk_sort()
@@ -386,7 +329,7 @@ def gate_7c_wrapper_census():
     ref, refp = C._reference(x, ss, si, p)
     check("the wrapper's output is bit-equal to megatron's cat", bitne(ref, out) == 0 and bitne(refp, outp) == 0)
 
-    # A malformed call must decline, not crash, and must not stop the next good call being served.
+    # a malformed call must decline, not crash, and must not block the next good call
     td.sort_chunks_by_idxs(x, ss, torch.zeros_like(si), probs=p)
     s2, d2, reason = C.chunk_sort_stats()
     check("a malformed call declines", d2 == d1 + 1 and s2 == s1, f"(declined {d1} -> {d2}, reason={reason!r})")
@@ -414,7 +357,7 @@ def gate_8_perf():
     ss = torch.full((LIVE_SPLITS,), LIVE_ROWS // LIVE_SPLITS, dtype=torch.long, device=DEV)
     ss[-1] += LIVE_ROWS - int(ss.sum())
     si = torch.arange(LIVE_SPLITS, device=DEV).reshape(8, 8).T.reshape(-1)
-    ss_cpu = ss.cpu()  # megatron pre-stages this to the host; measure BOTH layouts
+    ss_cpu = ss.cpu()  # megatron pre-stages this to the host; measure both layouts
     x = torch.randn(LIVE_ROWS, LIVE_HIDDEN, device=DEV, dtype=torch.bfloat16)
     p = torch.randn(LIVE_ROWS, device=DEV, dtype=torch.float32)
 
@@ -433,9 +376,8 @@ def gate_8_perf():
     got = _bench(lambda: fb(C.sort_chunks_gather), iters=20)
     print(f"  FWD+BWD                        cat {ref:8.1f} us -> gather {got:8.1f} us   {ref / got:5.2f}x", flush=True)
 
-    # The new per-call tax: what a call pays now that the probe does not re-run. This is the number
-    # that has to stay small against the saving above -- it is charged on EVERY call, and neither
-    # this battery nor knob_bench.py used to charge anything for admission at all.
+    # the per-call tax once the probe no longer re-runs; charged on every call, so it has to stay
+    # small against the saving above
     for tag, s, i, rows in (
         ("splits=64 host", ss.cpu(), si.cpu(), LIVE_ROWS),
         ("splits=64 device", ss, si, LIVE_ROWS),

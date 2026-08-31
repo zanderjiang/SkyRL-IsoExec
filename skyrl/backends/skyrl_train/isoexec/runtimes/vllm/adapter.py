@@ -1,5 +1,4 @@
-"""Engine-side ContractAdapter: runtime facts read off the vLLM/mpu deployment exactly as the
-gptmodel_vllm call site computed them; ``install()`` wraps the existing install sequence."""
+"""Engine-side ContractAdapter: runtime facts read off the vLLM/mpu deployment."""
 
 from __future__ import annotations
 
@@ -15,8 +14,8 @@ class VLLMContractAdapter(ContractAdapter):
         self._install_fn = install_fn
 
     def runtime_facts(self) -> dict:
-        # SP/CP: this adapter forces mp.sequence_parallel=False and initializes mpu with TP only,
-        # so both are structurally their read values, not guesses.
+        # mp.sequence_parallel is forced False and mpu is initialized TP-only, so SP/CP are read
+        # values rather than guesses.
         from megatron.core import parallel_state as mpu
 
         from ...core.arch import ARCH

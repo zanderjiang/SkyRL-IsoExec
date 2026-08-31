@@ -1,56 +1,12 @@
 """Offline comparator for debug-mode traces: where and how do the two runtimes diverge.
 
-Supported invocations (all stdlib-only -- this module imports nothing outside the standard
-library so it runs on a laptop with no torch, no CUDA and no TransformerEngine):
+Stdlib-only, so it runs without torch or CUDA. A and B are trace directories; every ``*.jsonl``
+inside is read along with the ``manifest-*.json`` sidecars, and records must carry
+:data:`FORMAT_VERSION`. Exit codes: 0 clean, 2 divergence, 3 inconclusive, 1 bad input.
 
-    python <repo>/skyrl/backends/skyrl_train/isoexec/debug/compare.py TRACE_A TRACE_B [opts]
-    PYTHONPATH=<repo>/skyrl/backends/skyrl_train/isoexec python -m debug.compare TRACE_A TRACE_B
-    PYTHONPATH=<repo>/skyrl/backends/skyrl_train/isoexec python -m debug TRACE_A TRACE_B
-
-The fully qualified ``python -m skyrl.backends.skyrl_train.isoexec.debug.compare`` form does NOT
-work offline and is not supported: ``-m`` imports every parent package first, and the ``isoexec``
-package ``__init__`` eagerly installs runtime guards (``install_no_te_guard`` -> ``import
-transformer_engine``), which needs the CUDA/TE stack. The forms above skip that package entirely.
-
-    options: [--case-a trainer_score] [--case-b engine_prefill] [--layers N]
-             [--regions moe.router,gdn.core] [--json out.json]
-
-A and B are trace directories (conventionally trainer and engine); every ``*.jsonl`` inside is
-read, along with the per-process ``manifest-*.json`` sidecars that say what each side sampled.
-Records must carry format version :data:`FORMAT_VERSION`; older traces are refused rather than
-mis-read.
-
-What the comparison guarantees:
-
-  * **Rank-aware.** Records are grouped by (region, layer, out-path, RANK), so many processes
-    writing one directory align per rank instead of by pid sort order. A rank-set mismatch
-    between the two sides is reported as one structural divergence, not as a flood of element
-    mismatches.
-  * **Key-aligned, not position-aligned.** Within a group the two sides are matched on ``step``
-    (else ``call``, else position). A record missing mid-stream therefore shows up as exactly
-    one ``absent`` divergence instead of shifting every later pair into a fabricated value
-    mismatch. A region or step present on one side and missing on the other IS a divergence and
-    does set the exit code.
-  * **Causally ordered.** Divergences are ordered by the recorded execution timestamp, so the
-    reported FIRST DIVERGENCE is the one that happened first, not the alphabetically first
-    contaminated region. Every later divergence on the same rank is marked
-    "contaminated (after first divergence)".
-  * **Honest magnitude.** A k-ladder mismatch yields a bracket ("between ~2^-10 and 2^-6"): the
-    tightest rung that still matches against the first that differs, as a MAX over elements. Only
-    the upper end is a bound -- truncation is a step function, so a differing rung can mean a
-    straddled boundary rather than a large error. When every rung differs the verdict says the
-    ladder does not bound it; it never converts saturation into a claim of large relative error.
-  * **Honest coverage.** Sampled-out steps are reported as "not observed", never as clean, and a
-    comparison whose two sides sampled disjoint record sets is reported as inconclusive.
-
-Known limitation (recorded, not fixed): digests are position-keyed, so a permutation of the same
-values -- a batch-order or token-ordering bug -- is detected but is indistinguishable from a
-value change. Both break every ladder rung. ``SKYRL_ISOEXEC_DEBUG_SEGMENTS`` narrows it: a
-localized fault differs in a few segments, a permutation or a whole-tensor round-off difference
-differs in all of them.
-
-Exit codes: 0 clean, 2 divergence found, 3 comparison inconclusive (disjoint sampling), 1 bad
-input (missing or wrong-version traces).
+Run ``compare.py TRACE_A TRACE_B`` by path, or ``python -m debug.compare`` with ``isoexec/`` on
+PYTHONPATH. The fully qualified ``-m skyrl...isoexec.debug.compare`` form does not work offline:
+``-m`` imports the ``isoexec`` package, whose ``__init__`` needs the CUDA/TE stack.
 """
 
 from __future__ import annotations
@@ -62,8 +18,7 @@ import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
-# Must match trace.FORMAT_VERSION. Duplicated rather than imported: trace.py pulls in torch and
-# this module is the one that has to run without it.
+# Must match trace.FORMAT_VERSION. Duplicated rather than imported: trace.py pulls in torch.
 FORMAT_VERSION = 3
 
 MAX_LOCATIONS = 10  # per list, in the rendered text; --json carries up to --json-max-per-region
@@ -149,9 +104,8 @@ def _group(recs: List[dict], case: Optional[str], layers: Optional[int], regions
 def _align(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple[Optional[dict], Optional[dict]]], str]:
     """Pair up two groups on a shared record key, so a missing record leaves a hole.
 
-    Aligning on position instead would shift every later pair and manufacture value divergences
-    out of records whose bits were never compared. ``step`` is preferred (it survives a call
-    counter that never fired), ``call`` is the fallback, position is the last resort.
+    ``step`` is preferred, ``call`` is the fallback, position is the last resort -- aligning on
+    position shifts every later pair and manufactures value divergences.
     """
     for field in ("step", "call"):
         ka = [r.get(field) for r in va]
@@ -169,9 +123,8 @@ def _align(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple[Optional[dict], O
 def _ladder_verdict(a: dict, b: dict) -> Tuple[Optional[int], str]:
     """(finest agreeing mantissa rung or None, honest magnitude bracket).
 
-    The bracket is (first rung that differs, finest rung that still matches) mapped to relative
-    error, and it is a MAX over elements. When nothing matches, say so -- do not translate a
-    saturated ladder into a magnitude.
+    The bracket is (first differing rung, finest matching rung) as relative error, a MAX over
+    elements. A saturated ladder is never translated into a magnitude.
     """
     la, lb = a.get("ladder") or {}, b.get("ladder") or {}
     ks = sorted((int(k[1:]) for k in set(la) & set(lb) if k.startswith("k")), reverse=True)
@@ -231,9 +184,7 @@ def _segment_note(ra: dict, rb: dict) -> Optional[str]:
 
 
 def _order_key(mm: dict) -> tuple:
-    """Causal order: recorded execution time first, then the per-process sequence number, which
-    is exact where the wall clock's resolution is not. Records without a ts (hand-written traces)
-    sort after, on the old step/index key."""
+    """Causal order: execution timestamp, then the per-process sequence number; ts-less records last."""
     ts = mm.get("ts")
     step = mm.get("step")
     return (
@@ -258,8 +209,7 @@ def _side_label(recs: List[dict], man: List[dict]) -> str:
 
 
 def _sampling(recs: List[dict], man: List[dict]) -> dict:
-    """What this side actually covered: sample rate, whether set_step drove it, steps seen vs
-    recorded. Without manifests, fall back to what the records themselves show."""
+    """What this side covered: sample rate, step signal, steps seen vs recorded."""
     seen, recorded = set(), {r.get("step") for r in recs if r.get("step") is not None}
     sample = 1
     step_signal = any(r.get("step") is not None for r in recs)
@@ -285,9 +235,8 @@ def _sampling(recs: List[dict], man: List[dict]) -> dict:
 def _layer_src_mismatch(sa: dict, sb: dict) -> Optional[str]:
     """The two sides derived the layer key differently, so its values are not comparable.
 
-    ``layer`` is part of the grouping key, so a side reading real module indices against a side
-    counting call order produces key-level ``absent`` divergences on a run that may be perfectly
-    clean. Naming the cause is the whole point of this comparator.
+    ``layer`` is part of the grouping key, so mismatched sources produce ``absent`` divergences
+    on a run that may be clean.
     """
     la, lb = set(sa.get("layer_src") or []), set(sb.get("layer_src") or [])
     if not la or not lb or la == lb:
@@ -394,8 +343,7 @@ def compare(
             else:
                 only_b += n
                 locations["only_in_b"].append(where)
-            # A rank that exists on one side only is one structural fact, already reported as
-            # rank_mismatch; do not restate it once per key.
+            # A one-sided rank is already reported once as rank_mismatch; do not restate it per key.
             if rank in rank_only_a or rank in rank_only_b:
                 continue
             st["absent"] += n
@@ -708,12 +656,9 @@ DEFAULT_JSON_MAX_PER_REGION = 200
 def cap_report(rep: dict, max_per_region: int = DEFAULT_JSON_MAX_PER_REGION) -> dict:
     """Report with its per-record lists capped for serialization; counts stay exact.
 
-    A fully divergent 110k-record run serializes every mismatch: 66MB of JSON, most of it the
-    same fact repeated. Cap the divergence list at the first ``max_per_region`` entries PER
-    REGION (they are already sorted causally, so those are the earliest, which is what triage
-    reads) and cap the flat location/unrecordable lists at the same number overall. ``regions``
-    (the counts), ``first_divergence`` and ``origins`` are never trimmed -- they are the verdict.
-    ``truncated`` says exactly what was dropped, so a reader is never silently short.
+    Divergences are capped at the first ``max_per_region`` per region (causally sorted, so the
+    earliest survive); ``regions``, ``first_divergence`` and ``origins`` are never trimmed, and
+    ``truncated`` records what was dropped.
     """
     if not max_per_region or max_per_region <= 0:
         return rep

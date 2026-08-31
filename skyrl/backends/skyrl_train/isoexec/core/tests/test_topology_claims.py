@@ -1,12 +1,8 @@
 """Topology claims: grounded derivation, refusing enforcement, and the engine pik-assert ordering.
 
-Three obligations, one file:
-  1. The production contract's TopologyClaims are the profile's DECLARED facts (no invented
-     literals) and every proof ref resolves to a real colocated gate file.
-  2. ``assert_topology_within_claims`` accepts inside a claimed envelope, REFUSES outside it,
-     and demotes to warn-only under SKYRL_ISOEXEC_MANIFEST_STRICT=0.
-  3. The engine install path builds the contract BEFORE the pik install, so
-     ``_assert_plan_matches_manifest`` reads a real view rather than None (which would skip).
+Covers that claims are the profile's declared facts with resolving proof refs, that
+``assert_topology_within_claims`` refuses outside a claimed envelope (warn-only under
+SKYRL_ISOEXEC_MANIFEST_STRICT=0), and that the engine builds its contract before the pik install.
 """
 
 import os
@@ -180,9 +176,7 @@ def test_enforcement_skips_unobtainable_axes_and_claimless_contracts():
 
 
 def test_engine_pik_assert_sees_real_view():
-    """With the process contract built before the pik install, ``_assert_plan_matches_manifest``
-    compares the env-built plan against the REAL production pins and refuses a split -- no stub
-    view, the actual qwen35 contract."""
+    """``_assert_plan_matches_manifest`` compares against the real production pins and refuses a split."""
     from skyrl.backends.skyrl_train.isoexec.ops.collectives import (
         pik_tp_invariant as pik,
     )
@@ -210,10 +204,8 @@ def test_engine_pik_assert_sees_real_view():
 
 
 def test_engine_contract_build_precedes_pik_install():
-    """Static ordering gate on the engine adapter: a contract built AFTER the pik install leaves
-    the engine arm of the pin assert silently dead. The ContractAdapter owns the ordering:
-    run_install builds the contract and checks the claims BEFORE install(), and the pik install
-    lives inside the engine's install closure."""
+    """Static ordering gate: a contract built after the pik install leaves the engine arm of the
+    pin assert silently dead."""
     import inspect
 
     from skyrl.backends.skyrl_train.isoexec.core.adapter import ContractAdapter

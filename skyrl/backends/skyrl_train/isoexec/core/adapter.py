@@ -1,15 +1,7 @@
 """ContractAdapter drives contract enforcement per runtime.
 
-Every claim kind owes a registered ``ClaimChecker``; ``check_all_claims`` iterates EVERY claim
-group on the contract, dispatches by kind, and reports each verdict into the obligation ledger.
-A claim kind with no registered checker is itself a violation (severity: refuse) -- the runtime
-completion of the schema-side rule that a claim without enforcement is unrepresentable.
-
-``ContractAdapter`` owns the per-process enforcement sequence
-(``build_contract -> check_all_claims -> install -> close INSTALL``) and exposes the later
-boundaries (``on_first_forward``, ``on_weight_sync``) as the thin methods runtime call sites
-delegate to. Per-runtime subclasses supply ``runtime_facts()`` and wrap -- never rewrite -- their
-existing install sequences (runtimes/vllm/adapter.py, runtimes/megatron/adapter.py).
+Owns the per-process sequence (``build_contract -> check_all_claims -> install -> close INSTALL``)
+plus the later boundaries. Every claim kind owes a registered ``ClaimChecker`` or the run refuses.
 """
 
 from __future__ import annotations
@@ -44,7 +36,7 @@ class ClaimChecker(Protocol):
 
 
 # kind (contract.claims field name) -> checker. Every field of Claims MUST have an entry here or
-# check_all_claims refuses; registration is how a new claim kind buys its way into a contract.
+# check_all_claims refuses.
 CLAIM_CHECKERS: Dict[str, ClaimChecker] = {}
 
 
@@ -54,9 +46,8 @@ def register_claim_checker(checker: ClaimChecker) -> ClaimChecker:
 
 
 class TopologyChecker:
-    """The domain comparison migrated from ``assert_topology_within_claims``, one claim at a time:
-    a ``pinned`` claim demands equality with its degree, an ``invariant`` claim membership in its
-    proven domain; an axis the caller could not obtain is a visible skip, never a guess."""
+    """A ``pinned`` claim demands equality with its degree, an ``invariant`` claim membership in
+    its proven domain; an axis the caller could not obtain is a visible skip, never a guess."""
 
     kind = "topology"
 
@@ -85,8 +76,7 @@ class TopologyChecker:
 
 
 class StateHookChecker:
-    """The hook-exists attestation migrated from the contract build: every StateClaim's
-    ``path::symbol`` ref must be real code in-tree."""
+    """Every StateClaim's ``path::symbol`` ref must be real code in-tree."""
 
     kind = "state"
 
@@ -103,9 +93,8 @@ class StateHookChecker:
 
 
 class ToleranceChecker:
-    """Attests the gate WIRING: the forward gate's limits must resolve from this claim
-    (``trainer_utils.isoexec_gate_limits``). The STEP-time judgment stays in the gate itself --
-    an ``ok`` here is deliberately NOT ledger-reported, so gate@STEP1 still requires the real run."""
+    """Attests the gate WIRING: the forward gate's limits must resolve from this claim. An ``ok``
+    is deliberately NOT ledger-reported, so gate@STEP1 still requires the real run."""
 
     kind = "tolerances"
     report_ok = False  # never pre-discharge the STEP1 gate obligation with an INSTALL-time attest
@@ -146,12 +135,7 @@ for _c in (TopologyChecker(), StateHookChecker(), ToleranceChecker()):
 
 
 def check_topology_claims(contract, actual, *, side: str = "?"):
-    """The aggregate topology check (banner + refusal), judgment delegated to ``TopologyChecker``.
-
-    Behavior of the pre-adapter ``assert_topology_within_claims``, preserved exactly: same ledger
-    records, same ``[ISOEXEC-CLAIMS]`` banner, same refusal message; the refusal itself goes
-    through ``enforce.refuse``. Returns ``(ok, {obligation_id: CheckResult})``.
-    """
+    """The aggregate topology check (banner + refusal); returns ``(ok, {obligation_id: result})``."""
     if contract is None:
         logger.warning("[ISOEXEC-CLAIMS] side=%s no contract built; topology unchecked", side)
         return True, {}
@@ -196,14 +180,10 @@ def check_topology_claims(contract, actual, *, side: str = "?"):
 
 
 def check_all_claims(contract, facts, side: str) -> Dict[str, CheckResult]:
-    """Iterate EVERY claim on the contract, dispatch each by kind to its registered checker, and
-    report each verdict to the ledger under its obligation.
+    """Dispatch every claim to its registered checker and report each verdict to the ledger.
 
-    A claim whose kind has no registered checker REFUSES (``enforce.refuse``, so strict=0 and debug
-    tracing demote it): this is what makes "claim without enforcement" unrepresentable at runtime.
-    A checker that RAISES records a CHECKER-ERROR violation, never a skip. Topology keeps its
-    aggregate banner + refusal; state and tolerance violations are ledger records the phase closes
-    judge under the severity table.
+    A claim kind with no registered checker refuses; a checker that RAISES records a
+    CHECKER-ERROR violation, never a skip.
     """
     if contract is None:
         logger.warning("[ISOEXEC-CLAIMS] side=%s no contract built; topology unchecked", side.upper())
@@ -230,8 +210,8 @@ def check_all_claims(contract, facts, side: str) -> Dict[str, CheckResult]:
             try:
                 r = checker.check(claim, facts)
             except Exception as e:  # noqa: BLE001 -- a broken checker never crashes the sequence
-                # ...but it fails CLOSED: recording a skip here let a refuse-severity obligation be
-                # discharged by a checker that could not run, which is the silent-inert class.
+                # ...but it fails CLOSED: a skip here would let a refuse-severity obligation be
+                # discharged by a checker that could not run.
                 r = CheckResult(enforce.VIOLATION, f"{enforce.CHECKER_ERROR}: {type(e).__name__}: {e}")
                 logger.error("[ISOEXEC-ADAPTER] %s checker RAISED, recorded as a violation: %s", oid, e)
             results[oid] = r
@@ -253,18 +233,8 @@ def check_all_claims(contract, facts, side: str) -> Dict[str, CheckResult]:
 def live_pins(op: str) -> Optional[dict]:
     """The pinned constants ``op``'s install can still be READ for, or None when it cannot.
 
-    Both runtimes' fingerprint sites record impl ids; the pins the contract hashes alongside them
-    were going unrecorded, so ``fingerprint.pin_disagreements`` -- the check that catches "same impl,
-    different constant" -- never ran outside tests. The values here come off the object the install
-    built (pik's ReductionPlan) or the call-time predicate the kernels themselves read, never off
-    the contract, or the comparison would be the declaration checking itself.
-
-    None means the pins are not readable here: either they are call-site literals with no
-    post-install state (the attention num_splits/fa_version pair, the logprob fastpath row
-    threshold) or the read itself failed. Either way the record carries no pins at all and
-    ``log_unreported_pins`` names it, rather than a record echoing the contract. Fail-soft
-    deliberately -- this runs inside the install fingerprint, and a pin read that raised would take
-    the remaining records down with it.
+    Values come off the object the install built or what the kernels themselves read, never off
+    the contract, or the comparison would be the declaration checking itself. Fail-soft.
     """
     try:
         if op == "collectives.tree_all_reduce":
@@ -273,17 +243,14 @@ def live_pins(op: str) -> Optional[dict]:
             plan = get_plan()
             return {"leaves": int(plan.num_leaves), "leaf_dtype": "bf16" if plan.bf16_leaves else "fp32"}
         if op == "moe.combine":
-            # G is the leaf count the fc2 leaf-tree splits by (ops/moe/moe_batched_experts), read
-            # from the same env those kernels read; fp32 leaves are the impl -- pik_leaf_tree IS
-            # the fp32 tree, there is no setting that makes it anything else.
+            # Leaf count read from the same env the fc2 leaf-tree kernels read; fp32 leaves are
+            # the impl itself, not a setting.
             return {"leaves": int(os.environ.get("SKYRL_ISOEXEC_PIK_LEAVES", "8")), "leaf_dtype": "fp32"}
         if op == "logprobs.log_softmax":
             from ..ops.logprobs import rowinv
 
-            # G off the same env the kernel reads, BLOCK off the module the install bound -- so a
-            # kernel whose tile drifted from the contract's pin is a recorded disagreement, not a
-            # silently rehashed schedule. Kahan fp32 is the impl: rowinv_leaftree IS the Kahan
-            # tree, there is no setting that makes it anything else.
+            # Leaves off the same env the kernel reads, BLOCK off the module the install bound, so
+            # a drifted tile is a recorded disagreement. Kahan fp32 is the impl, not a setting.
             return {
                 "leaves": int(os.environ.get(rowinv.LEAVES_ENV, "8")),
                 "block": int(rowinv.BLOCK),
@@ -295,13 +262,7 @@ def live_pins(op: str) -> Optional[dict]:
 
 
 def log_unreported_pins(view) -> Dict[str, list]:
-    """Name the recorded installs whose contract entry pins constants that the record does not carry.
-
-    ``log_fingerprint`` compares pins only when the recorder reported some, because an install that
-    reports none is a blind spot rather than evidence of agreement. That is the right rule and it is
-    also silent, so the blind spots never appear anywhere. This says them out loud: a site listed
-    here runs ``pin_disagreements`` over nothing, and the fix is to source the value off the object
-    the install bound -- not to echo the contract back at itself.
+    """Name the recorded installs whose contract entry pins constants the record does not carry.
 
     Returns ``{f"{op}:{site}": [pinned keys]}``; empty when every pinned entry reported its pins.
     """
@@ -327,9 +288,7 @@ def log_unreported_pins(view) -> Dict[str, list]:
 class ContractAdapter:
     """Base adapter: owns one process's enforcement sequence against its contract.
 
-    ``run_install()`` drives ``build_contract -> check_all_claims -> install() -> close INSTALL``;
-    ``on_first_forward()`` and ``on_weight_sync()`` are the thin boundary methods existing call
-    sites delegate to. Subclasses supply ``runtime_facts()`` and ``install()``.
+    Subclasses supply ``runtime_facts()`` and ``install()``.
     """
 
     build_failsoft = False  # trainer builds fail-soft (historical behavior); engine refuses
@@ -367,8 +326,7 @@ class ContractAdapter:
         return self.contract
 
     def run_install(self, close: bool = True) -> bool:
-        """The INSTALL sequence: build the contract BEFORE any install that asserts against it
-        (the pik-ordering fix), check every claim, run the install, close the phase."""
+        """The INSTALL sequence; the contract is built BEFORE any install that asserts against it."""
         self.build_contract()
         check_all_claims(self.contract, self.runtime_facts(), self.side)
         self.install()
@@ -377,10 +335,8 @@ class ContractAdapter:
             return enforce.install_boundary(self.side)
         return True
 
-    #: Debug tracing digests region outputs, which ends in a ``.item()`` D2H copy. Under CUDA
-    #: graph capture that poisons the capture, and a replayed graph runs no Python at all, so the
-    #: decode steps the graph serves produce no records either way -- a trace that looks clean
-    #: because half the forward was never observed. Refused at init instead.
+    #: Debug tracing's ``.item()`` D2H copy poisons a CUDA-graph capture, and a replayed graph runs
+    #: no Python, so decode steps produce no records at all. Refused at init instead.
     CUDAGRAPH_REFUSAL = (
         "[ISOEXEC-DEBUG] REFUSED: {side} debug tracing (SKYRL_ISOEXEC_DEBUG_TRACE={dir!r}) with "
         "SKYRL_ISOEXEC_ENABLE_CUDAGRAPH=1. A replayed CUDA graph executes no Python, so every "
@@ -391,20 +347,10 @@ class ContractAdapter:
     )
 
     def _install_debug_trace(self) -> None:
-        """Debug mode (SKYRL_ISOEXEC_DEBUG_TRACE): per-region output tracing. Every enforcement
-        refusal is demoted (``enforce.demoted``) so any kernel mix runs; the trace, not the gate,
-        reports the disagreement.
+        """Arm per-region output tracing under SKYRL_ISOEXEC_DEBUG_TRACE; fail-soft.
 
-        Fail-soft like every other diagnostic in this package: tracing is DIAGNOSTIC disposition,
-        so a hook-install failure must not be able to abort the INSTALL sequence that follows it.
-
-        ONE exception, raised before anything is installed: debug tracing on the engine together
-        with CUDA-graph decode. It does NOT go through ``enforce.refuse``, deliberately --
-        ``enforce.demoted()`` is true exactly when debug tracing is armed, so a refusal whose own
-        precondition is debug mode would demote itself to a log line every single time. It is
-        also not the failure mode fail-soft exists for: the run would not crash, it would produce
-        a trace that reads clean because the decode half of the forward was never observed. That
-        is worse than no trace, so it is a hard error with its own message.
+        Engine-side tracing with CUDA-graph decode is a hard error rather than an
+        ``enforce.refuse``: debug mode demotes every refusal, so this one would demote itself.
         """
         from ..debug.trace import enabled
 
@@ -418,8 +364,8 @@ class ContractAdapter:
             os.environ["SKYRL_ISOEXEC_DEBUG_SIDE"] = self.side
             from ..debug import install_debug_hooks
 
-            # A subclass that keeps its GPTModel handle gets layer-indexed records for free;
-            # without one the trainer falls back to layer_src="call_order" (see debug/trace.py).
+            # With a GPTModel handle the records are layer-indexed; without one the trainer falls
+            # back to layer_src="call_order".
             mf = getattr(self, "model_fn", None)
             n = install_debug_hooks(mf() if mf is not None else None)
         except Exception as e:  # noqa: BLE001 -- diagnostics never fail a run

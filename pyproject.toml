@@ -500,7 +500,8 @@ exclude = [
 [tool.ruff.lint]
 extend-select = ["I"]
 ignore = [
-    "F722" # Syntax error in annotation - ignored because this doesn't play well with jaxtyping
+    "F722", # Syntax error in annotation - ignored because this doesn't play well with jaxtyping
+    "E741", # variables named 'l', 'O', 'I' - upstream SkyRL ignores this; kernel output pointers are named O
 ]
 
 [tool.ruff.lint.isort]

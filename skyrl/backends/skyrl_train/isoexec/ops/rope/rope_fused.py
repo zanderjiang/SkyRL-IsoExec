@@ -1,20 +1,7 @@
 """Fused attention RoPE for the engine: one Triton kernel per call, plus a cos/sin hoist.
 
-Stock megatron recomputes ``cos``/``sin`` from a ``freqs`` tensor that is identical for every layer
-and both projections, then spends six more launches on the rotate-half and multiply-add. This
-computes cos/sin once per forward and fuses the rest into a single kernel.
-
-THE REFERENCE IS MEGATRON'S STOCK ``_apply_rotary_pos_emb_bshd``, whose multiply-add is a bf16
-THREE-round chain: bf16(t*cos_), bf16(rot*sin_), bf16(sum). Staying in fp32 across the add is more
-accurate and a different function, which would force the trainer to move with it. The repo also
-carries an fp32 RoPE patch with exactly that one-round chain, and this module refuses to install
-over it rather than silently matching the wrong reference.
-
-ENGINE-ONLY, by three independent guards: the installer is called only from the vLLM model wrapper,
-the fused path fires only for a ``freqs`` tensor marked by ``_PositionIndexedRoPE``, and it refuses
-whenever grad is enabled -- a raw Triton call carries no ``grad_fn`` and would sever a backward.
-
-Flag: ``SKYRL_ISOEXEC_FUSED_ROPE=1``, default off.
+Bitwise-equal to megatron's stock ``_apply_rotary_pos_emb_bshd``, whose multiply-add is a bf16
+three-round chain. Engine-only and inference-only. Flag: ``SKYRL_ISOEXEC_FUSED_ROPE=1``, off.
 """
 
 from __future__ import annotations
@@ -27,13 +14,11 @@ import triton.language as tl
 
 FLAG = "SKYRL_ISOEXEC_FUSED_ROPE"
 
-# Pinned launch geometry. Not a bitwise contract -- this kernel has no reduction, so the tile cannot
-# reorder any addition -- but pinned regardless, since nothing in this tree autotunes.
+# Pinned launch geometry; nothing in this tree autotunes.
 _MB = 4  # rows (= tokens x heads) per program
 _NUM_WARPS = 4
 
-# Populated by `_cos_sin_for`, read by `hoist_report`. A hoist that never fires is bitwise-perfect
-# and worth nothing, so whether it fires has to be a counter rather than an assumption.
+# Populated by `_cos_sin_for`, read by `hoist_report`.
 HOIST_STATS = {"calls": 0, "computes": 0}
 
 _LOGGED = False
@@ -42,18 +27,13 @@ _HOIST_LOGGED = False
 _ORIG_BSHD = None
 _INSTALLED = False
 
-# Both attributes live on the `freqs` tensor -- the engine mark and the hoisted cos/sin cache -- so
-# they die with it and there is no invalidation boundary to miss.
+# Both attributes live on the `freqs` tensor, so they die with it: no invalidation boundary.
 _MARK_ATTR = "_ix_engine_rope"
 _CACHE_ATTR = "_ix_rope_cos_sin"
 
 
 def fused_rope_enabled() -> bool:
-    """``SKYRL_ISOEXEC_FUSED_ROPE=1``, default off.
-
-    Logged once per process at first read, so the value the engine actor saw appears in its own log
-    rather than only the value the launcher exported.
-    """
+    """``SKYRL_ISOEXEC_FUSED_ROPE=1``, default off; logged once per process at first read."""
     global _LOGGED
     on = os.environ.get(FLAG, "0") == "1"
     if not _LOGGED:
@@ -84,13 +64,10 @@ def _rope_kernel(
 ):
     """One fused pass over a ``[S, B, H, D]`` tensor: rotate the first ``R`` lanes, copy the rest.
 
-    The input is addressed by explicit ``[S, B, H]`` strides and only its last dim must be unit
-    stride: query/key reach RoPE from a split of the fused qkv projection whose contiguity depends
-    on qk_layernorm and the rank's head counts, so a full-contiguity requirement would silently fall
-    back to eager on some shard geometries. The output is contiguous, as ``torch.cat`` returns.
+    Addressed by explicit ``[S, B, H]`` strides; only the last dim must be unit stride, since qkv
+    splits are not always fully contiguous. The output is contiguous.
     """
-    # int64 row index: the offset is row index times stride, and an int32 index silently wraps past
-    # 2^31 rather than faulting.
+    # int64 row index: an int32 offset would silently wrap past 2^31 rather than faulting.
     rows = tl.program_id(0).to(tl.int64) * MB + tl.arange(0, MB)[:, None]
     d = tl.arange(0, BD)[None, :]
     rmask = rows < n_rows
@@ -103,24 +80,24 @@ def _rope_kernel(
     base = s * st_s + (rem // H) * st_b + (rem % H) * st_h
     x = tl.load(t_ptr + base + d, mask=mask, other=0)
 
-    # `_rotate_half` is `cat((-x2, x1))` over the first R lanes: lane d takes lane d+R/2 negated for
-    # d < R/2 and lane d-R/2 as-is above. A fixed-distance gather, not a reduction.
+    # `_rotate_half` as a fixed-distance gather: lane d takes lane d+R/2 negated for d < R/2,
+    # lane d-R/2 as-is above.
     half: tl.constexpr = R // 2
     part = tl.where(d < half, d + half, d - half)
     xp = tl.load(t_ptr + base + part, mask=rot_mask, other=0)
-    # Negation must be `* -1.0`, never `-x`: Triton lowers unary minus to `0.0 - x`, which yields
-    # +0.0 where torch's neg gives -0.0, and that sign propagates through the add into the store.
+    # Negation must be `* -1.0`, never `-x`: Triton lowers unary minus to `0.0 - x`, which gives
+    # +0.0 where torch's neg gives -0.0, and that sign reaches the store.
     rot = tl.where(d < half, xp.to(tl.float32) * -1.0, xp.to(tl.float32))
 
     # `freqs` is [S, 1, 1, R]: one angle row per sequence position, broadcast over batch and heads.
     c = tl.load(cos_ptr + s * R + d, mask=rot_mask, other=0)
     sn = tl.load(sin_ptr + s * R + d, mask=rot_mask, other=0)
 
-    # The three rounds. ATen's bf16 elementwise ops compute in fp32 and round once at the store, and
-    # stock megatron writes `(t * cos_) + (rot * sin_)` as three such ops.
+    # The three rounds: stock megatron writes `(t * cos_) + (rot * sin_)` as three bf16 elementwise
+    # ops, each computing in fp32 and rounding once.
     dt = t_ptr.dtype.element_ty
     p1 = (x.to(tl.float32) * c.to(tl.float32)).to(dt)
-    p2 = (rot * sn.to(tl.float32)).to(dt)  # `rot` is already fp32, exactly representing the bf16 value
+    p2 = (rot * sn.to(tl.float32)).to(dt)  # `rot` is already fp32, exact for the bf16 value
     y = (p1.to(tl.float32) + p2.to(tl.float32)).to(dt)
 
     tl.store(o_ptr + rows * D + d, tl.where(d < R, y, x), mask=mask)
@@ -135,8 +112,7 @@ def fused_rope_bshd(t: torch.Tensor, cos_: torch.Tensor, sin_: torch.Tensor) -> 
     S, B, H, D = t.shape
     R = cos_.shape[-1]
     if t.stride(-1) != 1 or not cos_.is_contiguous() or not sin_.is_contiguous():
-        # The feature axis uses an implicit unit stride and cos/sin implicit row strides; a
-        # violation would not fault, it would silently rotate the wrong elements.
+        # Implicit unit/row strides: a violation would not fault, it would rotate wrong elements.
         raise RuntimeError(f"t last dim must be unit-stride and cos/sin contiguous, got {t.stride()} / {cos_.stride()}")
     if cos_.shape != sin_.shape or cos_.shape[0] != S or cos_.dtype != t.dtype:
         raise ValueError(f"cos/sin {tuple(cos_.shape)}/{cos_.dtype} do not match t {tuple(t.shape)}/{t.dtype}")
@@ -170,11 +146,9 @@ def fused_rope_bshd(t: torch.Tensor, cos_: torch.Tensor, sin_: torch.Tensor) -> 
 def _cos_sin_for(freqs: torch.Tensor, dtype: torch.dtype, mscale: float):
     """``(cos(freqs)*mscale).to(dtype)`` and its sine, computed at most once per ``freqs`` object.
 
-    The cache lives on the marked tensor in the view chain, so it dies with the forward that created
-    it -- there is no registry to keep coherent and no boundary a CUDA-graph replay can skip. It must
-    be the marked tensor and not the argument: megatron hands each layer its own
+    Cached on the MARKED tensor, not the argument: megatron hands each layer its own
     ``rotary_pos_emb[0:q_len]`` slice, so caching on the argument would cache per layer. The row
-    count joins the key so a shorter slice can never be served a longer slice's angles.
+    count joins the key so a shorter slice is never served a longer slice's angles.
     """
     HOIST_STATS["calls"] += 1
     _host = engine_marked_host(freqs)
@@ -184,8 +158,7 @@ def _cos_sin_for(freqs: torch.Tensor, dtype: torch.dtype, mscale: float):
     if cache is not None and cache[0] == key:
         return cache[1], cache[2]
     HOIST_STATS["computes"] += 1
-    # Exactly stock's two expressions. `* mscale` is kept even at mscale == 1.0 because eager emits
-    # it; the multiply is exact and costs one launch per forward.
+    # Exactly stock's two expressions; `* mscale` is kept even at 1.0 because eager emits it.
     cos_ = (torch.cos(freqs) * mscale).to(dtype)
     sin_ = (torch.sin(freqs) * mscale).to(dtype)
     try:
@@ -200,17 +173,13 @@ def hoist_report() -> str:
     return f"cos/sin computed {c} time(s) over {n} rope call(s)" + (f" -- {n / max(c, 1):.1f}x hoist" if n else "")
 
 
-# The live marked freqs, replaced on every mark, so at most one such tensor is held. The strong
-# reference is deliberate: it is what makes the storage comparison in `engine_marked_host` safe.
+# The live marked freqs. The strong reference is deliberate: it keeps the storage alive, which is
+# what makes the storage comparison in `engine_marked_host` safe.
 _LAST_MARKED: "torch.Tensor | None" = None
 
 
 def mark_engine_rope(freqs: torch.Tensor) -> torch.Tensor:
-    """Stamp the engine mark on a ``freqs`` tensor, from ``_PositionIndexedRoPE.forward``.
-
-    This mark, not the global patch, is what makes the fusion engine-only: an unmarked ``freqs``
-    falls through to the original function in any process.
-    """
+    """Stamp the engine mark on a ``freqs`` tensor; this is what makes the fusion engine-only."""
     global _LAST_MARKED
     try:
         setattr(freqs, _MARK_ATTR, True)
@@ -223,18 +192,9 @@ def mark_engine_rope(freqs: torch.Tensor) -> torch.Tensor:
 def engine_marked_host(freqs) -> "torch.Tensor | None":
     """The marked tensor ``freqs`` descends from, or None. Shared by both rope ops.
 
-    Three tests in order: the attribute itself, then the ``_base`` view walk, then storage identity.
-    The ``_base`` walk alone is not enough. megatron hands each layer its own
-    ``rotary_pos_emb[0:q_len]`` slice, which does not carry the attribute, and vLLM runs the forward
-    inside ``torch.inference_mode()`` -- a tensor allocated there is an inference tensor, for which
-    torch skips view tracking entirely, so the slice reports ``_base is None`` and there is no chain
-    to walk. Without the third test the detector returns False on every engine call and the fusion is
-    dead code that no bitwise test can see.
-
-    The storage test is not an identity-keyed cache: ``_LAST_MARKED`` holds a strong reference, so
-    that storage cannot be freed and reused while it is held, and the claim is "this tensor shares
-    storage with one I am holding" rather than "this pointer equals a number I wrote down". Dtype and
-    device are compared too, so a reinterpreting view cannot sneak in.
+    Three tests: the attribute, the ``_base`` view walk, then storage identity. The walk alone is
+    not enough -- under ``torch.inference_mode()`` torch skips view tracking, so a layer's
+    ``rotary_pos_emb[0:q_len]`` slice reports ``_base is None``. Dtype and device are compared too.
     """
     if getattr(freqs, _MARK_ATTR, False):
         return freqs
@@ -296,8 +256,7 @@ def _fused_apply_rotary_pos_emb_bshd(
     if not _eligible(t, freqs, rotary_interleaved, mla_rotary_interleaved):
         global _FALLBACK_LOGGED
         if not _FALLBACK_LOGGED and engine_mark_reaches(freqs):
-            # A marked freqs that still falls back means the engine is unfused everywhere, which
-            # looks exactly like a run where the flag never arrived.
+            # A marked freqs that still falls back means the engine is unfused everywhere.
             _FALLBACK_LOGGED = True
             print(
                 f"[ISOEXEC-ROPE] fused RoPE FELL BACK to eager: t={tuple(t.shape)}/{t.dtype} "
@@ -326,9 +285,8 @@ def install_engine_fused_rope(*, fp32_rope_installed: bool = False) -> bool:
     """Patch ``rope_utils._apply_rotary_pos_emb_bshd``. Engine process only; no-op if already
     installed or the flag is off.
 
-    Refuses when the fp32 RoPE patch is in place: that patch is a different rounding chain (one fp32
-    round) and this kernel matches stock's bf16 three-round chain. ``fp32_rope_installed`` carries
-    that state in from the runtime adapter, which owns the patch, so this op never imports a runtime.
+    Refuses when the fp32 RoPE patch is in place: that patch is a different rounding chain (one
+    fp32 round) and this kernel matches stock's bf16 three-round chain.
     """
     global _ORIG_BSHD, _INSTALLED
     if not fused_rope_enabled() or _INSTALLED:
@@ -356,9 +314,8 @@ def install_engine_fused_rope(*, fp32_rope_installed: bool = False) -> bool:
 def revert_engine_fused_rope() -> None:
     """Undo :func:`install_engine_fused_rope`; refuses unless this op is the outermost binding.
 
-    The MLA fused rope chains on top of this one and captures this wrapper as its delegate, so
-    reverting out of order would drop the MLA fusion while its own state still claimed it installed.
-    Bitwise-invisible either way, which is why it is checked rather than documented.
+    The MLA fused rope chains over this one, so reverting out of order would drop the MLA fusion
+    while its own state still claimed it installed.
     """
     global _INSTALLED
     if not _INSTALLED:

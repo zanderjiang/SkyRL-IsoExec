@@ -162,9 +162,8 @@ def test_analytic_native_conv_branch_has_no_eager_graph_or_sequence_host_loop():
     source = inspect.getsource(G._GdnNativeConvAutograd.backward)
     assert "_native_conv_vjp" in source
     assert "if not _NATIVE_CONV_ANALYTIC_BWD_ENABLED:" in source
-    # The three per-chunk bodies were extracted (2026-08-16) so they can be routed through the
-    # backward-region compile ledger; the properties this test guards are unchanged, they just
-    # live in the helpers now.
+    # The three per-chunk bodies live in helpers so they can be routed through the
+    # backward-region compile ledger.
     helper = inspect.getsource(G._native_conv_vjp)
     chunks = "".join(
         inspect.getsource(fn) for fn in (G._conv_vjp_dz_chunk, G._conv_vjp_act_chunk, G._conv_vjp_dxdw_chunk)

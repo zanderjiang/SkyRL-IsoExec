@@ -1,11 +1,7 @@
 """The env-built pik plan must match the manifest's pinned contract constants, fail-closed.
 
-``pik_tp_invariant._assert_plan_matches_manifest`` is the seam that closes MODEL_PORTABILITY
-audit gap 1(b) for the pik contract constants: the runtime tree is built from env vars, the
-handshake hash is built from profile pins, and nothing used to connect them -- an env flip on
-both sides ran a different reduction under an unchanged, MATCHING handshake. These tests pin
-the check's three behaviours: refuse on disagreement, pass on agreement, skip without a
-manifest (benches). CPU-only; the manifest is stubbed at the module seam the check reads.
+Covers refuse on disagreement, pass on agreement, skip without a manifest. CPU-only; the
+manifest is stubbed at the module seam the check reads.
 """
 
 from __future__ import annotations
@@ -22,7 +18,7 @@ manifest_mod = importlib.import_module("skyrl.backends.skyrl_train.isoexec.core.
 
 
 def _StubManifest(pins):
-    # the check reads process_contract.cached_contract_view(): {(op, site) -> {"pinned_constants": ...}}
+    # shape of cached_contract_view(): {(op, site) -> {"pinned_constants": ...}}
     return {("collectives.tree_all_reduce", "engine_decode"): {"pinned_constants": pins}}
 
 
@@ -68,5 +64,5 @@ def test_strict_off_downgrades_to_warning(monkeypatch, caplog):
     manifest_mod._VIEW = _StubManifest({"leaves": 8, "leaf_dtype": "fp32"})
     with caplog.at_level("ERROR"):
         pmod._assert_plan_matches_manifest("TEST", _plan(8, bf16=True))  # no raise
-    # The demotion is enforce.refuse's ERROR log -- the check says the split once, there.
+    # The demotion surfaces as enforce.refuse's ERROR log.
     assert [r for r in caplog.records if "SPLIT" in r.getMessage()]

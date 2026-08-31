@@ -1,12 +1,7 @@
-"""CPU guarantees for the debug-mode tensor digest (``debug/thash.py``).
+"""CPU tests for the debug-mode tensor digest (``debug/thash.py``).
 
-Covers: determinism across reduction chunkings, single-bit and permutation sensitivity, shape
-and dtype separation, non-contiguous inputs, the mantissa-truncation k-ladder (monotone rung
-threshold), segment localization, and edge shapes. GPU equivalence is skip-gated behind
-SKYRL_ISOEXEC_DEBUG_TEST_GPU=1 and must not run on a busy node.
-
-Run (CPU only):
-    python skyrl/backends/skyrl_train/isoexec/debug/tests/test_thash_cpu.py
+Covers chunking invariance, bit/permutation sensitivity, shape and dtype separation, the k-ladder,
+segment localization, and a pure-Python reference. GPU equivalence is env-gated.
 """
 
 from __future__ import annotations
@@ -64,7 +59,7 @@ def test_permutation_sensitivity():
     perm = torch.randperm(t.numel())
     assert not torch.equal(t, t[perm])
     assert thash.tensor_digest(t) != thash.tensor_digest(t[perm])
-    # the weakness the weighted scheme fixes: an unweighted sum would collide here
+    # an unweighted sum would collide here
     a = torch.tensor([1.0, 2.0])
     b = torch.tensor([2.0, 1.0])
     assert thash.tensor_digest(a) != thash.tensor_digest(b)
@@ -222,7 +217,7 @@ def test_unsupported_dtype_raises():
 
 
 def test_ladder_depth_is_per_dtype():
-    """A 4-rung ladder capped at 2**-6 cannot resolve a 1-ULP fp32 difference."""
+    """Ladder depth follows the dtype, so a 1-ULP fp32 difference stays resolvable."""
     assert thash.ladder_for(torch.bfloat16) == (6, 4, 2, 0)  # k=6 is bf16's finest expressible
     assert max(thash.ladder_for(torch.float32)) == 22
     assert max(thash.ladder_for(torch.float64)) == 48
@@ -232,7 +227,7 @@ def test_ladder_depth_is_per_dtype():
     y.view(-1).view(torch.int32)[100] ^= 1  # 1 ULP == 2**-23 relative
     la, lb = thash.digest_ladder(x), thash.digest_ladder(y)
     assert la["full"] != lb["full"]
-    assert la["k22"] == lb["k22"]  # bounded below 2**-22, not "~2e-02"
+    assert la["k22"] == lb["k22"]  # bounded below 2**-22
 
 
 def test_gpu_equivalence_skip_gated():
@@ -339,25 +334,22 @@ def test_ladder_is_one_pass_but_equals_per_rung_digests():
 
 
 def test_segment_axis_is_first_non_unit_dim():
-    """P6: dim 0 is useless on the shapes the GDN door produces -- [1,T,H,D] is one segment."""
+    """Segmentation uses the first non-unit dim, so a [1,T,H,D] tensor is not one segment."""
     assert thash.segment_axis(torch.zeros(1, 64, 4, 8)) == 1
     assert thash.segment_axis(torch.zeros(64, 1, 2048)) == 0
     assert thash.segment_axis(torch.zeros(1, 1, 1)) == 0
     assert thash.segment_axis(torch.zeros(7)) == 0
     t = torch.randn(1, 64, 4, 8, dtype=torch.float32)
     segs = thash.segment_digests(t, rows_per_segment=16)
-    assert len(segs) == 4  # was 1 when dim 0 was segmented
+    assert len(segs) == 4
     b = t.clone()
     b[0, 40, 1, 3] += 1.0
     assert [i for i, (x, y) in enumerate(zip(segs, thash.segment_digests(b, rows_per_segment=16))) if x != y] == [2]
 
 
 def test_segment_index_means_the_same_slab_on_both_sides():
-    """Both sides slice their own first non-unit dim, so segment i is the same T-slab of tokens.
-
-    The digests themselves still fold the shape (that is what makes a shape difference its own
-    divergence kind), so this is about WHICH rows segment i covers, not about equal hex.
-    """
+    """Segment i covers the same token slab on both side layouts (about which rows, not equal
+    hex -- the digests still fold the shape)."""
     core = torch.randn(1, 32, 2, 4, dtype=torch.float32)  # trainer gdn.core door layout
     flat = core.reshape(32, 8)  # same tokens, engine-side layout
     a, b = core.clone(), flat.clone()

@@ -1,20 +1,6 @@
-"""The composition the rowinv leaf-tree logprob IS -- unconditionally, at all four sites.
-
-This was a flag test. ``SKYRL_ISOEXEC_ROWINV_LOGPROB`` is gone: the leaf-tree denominator is the
-composed default, so what is left to assert is not that a lever selects it but that nothing else
-can be selected. Two halves, both CPU:
-
-  * the CONTRACT: ``rowinv_leaftree`` at ALL FOUR sites (one function everywhere is the design),
-    FUNCTION-half at every one of them, carrying the leaves/block/accum pins, and no aten-order
-    entry anywhere in the composition. The aten impls stay REGISTERED -- they are still the
-    structural-decline fallback -- so this asserts the composition, not the registry;
-  * DETERMINISM: the same code composes the same identities every time. The hash-rotation test
-    that used to live here proved a one-sided flag flip could not hide; with no flag there is no
-    one-sided flip to catch, and the property that replaces it is that the two runtimes derive the
-    identical numerical_policy from identical code.
-
-Like test_manifest_qwen35, every composition test builds under a cleared environment so it asserts
-what the code composes, not whatever shell invoked it.
+"""The rowinv leaf-tree logprob is the composed default at all four sites, with no lever to select
+anything else. Asserts the composition (the aten impls stay registered as the structural-decline
+fallback) and that identical code composes identical identities. Builds under a cleared env.
 """
 
 import os
@@ -75,9 +61,7 @@ def test_rowinv_serves_all_four_sites_with_the_pins():
 def test_no_superseded_impl_survives_in_the_composition():
     """The aten-order denominator is unreachable by composition, at every site and both variants.
 
-    It is still REGISTERED (it is the structural-decline fallback), so the check that matters is
-    that nothing SELECTS it: a reintroduced branch would put trainer_score back on a schedule the
-    engine cannot reproduce, which is the exact defect rowinv exists to close.
+    A reintroduced branch would put trainer_score on a schedule the engine cannot reproduce.
     """
     for profile in (qwen3_5.PROFILE, qwen3_5.CPR_PROFILE):
         with _code_defaults():

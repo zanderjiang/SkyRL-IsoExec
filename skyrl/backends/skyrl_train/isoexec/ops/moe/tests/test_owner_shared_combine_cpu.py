@@ -1,10 +1,7 @@
-"""CPU/AOT proof obligations for the isolated exact shared+routed owner composition.
+"""CPU/AOT tests for the exact shared+routed owner composition.
 
-The live TP8 battery proves cross-rank bytes and performance.  These tests pin the part that is
-cheaper and stronger to prove before a GPU is free: the two balanced trees are the canonical
-left=lower-rank tree, all four bf16 rounding boundaries are present in the generated program, the
-compiler did not contract the shared multiply with the final add, and unsupported plumbing refuses
-instead of silently returning a different expression.
+They pin the canonical balanced trees, the four bf16 rounding boundaries in the generated
+program, the absence of fp contraction, and the fail-closed plumbing.
 """
 
 from __future__ import annotations
@@ -82,7 +79,7 @@ def _fp_ops(ptx: str) -> list[str]:
 
 
 def test_existing_routed_owner_source_is_not_modified():
-    """The experiment must not mutate the current production kernel family."""
+    """The shared-owner variant does not appear in the existing routed-owner kernel source."""
     assert OC._shared_owner_core(2, 2, True, True) not in OC._push_src(2, 2, True)
     assert "shared_root_bf" not in OC._push_src(8, 8, True)
 
@@ -104,16 +101,15 @@ def test_generated_source_pins_every_existing_rounding_boundary():
 def test_both_peer_folds_use_the_same_canonical_balanced_tree():
     routed = OC._named_tree_src(8, True, inp="rin", tmp="rt", base="rbase", indent="")
     shared = OC._named_tree_src(8, True, inp="sin", tmp="st", base="sbase", indent="")
-    # They are not two hand-written approximations: after renaming inputs/SSA/base, they are the
-    # same emitted schedule character for character.
+    # after renaming inputs/SSA/base the two schedules must match character for character
     normalized = routed.replace("rin", "sin").replace("rt", "st").replace("rbase", "sbase")
     assert normalized == shared
     assert routed.count("tl.load(") == 8
-    assert routed.count(" = rt") == 7  # seven tree additions over eight leaves
+    assert routed.count(" = rt") == 7  # seven additions over eight leaves
 
 
 def test_root_rounding_negative_control_has_teeth():
-    """A concrete population where moving the shared-root round changes one bf16 bit."""
+    """Negative control: moving the shared-root round changes one bf16 bit on this population."""
     words = torch.tensor(
         [-17751, -17670, 14873, -17612, 15207, -17567, 14798, -17682],
         dtype=torch.int16,
@@ -137,9 +133,8 @@ def test_sm90_machine_code_has_four_rounds_and_no_fma(world, k):
     asm = _compile(world, k)
     ptx = asm["ptx"]
     ops = _fp_ops(ptx)
-    # Frontend IR pins four explicit truncations.  PTX legally selects native bf16 mul/add for the
-    # last two; those instructions mean exactly "operate on bf16 operands and round to bf16", so
-    # counting only cvt.rn would incorrectly call a preserved round missing.
+    # TTIR pins four truncations; PTX may fold the last two into native bf16 mul/add, which round
+    # to bf16 themselves, so counting cvt.rn alone would miss them
     assert asm["ttir"].count("arith.truncf") == 4
     assert ops.count("mul.rn.bf16") == 8
     assert ops.count("add.rn.bf16") >= 8
@@ -188,8 +183,7 @@ def test_group_vote_is_required_and_cached(monkeypatch):
     monkeypatch.setattr(AR, "_agree", disagree)
     assert not OC.shared_owner_group_enabled(object(), torch.device("cpu"))
     assert votes == [True]
-    # The same process group may own 40 layers. It votes once, then every layer consumes the
-    # identical cached install decision without 39 extra collectives.
+    # a group votes once; every later layer reuses the cached decision with no extra collective
     assert not OC.shared_owner_group_enabled(object(), torch.device("cpu"))
     assert votes == [True]
     counts = OC.shared_owner_fusion_counts()
@@ -307,7 +301,7 @@ def test_memory_profile_provisions_persistent_pools_but_never_calls_candidate(mo
     def provision(*args):
         calls["provision"] += 1
         order.append("provision")
-        # Full live geometry, not a toy shape hidden from the memory profile.
+        # full live geometry, not a toy shape hidden from the memory profile
         assert args[0].numel() == T * k * routed.shape[-1]
         assert args[1].numel() == T * routed.shape[-1]
         return True, ""
@@ -336,8 +330,8 @@ def test_memory_profile_provisions_persistent_pools_but_never_calls_candidate(mo
     assert counts["profile_provisions"] == 1
     assert counts["profile_deferred"] == 2
 
-    # Leaving vLLM's peak-measurement scope does not silently admit the shape.  The next ordinary
-    # eager warmup performs the unchanged live reference/candidate compare and only then admits.
+    # leaving the profile scope must not admit the shape: the next eager warmup does the
+    # reference/candidate compare and only then admits
     monkeypatch.setattr(OC, "_owner_shared_combine", lambda *_args: reference.clone())
     got = OC._shared_owner_dispatch(*operands)
     assert torch.equal(got.view(torch.int16), reference.view(torch.int16))

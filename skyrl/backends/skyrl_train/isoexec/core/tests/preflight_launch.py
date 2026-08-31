@@ -1,16 +1,7 @@
-"""Launch-readiness gate: run immediately before a production launch, from the repo root.
+"""Launch-readiness gate, run from the repo root before a production launch.
 
-    python skyrl/backends/skyrl_train/isoexec/core/tests/preflight_launch.py
-
-Phase 1 runs the complete enforcement battery (every core/tests/test_*.py, each in its own
-subprocess, plus the contract leaf suite via unittest). Phase 2 builds the production contract
-under the run-script env (examples/isoexec/run_qwen35_dapo_isoexec.sh) and prints the four
-identity values plus the derived obligation counts. Any failure exits nonzero and prints
-PREFLIGHT: BLOCKED (<reason>); a clean run prints PREFLIGHT: READY.
-
-GPU safety: a production run may own this node's GPUs, so every child runs with
-CUDA_VISIBLE_DEVICES="" and core/arch.ARCH pointed at the production accelerator tag (sm90).
-Nothing here touches CUDA, processes, or Ray.
+Runs the full core/tests battery in subprocesses, then builds the production contract under the
+run-script env. Prints PREFLIGHT: READY, or PREFLIGHT: BLOCKED (<reason>) and exits nonzero.
 """
 
 import os
@@ -23,7 +14,7 @@ import time
 HERE = pathlib.Path(__file__).resolve()
 TEST_DIR = HERE.parent
 REPO = HERE.parents[6]
-RUN_SCRIPT = REPO / "examples/isoexec/run_qwen35_dapo_isoexec.sh"
+RUN_SCRIPT = REPO / "examples/train/isoexec/run_qwen35_dapo_isoexec.sh"
 LEAF_PKG = "skyrl/backends/skyrl_train/isoexec/contract/tests"
 PROD_ARCH = "sm90"
 
@@ -68,8 +59,8 @@ def _run_file(path):
 
 
 def _run_script_env():
-    """The run script's literal SKYRL_ISOEXEC_*/ISOEXEC_* exports; $-bearing values are listed as
-    skipped (they name node-local paths or derived vars, none of which enter the contract)."""
+    """The run script's literal SKYRL_ISOEXEC_*/ISOEXEC_* exports; $-bearing values are skipped
+    (node-local paths and derived vars, none of which enter the contract)."""
     applied, skipped = {}, []
     text = RUN_SCRIPT.read_text()
     for line in text.splitlines():

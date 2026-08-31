@@ -1,9 +1,8 @@
 """Static alignment gate between ops/*/_register.py claims and the colocated ops/*/tests/.
 
-Checks that (a) every ``bitwise_equal_to`` referent names an impl on the same op (FAILS otherwise,
-minus the documented external-baseline allowlist), (b) every equivalence claim has a colocated test
-naming the claiming impl id, and (c) every declared hazard is referenced in the family's tests.
-(b)/(c) are report-only until ``_STRICT_COVERAGE`` is flipped. CPU-only, no kernel imports.
+(a) every ``bitwise_equal_to`` referent names an impl on the same op (hard-fails, minus the
+allowlist); (b) every claim has a colocated test; (c) every hazard is referenced in the family's
+tests. (b)/(c) are report-only until ``_STRICT_COVERAGE`` is flipped.
 """
 
 from __future__ import annotations
@@ -24,17 +23,14 @@ _OPS_DIR = pathlib.Path(__file__).resolve().parents[2] / "ops"
 # Flip to True once every claim has a colocated test and every hazard is referenced.
 _STRICT_COVERAGE = False
 
-# bitwise_equal_to referents that deliberately name an UPSTREAM baseline, not a registered impl.
-# Each entry is itself a standing finding: the claim is proven against code this repo does not
-# register (megatron's stock non-fused ``sort_chunks_by_idxs`` cat/chunk loop), so no registry
-# cross-check can validate it -- only the colocated bitwise battery can. Remove an entry to make
-# the corresponding claim hard-fail.
+# bitwise_equal_to referents that name an upstream baseline, not a registered impl: no registry
+# cross-check can validate these, only the colocated bitwise battery. Remove an entry to hard-fail.
 _EXTERNAL_BASELINES = {
     ("moe.dispatch", "chunk_sort_gather", "megatron_cat_chunk_loop"),
 }
 
-# String-level hazard spellings accepted as "this test talks about that hazard". Deliberately
-# narrow: the point is greppability from claim to test, not proof of exercise (the tests own that).
+# Hazard spellings accepted as "this test talks about that hazard": greppability from claim to
+# test, not proof of exercise.
 _HAZARD_ALIASES = {
     "null_lanes": ("null_lanes", "null lanes", "null_row", "null row", "null_block", "NULL lane"),
     "t_zero": ("t_zero", "T=0", "T = 0", "t == 0"),

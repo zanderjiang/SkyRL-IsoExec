@@ -1,12 +1,8 @@
 """The single flag / override table, and the forwarding channels that carry each flag.
 
-A flag that reaches one runtime but not the other is a split-brain composition, so every env
-override is catalogued here with its code default, the sides that READ it, the channels that
-currently forward it, and its manifest disposition: FUNCTION moves bits and becomes a hashed
-manifest entry, DEPLOYMENT is proven bitwise-neutral and is logged but not hashed, DIAGNOSTIC is
-never a manifest entry, and DEAD is a tombstone for a name nothing reads any more. ``default`` is
-the literal the CODE falls back to when the variable is unset; set ``default_dynamic=True`` when it
-is computed and record the resolved value in ``notes``.
+A flag reaching one runtime but not the other is a split-brain composition, so every env override
+is catalogued with its code default, reading sides, forwarding channels and manifest disposition.
+``default`` is the literal the CODE falls back to; use ``default_dynamic`` when it is computed.
 """
 
 from __future__ import annotations
@@ -21,7 +17,7 @@ DIAGNOSTIC = "diagnostic"
 DEAD = "dead"
 
 # The three forwarding channels: two Ray-actor allowlists plus ``ISOEXEC_VLLM_ENV``, a dict applied
-# in-process before vLLM init (the engine gets num_splits=1 and friends through THAT, not ENGINE).
+# in-process before vLLM init.
 TRAIN = "train"  # skyrl/train/utils/utils.py  (colocated path; reaches all actors)
 ENGINE = "engine"  # skyrl/backends/skyrl_train/inference_engines/utils.py (engine path)
 VLLM_ENV = "vllm_env"  # runtimes/vllm/vllm_patches.py ISOEXEC_VLLM_ENV
@@ -31,9 +27,8 @@ VLLM_ENV = "vllm_env"  # runtimes/vllm/vllm_patches.py ISOEXEC_VLLM_ENV
 class Flag:
     """One env override.
 
-    ``sides`` is which runtimes READ the value -- a flag read on a side that never receives it is
-    inert there. ``forwarded_by`` is the current forwarding reality, while ``should_forward`` is
-    whether the flag needs forwarding to be correct at all.
+    ``sides`` is which runtimes READ the value; ``forwarded_by`` is the current forwarding reality,
+    while ``should_forward`` is whether the flag needs forwarding to be correct at all.
     """
 
     name: str
@@ -48,8 +43,7 @@ class Flag:
 
     @property
     def is_latent_split_brain(self) -> bool:
-        """True when the flag needs forwarding but no channel forwards it, so a launch-shell value
-        never reaches the process that reads it."""
+        """True when the flag needs forwarding but no channel forwards it."""
         return self.should_forward and not self.forwarded_by
 
 
@@ -1635,9 +1629,8 @@ FLAGS: List[Flag] = [
         notes="Installed on both runtimes. The two forms are bitwise-equal, so the only difference is speed: the "
         "masked_select it replaces has a data-dependent, uncapturable shape.",
     ),
-    # A flag absent from this table is in neither actor allowlist, so exporting it from a launch
-    # shell sets a variable only the launcher process ever sees. Every governed env read therefore
-    # has an entry here, with the channel its readers actually live on.
+    # A flag absent from this table is in neither actor allowlist, so a launch-shell export reaches
+    # only the launcher process. Every governed env read owes an entry here.
     #
     # Trainer-side kill switches read inside the policy actor.
     Flag(
@@ -1975,9 +1968,8 @@ FLAGS: List[Flag] = [
 def actor_forwarding_list(channel: str | None = None) -> List[str]:
     """The flag names this table says a channel forwards, sorted and de-duplicated.
 
-    With a ``channel``, every flag whose ``forwarded_by`` contains it, including ``SKYRL_ISOEXEC``.
-    With ``channel=None``, every flag that needs forwarding to be correct, minus ``SKYRL_ISOEXEC``,
-    which gates the whole loop rather than sitting in it.
+    ``channel=None`` gives every flag needing forwarding minus ``SKYRL_ISOEXEC``, which gates the
+    whole loop rather than sitting in it.
     """
     if channel is not None:
         return sorted({f.name for f in FLAGS if channel in f.forwarded_by})
@@ -1985,8 +1977,7 @@ def actor_forwarding_list(channel: str | None = None) -> List[str]:
 
 
 # Flags forwarded by a direct ``env_vars["X"] = ...`` assignment rather than the generic allowlist
-# loop: SKYRL_ISOEXEC gates the whole block, FLA_TILELANG is set in the megatron branch, and the
-# NCCL pins are gated on the pin. ``actor_forwarding_tuple``, the loop's iterable, excludes them.
+# loop; ``actor_forwarding_tuple``, the loop's iterable, excludes them.
 _DIRECT_FORWARDS = frozenset(
     {
         "SKYRL_ISOEXEC",
@@ -1999,11 +1990,7 @@ _DIRECT_FORWARDS = frozenset(
 
 
 def actor_forwarding_tuple(channel: str) -> List[str]:
-    """Flags forwarded by a channel's generic loop.
-
-    Direct assignments are excluded. Trainer and inference environment builders consume this
-    tuple, and the derivation test checks those consumers against the catalog.
-    """
+    """Flags forwarded by a channel's generic loop; direct assignments are excluded."""
     return sorted(set(actor_forwarding_list(channel)) - _DIRECT_FORWARDS)
 
 

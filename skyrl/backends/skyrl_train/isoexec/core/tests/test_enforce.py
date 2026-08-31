@@ -1,9 +1,8 @@
 """The obligation ledger: plan derivation, completeness at boundaries, severity, exceptions,
 the verdict artifact, and the install-attestation handshake extension.
 
-The architecture's own negative control lives here: a reporter that never runs must surface as a
-``missing`` violation at the phase close -- the property that kills the silent-inert class the
-enforcement audit measured (a check that never ran was indistinguishable from a passing one).
+The negative control: a reporter that never runs must surface as a ``missing`` violation at the
+phase close, so a check that never ran is distinguishable from a passing one.
 """
 
 import json
@@ -77,9 +76,7 @@ def _report_phase(plan, phase, result="ok"):
 
 
 def test_plan_derivation_complete_and_deterministic():
-    # trainer gained a key when rowinv became the composed logprob: one function at all four
-    # sites means the training forward now has a logprob case where the aten-order composition
-    # declared none.
+    # The trainer's extra key is the training forward's logprob case, which rowinv covers.
     for side, n_keys in (("trainer", 30), ("engine", 40)):
         p1 = enforce.derive_obligation_plan(_CONTRACT, _REG, side)
         p2 = enforce.derive_obligation_plan(_CONTRACT, _REG, side)
@@ -228,7 +225,7 @@ def test_handshake_reporter_and_weight_sync_close():
 
 def test_installed_backstop_refuses_missing_key():
     with _fresh():
-        # Complete trainer install -> the backstop (audit finding (b), now wired) passes.
+        # Complete trainer install -> the backstop passes.
         for op, site in pc.cached_contract_view():
             if site.startswith("trainer"):
                 fp.record_install(op, site, "x")
@@ -253,10 +250,8 @@ def test_gate_reporter():
         assert tu.validate_isoexec_forward_gate(good, enabled=True, scoring_audit_skipped=False) is True
         recs = enforce.ledger().records["gate:engine_decode|trainer_score"]
         assert recs[-1].result == "ok"
-        # rowinv is the composed logprob, so its served obligations are REFUSE-severity on every
-        # composition and must be reported before STEP1 can close (test_rowinv_engagement.py owns
-        # the refusal path itself). With those and the gate ok, STEP1 closes green; unserved
-        # counters log, never refuse.
+        # rowinv's served obligations are REFUSE-severity and must be reported before STEP1 can
+        # close (test_rowinv_engagement.py owns the refusal path itself).
         for case in ("trainer_fwd", "trainer_score"):
             enforce.report(f"served:logprobs.log_softmax:{case}", enforce.STEP1, enforce.OK, "test census")
         assert enforce.close_phase(enforce.STEP1, "trainer") is True
@@ -352,8 +347,7 @@ def test_contract_path_is_a_registered_flag():
 def test_phantom_entry_is_gone():
     # An identity-hashed entry with no impl, installer, or check anywhere.
     assert not _REG.has_op("attention.qwen35_context_layout")
-    # 28, not 29: the two aten-order logprob entries (trainer_score + the engine twin) collapsed
-    # into the single rowinv entry that covers all four sites.
+    # 28: the two aten-order logprob entries collapsed into one rowinv entry covering four sites.
     assert len(_CONTRACT.composition) == 28
     assert all("attention.qwen35_context_layout" not in e.region for e in _CONTRACT.composition)
 
@@ -412,8 +406,7 @@ def test_strict_still_refuses_the_same_boundary_without_debug_trace():
 
 
 def test_all_skipped_refuse_obligation_does_not_close_green():
-    # An unexplained skip discharges nothing: silent inertness reached through ``skipped``
-    # rather than through absence.
+    # An unexplained skip discharges nothing -- silent inertness via ``skipped`` rather than absence.
     with _fresh():
         os.environ[STRICT_ENV] = "1"
         os.environ.pop(DEBUG_ENV, None)
@@ -447,8 +440,8 @@ def test_unrecognized_skip_reason_on_the_same_obligation_refuses():
 
 
 def test_zero_runtime_facts_cannot_close_install_clean():
-    # C7b: an adapter that obtains no topology fact leaves every domain_check a skip, which used to
-    # close INSTALL green. An axis nobody could read is not a recognized reason.
+    # An adapter that obtains no topology fact leaves every domain_check a skip; an axis nobody
+    # could read is not a recognized skip reason.
     from skyrl.backends.skyrl_train.isoexec.core import adapter as ad
 
     with _fresh():
@@ -555,11 +548,10 @@ def test_close_phase_internal_error_leaves_a_record_not_only_a_log():
 
 
 def test_step1_boundary_is_a_no_op_without_a_contract():
-    """The gate's only STEP1 call site is the CONTROLLER, which builds no contract.
+    """The controller builds no contract, so its STEP1 call must not close an empty plan.
 
-    An unguarded close there judged an empty plan -- enforcing nothing -- and then rewrote the
-    verdict artifact from an empty ledger, which is how a trainer worker's green file replaced the
-    engine's recorded RED. No plan, no close, no artifact.
+    An unguarded close there rewrites the verdict artifact from an empty ledger, turning a
+    recorded RED green.
     """
     with _fresh():
         pc._CONTRACT, pc._VIEW = None, None
@@ -596,8 +588,7 @@ def test_step1_boundary_closes_green_on_a_clean_gate():
 def test_red_gate_refuses_the_step1_close_strict_and_demotes_under_debug():
     """The RED gate goes through ``enforce.refuse``: identical strict behavior, demoted in debug.
 
-    Either way the ledger record is a violation, so the STEP1 close refuses on the record rather
-    than on the call site -- which is what makes the demoted (traced) run's artifact just as red.
+    Either way the ledger record is a violation, so the demoted run's artifact is just as red.
     """
     from skyrl.train.utils import trainer_utils as tu
 
@@ -624,10 +615,8 @@ def test_red_gate_refuses_the_step1_close_strict_and_demotes_under_debug():
 
 
 def test_two_ledgers_in_one_directory_both_survive_and_red_stays_red():
-    """Sixteen workers share the contract directory, so one filename is last-writer-wins: an
-    engine-recorded RED handshake verdict gets replaced by a trainer worker's later green write.
-    Per-process names + a glob merge keep both.
-    """
+    """Workers share the contract directory, so one filename would be last-writer-wins and a
+    trainer's green write would replace an engine RED. Per-process names + a glob merge keep both."""
     with _fresh():
         with tempfile.TemporaryDirectory() as d:
             os.environ["ISOEXEC_CONTRACT_PATH"] = os.path.join(d, "contract.json")

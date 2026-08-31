@@ -1,27 +1,8 @@
 """CPU-side guarantees for the pik small-M leaf paths (batched leaves / fused leaf-tree).
 
-The GPU halves -- per-shape admission bit-compares and the full sweep -- live in
-the private repo's nightly ``pik_fused_leafgemm_battery.py``. What CAN be pinned down without a
-GPU, and therefore in CI, is pinned here:
-
-  1. The FOLD ALGEBRA. The sequential fp32 path materializes PAIR SUMS (the cuBLASLt beta=1
-     trick) and folds pairs with ``combine_order(m/2)``; the batched path materializes RAW
-     LEAVES and folds them with ``combine_order(m)``; the fused CUDA kernel folds leaves with
-     a binary-counter carry walk. All three must be the SAME expression tree -- proven here by
-     evaluating all three schedules on identical adversarial fp32 values and comparing
-     bitwise (torch.equal on fp32, CPU IEEE adds -- exactly the adds the GPU fold performs).
-
-  2. The FLAG WIRING. Both path flags and both M-gates must exist in the census with the
-     shipped defaults and must be forwarded on BOTH Ray-actor channels: an unregistered env
-     var is None inside every worker (the silent no-op trap), and pik runs in the trainer
-     worker AND the vLLM engine worker.
-
-``pik/plan.py`` is loaded by file path: importing the ``pik`` package pulls ``pik.gemm``,
-whose Triton autotune decorators query the GPU at import -- plan.py itself is pure Python.
-
-Run (CPU only):
-    uv run --isolated --extra dev python -m pytest \
-        skyrl/backends/skyrl_train/isoexec/ops/collectives/tests/test_pik_smallm_leaf_paths.py -q
+Pins the fold algebra -- the sequential, batched and fused schedules must be the same expression
+tree, bit for bit -- and the flag wiring. ``pik/plan.py`` is loaded by file path because
+importing the ``pik`` package pulls Triton autotune decorators that query the GPU.
 """
 
 from __future__ import annotations
@@ -33,7 +14,7 @@ import sys
 import torch
 
 _HERE = pathlib.Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parents[7]))  # the repo root (parents[6] is the skyrl package itself)
+sys.path.insert(0, str(_HERE.parents[7]))  # repo root
 
 from skyrl.backends.skyrl_train.isoexec.core import flags  # noqa: E402
 
@@ -61,7 +42,7 @@ def test_leaf_fold_equals_pair_fold_bitwise():
         for seed in range(8):
             leaves = _adversarial_leaves(m, seed=seed)
 
-            # schedule A -- the sequential fp32 path: beta=1 pair sums, then tree over pairs
+            # schedule A: sequential fp32 -- beta=1 pair sums, then tree over pairs
             pairs = [leaves[2 * j] + leaves[2 * j + 1] for j in range(m // 2)]
             if m == 2:
                 root_a = pairs[0]
@@ -71,13 +52,13 @@ def test_leaf_fold_equals_pair_fold_bitwise():
                     slots[dst] = slots[lhs] + slots[rhs]
                 root_a = slots[0]
 
-            # schedule B -- the batched path: raw leaves, tree over leaves
+            # schedule B: batched -- raw leaves, tree over leaves
             slots = list(leaves)
             for dst, lhs, rhs in plan.combine_order(m):
                 slots[dst] = slots[lhs] + slots[rhs]
             root_b = slots[0]
 
-            # schedule C -- the fused kernel's in-register fold: binary-counter carries
+            # schedule C: fused kernel's in-register fold -- binary-counter carries
             stack: dict[int, torch.Tensor] = {}
             for j, leaf in enumerate(leaves):
                 acc, lvl, tz = leaf, 0, j

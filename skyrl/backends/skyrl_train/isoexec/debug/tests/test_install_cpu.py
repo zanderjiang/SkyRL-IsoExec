@@ -1,11 +1,7 @@
 """The hook table covers the registry, and every door in it resolves or is explained.
 
-Coverage is a table, so what has to be pinned is the table's relationship to the registry:
-every registry region is either hooked with named doors or listed
-in ``NOT_HOOKED`` with a reason, and nothing drifts out of that partition silently.
-
-Run:
-    python -m pytest skyrl/backends/skyrl_train/isoexec/debug/tests/test_install_cpu.py
+Pins the partition: every registry region is either hooked with named doors or listed in
+``NOT_HOOKED`` with a reason. Also covers door installation shape and layer-context hooks.
 """
 
 from __future__ import annotations
@@ -121,7 +117,7 @@ def _uninstall_everything():
 
 
 def test_layer_context_needs_no_recording_of_its_own():
-    """The engine's old post-out_proj door recorded a tensor the trainer never produces."""
+    """Layer-context hooks set context only and emit no trace records of their own."""
     d = tempfile.mkdtemp(prefix="ix-lay-")
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):
@@ -134,7 +130,7 @@ def test_layer_context_needs_no_recording_of_its_own():
                 lay.forward()
             trace.flush()
             files = list(pathlib.Path(d).glob("*.jsonl"))
-            assert not files or not files[0].read_text().strip()  # context only, no records
+            assert not files or not files[0].read_text().strip()
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -154,11 +150,7 @@ class _StaticDoor:
 
 
 def test_staticmethod_door_stays_a_staticmethod():
-    """``getattr`` unwraps the descriptor, which would rebind the door as an instance method.
-
-    The engine then calls ``self.compute_logprobs(logits)``, the wrapper receives ``self`` as its
-    only positional argument, and vLLM dies with a TypeError at the first sample.
-    """
+    """Wrapping a staticmethod door keeps it a staticmethod, so it is not rebound as a method."""
     d = tempfile.mkdtemp(prefix="ix-static-")
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer"}):
@@ -166,7 +158,7 @@ def test_staticmethod_door_stays_a_staticmethod():
             assert holder is _StaticDoor and isinstance(cur, staticmethod)
             assert install._install_door("norms.rms", __name__, "_StaticDoor.compute", True, {})
             assert isinstance(_StaticDoor.__dict__["compute"], staticmethod)
-            # The door is live and still takes exactly its own argument, through the instance too.
+            # live, and still takes only its own argument -- through the instance too
             assert _StaticDoor.compute(torch.zeros(2)).tolist() == [1.0, 1.0]
             assert _StaticDoor().compute(torch.zeros(2)).tolist() == [1.0, 1.0]
             trace.flush()
@@ -178,12 +170,8 @@ def test_staticmethod_door_stays_a_staticmethod():
 
 
 def test_layer_context_walks_a_virtual_pipeline_chunk_list():
-    """The megatron worker's ``model_fn`` returns a LIST of chunks, which has no ``.decoder``.
-
-    A list produces zero layer-context hooks unless it is walked, leaving the trainer on
-    ``layer_src="call_order"`` with per-layer keys that do not align with the engine's module
-    indices. ``layer_number`` is global across chunks, so a flat walk is correct.
-    """
+    """A list of pipeline chunks (no ``.decoder``) is walked flat; ``layer_number`` is global
+    across chunks, so the resulting indices are contiguous."""
     from types import SimpleNamespace
 
     d = tempfile.mkdtemp(prefix="ix-vp-")
@@ -194,7 +182,7 @@ def test_layer_context_walks_a_virtual_pipeline_chunk_list():
                 layers = [SimpleNamespace(layer_number=n, forward=lambda *a, **k: None) for n in numbers]
                 return SimpleNamespace(decoder=SimpleNamespace(layers=layers))
 
-            # Wrapped the way the megatron worker holds them: DDP(Float16Module(GPTModel)).
+            # wrapped as the megatron worker holds them: DDP(Float16Module(GPTModel))
             def _wrapped(numbers):
                 return SimpleNamespace(module=SimpleNamespace(module=_chunk(numbers)))
 

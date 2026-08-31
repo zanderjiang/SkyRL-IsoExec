@@ -1,10 +1,7 @@
 """Op / impl registration: the registry the composition manifest resolves against.
 
-An op's identity is its rounding schedule, so this makes "the same function at every site" a
-declared, machine-checkable object. Sites and hazards come from controlled vocabularies, an impl's
-rounding schedule is split into a machine-assertable half (which is also the set of pins a manifest
-may hand it) and a documentary half, and ``subsumes`` tells the adapter which sub-ops a fused impl
-absorbs. The manifest has no layer dimension: an op is assumed to resolve identically at every layer.
+An op's identity is its rounding schedule; sites and hazards come from controlled vocabularies.
+The manifest has no layer dimension: an op resolves identically at every layer.
 """
 
 from __future__ import annotations
@@ -12,8 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
-# The common site vocabulary. An op declares only the sites it has; absence of a site means the op
-# has no such site, never a default. Open set: ``register_site`` extends it.
+# The common site vocabulary; absence of a site means the op has no such site, never a default.
+# Open set: ``register_site`` extends it.
 _BASE_SITES = frozenset(
     {
         "trainer_fwd",  # checkpoint forward (no-grad) plus its grad-enabled recompute
@@ -23,8 +20,7 @@ _BASE_SITES = frozenset(
     }
 )
 
-# The hazard vocabulary. A test that declares one of these must prove it actually fired, or the
-# pass is vacuous.
+# The hazard vocabulary. A test that declares one must prove it actually fired.
 HAZARDS = frozenset(
     {
         "null_lanes",  # NULL / padded lanes (graph-replay inertness)
@@ -40,8 +36,7 @@ HAZARDS = frozenset(
 
 
 class RegistryError(ValueError):
-    """Raised on any registry-vocabulary violation: unknown site, unknown hazard, duplicate
-    op/impl, or an impl whose declared sites are not a subset of the op's sites."""
+    """Raised on any registry-vocabulary violation."""
 
 
 # Contract route vocabulary, kept literal so this module stays standalone.
@@ -49,11 +44,9 @@ _ROUTES = frozenset({"reference_preserving", "composition_defining", "protected"
 
 
 class _PerModel:
-    """Sentinel for a ``machine_assertable`` key that the impl declares but whose value is a model
-    fact supplied by the manifest pin.
+    """A declared ``machine_assertable`` key whose value is a model fact supplied by the pin.
 
-    Not the same as omitting the key: an omitted key means the impl knows nothing about that pin,
-    and ``Manifest.validate_pins`` refuses a pin the impl never declared.
+    Distinct from omitting the key, which makes ``validate_pins`` refuse the pin outright.
     """
 
     __slots__ = ()
@@ -66,12 +59,7 @@ PER_MODEL = _PerModel()
 
 
 class OneOf:
-    """A ``machine_assertable`` value constrained to an enumerated set.
-
-    Between ``PER_MODEL`` (any value) and a literal (exactly one): the impl is reachable under
-    several pinned values and no others, so a manifest pinning anything else names a function that
-    will never install.
-    """
+    """A ``machine_assertable`` value constrained to an enumerated set."""
 
     __slots__ = ("values",)
 
@@ -88,9 +76,8 @@ class OneOf:
 def pin_values_equal(a, b) -> bool:
     """Equality for a declared schedule value vs a manifest pin.
 
-    Sequence-insensitive, because a manifest round-trips through JSON and a declared tuple arrives
-    as a list, and bool-strict, so a pin of ``1`` against a declared ``True`` is a mismatch. Public
-    because the install fingerprint compares recorded pins against the contract's by the same rule.
+    Sequence-insensitive (JSON turns a declared tuple into a list) and bool-strict (``1`` never
+    equals ``True``).
     """
     if isinstance(a, bool) != isinstance(b, bool):
         return False
@@ -105,23 +92,17 @@ def pin_values_equal(a, b) -> bool:
 class RoundingSchedule:
     """An impl's rounding schedule as data, split by checkability.
 
-    ``machine_assertable`` holds structural facts a debug run can assert at the op boundary
-    (boundary dtypes, autotune pin index, block sizes, constexpr values); each value is a literal,
-    ``PER_MODEL``, or ``OneOf(...)``, and the declared keys are exactly the pins the impl accepts.
-    ``documentary`` is free text that still moves bits -- reduction orders, formula variants. A
-    change to either half is a new impl version, and therefore a new composition hash.
+    ``machine_assertable`` values are literals, ``PER_MODEL`` or ``OneOf(...)``, and its keys are
+    exactly the pins the impl accepts. A change to either half is a new impl version.
     """
 
     machine_assertable: Dict[str, object] = field(default_factory=dict)
     documentary: str = ""
 
     def check_pin(self, key: str, value) -> Optional[str]:
-        """Judge one manifest pin against this schedule; ``None`` means consistent.
+        """Judge one manifest pin against this schedule; ``None`` means consistent, else the reason.
 
-        Otherwise the reason, which the caller prefixes with the (op, site) and the model. An
-        undeclared key is refused because a pin the impl never declared hashes and cross-matches
-        while constraining nothing; a contradicted value means the manifest names a function the
-        impl does not implement.
+        An undeclared key is refused: such a pin hashes and cross-matches while constraining nothing.
         """
         if key not in self.machine_assertable:
             return (
@@ -144,9 +125,8 @@ class RoundingSchedule:
 class StateInvalidation:
     """The rebind contract for a stateful op.
 
-    ``condition`` describes what invalidates the state; ``hook(state, ctx) -> bool`` is the
-    host-only, capture-safe check the adapter runs every forward, returning True while the state is
-    still valid.
+    ``hook(state, ctx) -> bool`` is the host-only, capture-safe check the adapter runs every
+    forward, returning True while the state is still valid.
     """
 
     condition: str
@@ -157,11 +137,9 @@ class StateInvalidation:
 class ImplSpec:
     """A single implementation of an op, at a pinned version.
 
-    ``version`` is bumped on any rounding-schedule change. ``supported_archs`` is matched against
-    the manifest's arch. ``capabilities`` are what the impl permits: ops declare capabilities,
-    models declare choices, the adapter enforces compatibility. ``subsumes`` names the ops this
-    impl absorbs, which is what lets the adapter route them to passthrough. ``hazards`` is the floor
-    of hazards this impl's parity tests must exercise.
+    ``version`` is bumped on any rounding-schedule change. ``subsumes`` names the ops this impl
+    absorbs, which the adapter routes to passthrough; ``hazards`` is the floor its parity tests
+    must exercise.
     """
 
     impl_id: str
@@ -192,9 +170,8 @@ class ImplSpec:
 class OpSpec:
     """A mathematical function with a pinned rounding schedule, packaged as one op.
 
-    ``sites`` are the sites this op has; declaring one here is what licenses a manifest entry for
-    (name, site), and an unlisted site means "no such site". An op whose sites do not all resolve
-    to one impl must carry an equivalence proof, which is enforced downstream of the registry.
+    Declaring a site licenses a manifest entry for (name, site); an unlisted site means "no such
+    site". An op whose sites do not all resolve to one impl must carry an equivalence proof.
     """
 
     name: str
@@ -211,8 +188,7 @@ class OpSpec:
 
 
 class Registry:
-    """The site vocabulary and the op/impl table. Both runtimes build the same registry -- it is
-    code, delivered in the package -- and the manifest then selects from it."""
+    """The site vocabulary and the op/impl table the manifest selects from."""
 
     def __init__(self) -> None:
         self._sites = set(_BASE_SITES)
@@ -256,13 +232,11 @@ class Registry:
         return dict(self._ops)
 
     def installed_keys(self) -> frozenset:
-        """The (op, site) pairs this registry declares: the universe a manifest must name exactly,
-        since every installed key carries an explicit entry and absence never means "default"."""
+        """The (op, site) pairs this registry declares; a manifest must name them exactly."""
         return frozenset((op.name, site) for op in self._ops.values() for site in op.sites)
 
     def assert_subsumption_closed(self) -> None:
-        """Every op named in an impl's ``subsumes`` must itself be registered, or the adapter cannot
-        derive its passthrough."""
+        """Every op named in an impl's ``subsumes`` must itself be registered."""
         for op in self._ops.values():
             for impl in op.impls.values():
                 for sub in impl.subsumes:

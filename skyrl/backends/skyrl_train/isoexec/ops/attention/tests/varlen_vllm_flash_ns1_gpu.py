@@ -1,8 +1,7 @@
 """Bitwise gate for attention.varlen: vllm_flash_ns1 == varlen_custom at the registered pins.
 
-Runs vLLM's flash_attn_varlen_func(num_splits=1, fa_version=3, causal) and torch's
-varlen_attn(num_splits=1, window=(-1,0), FA3) on identical varlen batches (GQA, decode-length
-rows, non_contiguous operands) and asserts torch.equal. One GPU, seconds.
+Asserts torch.equal between vLLM's flash_attn_varlen_func and torch's varlen_attn on identical
+varlen batches, both at num_splits=1 / FA3 / causal.
 """
 
 import os

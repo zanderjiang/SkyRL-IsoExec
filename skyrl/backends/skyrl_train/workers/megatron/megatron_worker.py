@@ -1110,12 +1110,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         """
         Initialize the model, optimizer, and scheduler for the policy worker.
         """
-        # isoexec Phase 2: the ContractAdapter drives the trainer's enforcement sequence -- build
-        # the composition contract (fail-soft, as before), check EVERY contract claim against the
-        # deployed trainer facts, run the install path below, close the INSTALL boundary. Both
-        # runtimes build the SAME complete (op,site)->impl contract from the same code+model+arch,
-        # so their identities match by construction; a differing [ISOEXEC-CONTRACT] hash across the
-        # two process logs is a composition split-brain (the #1 failure mode).
+        # isoexec Phase 2: the ContractAdapter drives the trainer's enforcement sequence (build,
+        # check claims, install, close). Both runtimes build the SAME (op,site)->impl contract, so
+        # a differing [ISOEXEC-CONTRACT] hash across the two process logs is a split-brain.
         if os.environ.get("SKYRL_ISOEXEC"):
             # NCCL pin A/B EVIDENCE, read from the WORKER's own environment (the ray runtime env is
             # what the driver *asked* for; this is what the process actually got, which is the only
@@ -1350,12 +1347,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # ProcessGroupNCCL option reads back exactly, and the measured non-torch charge fits.
             self.strategy.verify_nccl_channels(_nccl_prewarm_report)
 
-        # run_install: contract build (fail-soft) -> check_all_claims (REFUSING, strict default:
-        # a topology outside the claims must stop the run, not warn into it) -> the install path
-        # above -> INSTALL boundary of the obligation ledger (every check the contract derives for
-        # the trainer side must have a record by the end of init_model -- a required check that
-        # never ran refuses here as loudly as one that failed). Refusals propagate; internal
-        # ledger errors never do.
+        # run_install: contract build (fail-soft) -> check_all_claims (refusing) -> the install
+        # path above -> INSTALL ledger boundary, where a required check that never ran refuses as
+        # loudly as one that failed. Refusals propagate; internal ledger errors never do.
         if os.environ.get("SKYRL_ISOEXEC"):
             from skyrl.backends.skyrl_train.isoexec.core.adapter import (
                 set_process_adapter,
@@ -1542,9 +1536,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 )
 
                 _native = gdn_native_kernels_enabled() and (recurrent_mode() or cpr_mode())
-                # The pin carries the kernel the native impl runs: `native_fused_sigmoid` alone
-                # cannot distinguish a recurrent build from a cpr one, and the contract
-                # pins exactly that.
+                # The pin carries the kernel: `native_fused_sigmoid` alone cannot distinguish a
+                # recurrent build from a cpr one, and the contract pins exactly that.
                 record_installs(
                     "gdn.core",
                     TRAINER_SITES,
@@ -1554,11 +1547,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 record_installs("gdn.conv", TRAINER_SITES, "causal_conv1d_fn")
 
             # -- logprobs -------------------------------------------------------------------------
-            # The leaf-tree impl is one function at BOTH trainer sites, unconditionally. Record
-            # what this process will actually arm, never what the contract asked for: a missing
-            # module means the model_utils hook shim declines every call, so the incumbent serves
-            # and NOT_INSTALLED is what gets recorded (the contract still names rowinv, and the
-            # fingerprint comparator is what makes that disagreement visible).
+            # Records what this process will actually arm, never what the contract asked for: with
+            # the module missing the shim declines every call, so NOT_INSTALLED is recorded and the
+            # fingerprint comparator makes the disagreement with the contract visible.
             try:
                 import skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv  # noqa: F401
 
@@ -2242,13 +2233,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # offload state machine is unaffected.
             _ix_grads_parked = False
             if os.environ.get("SKYRL_ISOEXEC") == "1":
-                # Rowinv ENGAGEMENT boundary (trainer side), before the expensive extraction: a
-                # contract that selects rowinv_leaftree while this process's census never served
-                # it must refuse at the first post-step sync, not after hours of one-sided
-                # composition (contract hashes MATCH in that failure -- both sides carry the flag,
-                # only one executes). Exact no-op while the flag is off; the init sync (no forward
-                # has run yet) is granted inside the boundary. Deliberate refusals propagate;
-                # everything else is fail-safe inside the call.
+                # Rowinv engagement boundary (trainer side), before the expensive extraction. The
+                # contract hashes MATCH in the failure it catches: both sides carry the flag, only
+                # one executes. Deliberate refusals propagate; everything else is fail-safe.
                 from skyrl.backends.skyrl_train.isoexec.core.enforce import (
                     rowinv_engagement_boundary,
                 )

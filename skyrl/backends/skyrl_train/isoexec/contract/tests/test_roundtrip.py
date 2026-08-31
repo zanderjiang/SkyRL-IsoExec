@@ -68,8 +68,7 @@ class TestRoundTrip(unittest.TestCase):
         d["schema_version"] = "1"
         with self.assertRaises(SerializationError) as cm:
             from_canonical_json(json.dumps(d).encode())
-        # ...and say which versions it does read and how to get one, since the reader is holding an
-        # artifact and has no other way to learn either.
+        # ...and name the versions it does read, plus how to get one.
         msg = str(cm.exception)
         self.assertIn("['2']", msg)
         self.assertIn("rebuild the contract", msg)

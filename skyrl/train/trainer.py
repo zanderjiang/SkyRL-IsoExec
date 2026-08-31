@@ -464,9 +464,8 @@ class RayPPOTrainer:
                             self.all_metrics["policy/rollout_train_logprobs_abs_diff_mean"],
                             self.all_metrics["policy/rollout_train_logprobs_abs_diff_max"],
                         )
-                        # The gate is the only STEP1 reporter, so this is the phase's boundary. It
-                        # is a no-op in a process with no obligation plan (the controller builds no
-                        # contract); armed processes get the full completeness close.
+                        # The gate is the only STEP1 reporter, so this is the phase's boundary.
+                        # No-op in a process with no obligation plan.
                         isoexec_step1_boundary()
                     elif os.environ.get("SKYRL_ISOEXEC") == "1":
                         logger.info(

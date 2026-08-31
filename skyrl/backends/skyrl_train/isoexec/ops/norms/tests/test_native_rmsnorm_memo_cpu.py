@@ -1,28 +1,7 @@
 """CPU guarantees for the ``_native`` RMSNorm admission memo (``ops/norms/native_rmsnorm_memo.py``).
 
-The lever memoizes exactly two functions inside torch's own predicate,
-``torch._native.ops.norm.rmsnorm_impl._is_supported`` and ``._smem_budget_bytes``, both of which
-are pure functions of the DEVICE (plus dtype). The predicate returns a boolean, and there is
-exactly one override node for ``(_fused_rms_norm, CUDA)``, so an unchanged boolean is an unchanged
-kernel. Everything the predicate reads that is genuinely per-call -- alignment, contiguity, COW,
-numel, shape, weight dtype/device -- is untouched.
-
-What is CPU-testable is the memo's DISCIPLINE, which is where a defect would live:
-
-  1. the memoized functions return exactly what the originals return, for every key;
-  2. the original is called ONCE per key and not again -- the whole point;
-  3. an INDEX-LESS device is never cached (``get_device_capability(torch.device("cuda"))``
-     resolves against the CURRENT device, so a cached answer would be wrong after a device switch);
-  4. install is idempotent, revert restores torch's own functions by identity, and the flag is
-     honoured -- an unset flag must leave torch untouched;
-  5. ``hits`` is a real count, so an inert install is visible as inert.
-
-This CPU test does not establish live-CUDA predicate behavior; that requires a separate GPU
-qualification on the target runtime and production widths.
-
-Run (CPU only):
-    uv run --isolated --extra dev python -m pytest \
-        skyrl/backends/skyrl_train/isoexec/ops/norms/tests/test_native_rmsnorm_memo_cpu.py -q
+The memo caches two device-pure functions inside torch's predicate. Gated here: same answers,
+one evaluation per key, index-less devices never cached, idempotent install and clean revert.
 """
 
 from __future__ import annotations
@@ -37,7 +16,7 @@ import torch
 _HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[7]))  # repo root
 
-from skyrl.backends.skyrl_train.isoexec.ops.norms import (
+from skyrl.backends.skyrl_train.isoexec.ops.norms import (  # noqa: E402
     native_rmsnorm_memo as NM,  # noqa: E402
 )
 
@@ -52,7 +31,7 @@ class _FakeRmsnormImpl(types.SimpleNamespace):
 
         def _is_supported(inp):
             self.supported_calls.append((inp.device, inp.dtype))
-            return inp.dtype is not torch.float64  # an arbitrary but device/dtype-pure answer
+            return inp.dtype is not torch.float64  # arbitrary, but device/dtype-pure
 
         def _smem_budget_bytes(device):
             self.smem_calls.append(device)
@@ -113,7 +92,7 @@ def test_same_answer_evaluated_once_per_key(fake, monkeypatch):
     assert len(impl.supported_calls) == 1, "the original must be evaluated once per (device, dtype)"
     assert NM.native_rmsnorm_memo_counts()["hits"] == 49
 
-    # a different dtype is a different key, and still gets the ORIGINAL's answer
+    # a different dtype is a different key, and still gets the original's answer
     assert mod._is_supported(_Fake(dev, torch.float64)) is False
     assert len(impl.supported_calls) == 2
 
@@ -124,7 +103,7 @@ def test_same_answer_evaluated_once_per_key(fake, monkeypatch):
 
 
 def test_index_less_device_is_never_cached(fake, monkeypatch):
-    """``get_device_capability(torch.device('cuda'))`` resolves against the CURRENT device, so a
+    """``get_device_capability(torch.device('cuda'))`` resolves against the current device, so a
     cached answer would survive a device switch and be wrong. It must fall through, uncounted."""
     impl, mod = fake
     monkeypatch.setenv("SKYRL_ISOEXEC_NATIVE_NORM_MEMO", "1")

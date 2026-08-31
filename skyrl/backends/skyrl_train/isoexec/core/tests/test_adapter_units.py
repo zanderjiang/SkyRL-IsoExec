@@ -1,7 +1,5 @@
-"""Adapter unit-coverage gaps against the base-class surface: the process-adapter accessor
-lifecycle, the fail-soft trainer build vs the refusing engine build, run_install(close=False)
-gating, per-subclass facts completeness against every claimed axis, double-run idempotency of the
-INSTALL sequence, and register_claim_checker re-registration semantics.
+"""Unit coverage of the ContractAdapter base-class surface: accessor lifecycle, build fail-soft,
+run_install gating and idempotency, facts completeness, and checker re-registration.
 """
 
 import dataclasses
@@ -27,7 +25,7 @@ from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import (
     CudaIpcInitInfo,  # noqa: F401
 )
 
-# CPU-only harness (a live production run owns the GPUs): real builds read core/arch.ARCH.
+# Real builds read core/arch.ARCH; on a CPU-only host point it at the production accelerator.
 if arch_mod.ARCH == arch_mod.NON_ACCELERATOR_ARCH:
     arch_mod.ARCH = "sm90"
 
@@ -119,14 +117,14 @@ def _stub_install(side):
 
 def test_process_adapter_accessor_lifecycle():
     with _fresh():
-        assert ad.process_adapter() is None  # unset: sites see "no adapter", never a stale one
+        assert ad.process_adapter() is None  # unset: never a stale adapter
         a = _mk_trainer()
         assert ad.set_process_adapter(a) is a and ad.process_adapter() is a
         b = _mk_engine()
         assert ad.set_process_adapter(b) is b and ad.process_adapter() is b  # last set wins
         ad._reset_for_tests()
         assert ad.process_adapter() is None
-    assert ad.process_adapter() is None  # _fresh restored the module state
+    assert ad.process_adapter() is None  # restored by _fresh
 
 
 def test_unknown_side_is_rejected_at_construction():
@@ -141,7 +139,7 @@ def test_trainer_build_failsoft_engine_build_refuses():
         assert trainer.build_failsoft is True
         assert trainer.run_install() is True  # the non-IsoExec path must survive a failed build
         assert trainer.contract is None and ran == [1]
-        # ...but the failure is LOUD in the ledger, not a silent skip.
+        # ...but the failure is recorded in the ledger, not silently skipped.
         assert enforce.ledger().records["build_valid:contract"][-1].result == "violation"
     with _fresh():
         ran = []
@@ -239,7 +237,7 @@ def test_register_claim_checker_reregistration():
         c2 = dataclasses.replace(_CONTRACT, claims=claims)
         with _fresh():
             pc._CONTRACT, pc._VIEW = c2, build_contract_view(c2, _REG)
-            # Registration is how a kind buys its way in: the formerly refusing kind now dispatches.
+            # Registering a checker makes the formerly refusing kind dispatch.
             results = ad.check_all_claims(c2, {"TP": 8, "SP": 0, "PP": 1, "CP": 1}, "engine")
             assert results["provenance:prose"].result == enforce.OK
             assert "claim_check:provenance" not in enforce.ledger().records

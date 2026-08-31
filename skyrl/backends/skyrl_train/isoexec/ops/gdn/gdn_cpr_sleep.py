@@ -1,10 +1,7 @@
-"""Allocate CPR state in a discard-at-sleep CUDA VMM arena.
+"""Allocate CPR state in a discard-at-sleep CUDA VMM arena (``SKYRL_ISOEXEC_GDN_CPR_SLEEP=1``).
 
-When enabled, each layer's state tensors are views into one aligned allocation carrying the private
-``isoexec_gdn_cpr`` tag, which the worker sleep hook discards without a host backup; wake re-maps it,
-zeros it and resets all row/lifecycle bookkeeping. Any unsupported allocator surface or ambiguous
-allocation layout declines to the ordinary state allocation. ``SKYRL_ISOEXEC_GDN_CPR_SLEEP=1`` enables
-the feature.
+Each layer's state is a view into one tagged allocation that sleep discards with no host backup;
+wake re-maps it, zeros it and resets all row bookkeeping. Every decline path is a fallback, not an error.
 """
 
 from __future__ import annotations
@@ -12,8 +9,7 @@ from __future__ import annotations
 import os
 import time
 
-# A private cumem tag: not "weights" (backed up D2H at level-1 sleep) and not "kv_cache" (owned by
-# vLLM's cache-initialization lifecycle). This one is discarded at sleep but woken by us.
+# A private cumem tag: not "weights" (backed up D2H at level-1 sleep) and not "kv_cache" (vLLM-owned).
 CPR_SLEEP_TAG = "isoexec_gdn_cpr"
 
 FLAG = "SKYRL_ISOEXEC_GDN_CPR_SLEEP"
@@ -30,10 +26,7 @@ _accounted = False
 
 
 def cpr_sleep_enabled() -> bool:
-    """Whether the CPR state arena is discarded at sleep and re-created at wake.
-
-    Read at call time, so a test can toggle it per process.
-    """
+    """Whether the CPR state arena is discarded at sleep and re-created at wake (read at call time)."""
     return os.environ.get(FLAG, "0").lower() not in ("", "0", "false", "no")
 
 
@@ -50,11 +43,10 @@ def _round_up(n: int, m: int) -> int:
 
 
 def alloc_cpr_arena(specs, device):
-    """Allocate one tagged, discard-at-sleep arena for a layer and carve it into state tensors.
+    """Carve one tagged, discard-at-sleep arena into a layer's state tensors.
 
-    ``specs`` is ``[(attr_name, shape, dtype), ...]`` in allocation order; returns
-    ``{attr_name: tensor}``, or ``None`` so the caller allocates the tensors the ordinary way. Every
-    rejection path here is a performance fallback, never a correctness one.
+    ``specs`` is ``[(attr_name, shape, dtype), ...]`` in allocation order; returns ``{attr_name: tensor}``,
+    or ``None`` so the caller allocates the ordinary way.
     """
     if not cpr_sleep_enabled():
         return None
@@ -70,9 +62,8 @@ def alloc_cpr_arena(specs, device):
         if alloc is None:
             _say(f"INERT: {FLAG}=1 but no CuMemAllocator instance (engine built without sleep mode)")
             return None
-        # Everything below reads cumem internals (``current_tag`` and ``pointer_to_data``), so
-        # probe the surface here: a vLLM that renamed either must disable the feature, not raise
-        # mid-construction.
+        # Probe the cumem internals used below: a vLLM that renamed either must disable the feature,
+        # not raise mid-construction.
         for _attr in ("current_tag", "pointer_to_data"):
             if not hasattr(alloc, _attr):
                 _say(f"INERT: CuMemAllocator has no {_attr!r} -- vLLM's cumem surface moved")
@@ -94,16 +85,15 @@ def alloc_cpr_arena(specs, device):
         cur += nbytes
     total = _round_up(cur, _ROUND_LARGE)
     if total < _MIN_LARGE_ALLOC:
-        # A sub-10 MiB request lands in a 20 MiB kLargeBuffer segment whose remainder is splittable,
-        # so a later weight allocation could end up inside memory we mark discard-at-sleep.
+        # A sub-10 MiB request lands in a splittable 20 MiB kLargeBuffer segment, so a later weight
+        # allocation could land inside memory we mark discard-at-sleep.
         _say(f"arena declined: {total / 2**20:.1f} MiB < {_MIN_LARGE_ALLOC / 2**20:.0f} MiB (splittable segment)")
         return None
 
     old_tag = alloc.current_tag
     alloc.current_tag = CPR_SLEEP_TAG
     try:
-        # A current_tag swap, not a nested ``use_memory_pool``: model build already holds an active
-        # cumem MemPool context, so only the tag recorded by the malloc callback needs to change.
+        # A tag swap, not a nested ``use_memory_pool``: model build already holds a cumem MemPool context.
         flat = torch.zeros(total, dtype=torch.uint8, device=device)
     finally:
         alloc.current_tag = old_tag
@@ -138,7 +128,6 @@ def register_layer(layer, flat, capacity: int) -> None:
     first = not _ARENAS
     _ARENAS.append((layer, flat, int(flat.numel())))
     if first:
-        # Printed at build time, before any sleep, so its absence is diagnostic.
         _say(
             f"ARENA: {flat.numel() / 2**20:.1f} MiB per GDN layer at capacity={capacity} slots "
             f"({flat.numel() / max(capacity, 1) / 2**20:.3f} MiB/slot/layer), tag={CPR_SLEEP_TAG!r}"
@@ -153,8 +142,7 @@ def arena_bytes() -> int:
 def _reset_layer(layer, zero_arena: bool) -> None:
     """Drop every meaning a row index could have, leaving the pool as freshly built.
 
-    ``zero_arena`` is only ever true at wake: at sleep the arena is about to be unmapped, and after
-    the sleep its pages are gone, so touching it would be an illegal access.
+    ``zero_arena`` may only be true at wake; at/after sleep the arena's pages are unmapped.
     """
     if zero_arena:
         layer._flat_arena.zero_()  # the state tensors are views of it
@@ -167,17 +155,14 @@ def _reset_layer(layer, zero_arena: bool) -> None:
     if clock is not None:
         clock.zero_()
     layer._slot2row.clear()
-    # The batched slot-map outbox goes with the map it feeds: a pending edit surviving this reset
-    # would flush after the zeroing above and re-introduce a slot->row meaning that was destroyed.
+    # A pending slot-map edit surviving this reset would flush after the zeroing and revive a dead row.
     pending = getattr(layer, "_slot_pending", None)
     if pending is not None:
         pending.clear()
-    # Row count read off the pool rather than re-derived from ``capacity``: the pool holds
-    # ``capacity + 1`` rows (row 0 is the null row), and a second copy of that convention could drift.
+    # Read off the pool, not re-derived from ``capacity``: the pool holds capacity + 1 rows (row 0 is null).
     rows = int(layer.pos.numel())
     layer._free = list(range(1, rows))
-    # Inverse ownership indices must be reset with the maps they describe; a stale one would
-    # mis-name a row after the next wake even though the device/host maps were cleared.
+    # Inverse ownership indices must be reset with the maps they describe.
     if hasattr(layer, "_row2slot"):
         layer._row2slot.clear()
     if hasattr(layer, "_free_set"):
@@ -198,8 +183,7 @@ def _reset_layer(layer, zero_arena: bool) -> None:
 def install_worker_sleep_hooks() -> None:
     """Patch ``gpu_worker.Worker.sleep``/``wake_up`` so the arena is dropped and re-created.
 
-    Installed from the first arena allocation, i.e. during model build in the worker process and long
-    before any sleep. Idempotent, and refuses loudly (leaving stock behavior) on a surface mismatch.
+    Idempotent; refuses loudly (leaving stock behavior) on a vLLM surface mismatch.
     """
     global _installed
     if _installed:
@@ -211,8 +195,7 @@ def install_worker_sleep_hooks() -> None:
         from vllm.v1.worker import gpu_worker as _gw
 
         _ = (_gw.Worker.sleep, _gw.Worker.wake_up, CuMemAllocator.wake_up)
-        # The replacements below are ``sleep(self, level=1)`` / ``wake_up(self, tags=None)``; if
-        # vLLM's signatures move, refuse here rather than raise TypeError at the first sleep.
+        # Refuse here on a signature change rather than raise TypeError at the first sleep.
         _sig_sleep = list(inspect.signature(_gw.Worker.sleep).parameters)
         _sig_wake = list(inspect.signature(_gw.Worker.wake_up).parameters)
         if _sig_sleep != ["self", "level"] or _sig_wake != ["self", "tags"]:
@@ -233,10 +216,8 @@ def install_worker_sleep_hooks() -> None:
 
     def cpr_sleep(self, level: int = 1):
         global _asleep
-        # Runs first and unconditionally -- before the double-sleep guard, the arena release and
-        # vLLM's own sleep -- because it also retracts the shared boundary index advertised to the
-        # scheduler. Exceptions propagate: an index advertising checkpoints no worker holds must
-        # never pass silently.
+        # Must run first and unconditionally: it retracts the boundary index advertised to the scheduler.
+        # Exceptions propagate -- an index naming checkpoints no worker holds must never pass silently.
         from .gdn_cpr_state import CPR_APC_STORE, cpr_apc_store_invalidate
 
         apc_gib = CPR_APC_STORE.nbytes / 2**30 if CPR_APC_STORE is not None else 0.0
@@ -248,8 +229,7 @@ def install_worker_sleep_hooks() -> None:
         _accounting_banner()
         t0 = time.perf_counter()
         gib = arena_bytes() / 2**30
-        # Host-side bookkeeping is dropped before the pages go away, so no window exists in which
-        # a map claims a row whose bytes are unmapped.
+        # Drop host bookkeeping before the pages go away: no map may claim a row whose bytes are unmapped.
         for layer, _f, _n in _ARENAS:
             _reset_layer(layer, zero_arena=False)
         _asleep = True
@@ -264,14 +244,10 @@ def install_worker_sleep_hooks() -> None:
 
     def cpr_wake_up(self, tags=None):
         global _asleep
-        # ``tags is None`` means wake everything, and vLLM's allocator already re-maps our tag in
-        # that case; calling wake_up([tag]) again would map an already-mapped handle. So for
-        # tags=None only the bookkeeping is reset.
+        # tags=None already re-maps our tag inside vLLM; a second wake_up([tag]) would map a mapped handle.
         woken_by_vllm = tags is None
         out = _orig_wake(self, tags)
-        # The arena's lifetime matches vLLM's kv_cache lifetime: it returns in the wake that
-        # re-maps the KV pool, so the weight-broadcast window runs with the arena still released --
-        # which is where the trainer's NCCL buffers and the gathered weights are both resident.
+        # The arena's lifetime tracks kv_cache, so it stays released through the weight-broadcast window.
         if not _asleep or not (tags is None or "kv_cache" in tags):
             return out
         t0 = time.perf_counter()
@@ -306,12 +282,7 @@ _backup_checked = False
 
 
 def _check_not_backed_up(level: int) -> None:
-    """Verify once that vLLM's sleep discarded our tag instead of copying it D2H.
-
-    The private tag relies on ``Worker.sleep`` offloading only ``weights`` at level 1, which is an
-    assumption about vLLM. Performance only: a backed-up arena is still correct, because wake zeroes
-    it and resets every map regardless of what was restored.
-    """
+    """Verify once that vLLM's sleep discarded our tag instead of copying it D2H (performance only)."""
     global _backup_checked
     if _backup_checked or not _ARENAS:
         return

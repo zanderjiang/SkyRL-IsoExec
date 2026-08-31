@@ -1,7 +1,7 @@
-"""Trainer-side ContractAdapter: runtime facts from megatron_config + the trainer SP env exactly as
-the megatron_worker call site computed them; ``install()`` wraps the existing init_model install
-path. Contract build stays fail-soft (the pre-adapter trainer behavior); claim violations and the
-INSTALL close refuse as before."""
+"""Trainer-side ContractAdapter: runtime facts from megatron_config plus the trainer SP env.
+
+Contract build is fail-soft; claim violations and the INSTALL close still refuse.
+"""
 
 from __future__ import annotations
 
@@ -36,8 +36,7 @@ class MegatronContractAdapter(ContractAdapter):
         self._install_fn()
 
     def on_weight_sync(self, peer_hash_or_stamp=None) -> bool:
-        """Sender half: ``peer_hash_or_stamp`` is the composite this trainer stamped on init_info
-        (None when no local contract exists). The stamp IS the trainer's half of the handshake."""
+        """Sender half: ``peer_hash_or_stamp`` is the composite stamped on init_info, or None."""
         from ...core import enforce
 
         if peer_hash_or_stamp is not None:

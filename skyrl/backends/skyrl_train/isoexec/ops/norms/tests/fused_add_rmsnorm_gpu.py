@@ -1,13 +1,8 @@
 """Bit-gate + backward gate for fused_add_rmsnorm.
 
-FORWARD: torch.equal AND int16 bit-pattern equality (signed-zero / subnormal sensitive) of BOTH
-outputs (added residual stream + normed) vs the EXACT eager composition:
-    h      = residual + x                                   # CUDAFunctor_add<BFloat16>
-    normed = F.rms_norm(h, (N,), None, eps) * (1.0 + w)     # ZeroCenteredTorchRMSNorm == K2
-This is the sequence the shipped Megatron layer runs (bda p=0 bias=None, then pre_mlp/input norm).
-Also cross-checks against the shipped K2 kernel (fused_outnorm.fused_rms_norm_gamma) on the same h.
-
-BACKWARD: max abs grad error of (x, residual, weight) vs the same eager composition (fp32 tol).
+Forward: int16 bit-pattern equality of both outputs against the eager ``h = residual + x`` then
+``F.rms_norm(h) * (1 + w)`` composition the Megatron layer runs, plus a cross-check against K2.
+Backward: max abs grad error of (x, residual, weight) vs the same composition, fp32 tolerance.
 """
 
 import os
@@ -26,7 +21,7 @@ from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_add_rmsnorm import (  # 
     fused_add_rmsnorm,
 )
 
-# shipped K2 kernel, to prove fused_add == CUDAFunctor_add then K2 exactly
+# shipped K2 kernel, to prove fused_add == add-then-K2 exactly
 from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (
     fused_rms_norm_gamma,  # noqa
 )
@@ -69,8 +64,7 @@ print("=== FORWARD bit-gate (added stream AND normed), decode + prefill shapes, 
 print("    SHIPPED MODEL WIDTH = 2048 (Qwen3.5-35B-A3B hidden_size). Others probe the tile ladder.")
 ok = True
 ok_shipped = True
-# widths spanning every tile-ladder bucket boundary that a hidden_size / head_dim can land in.
-# 2048 is the ONLY one the layer-boundary norm actually uses.
+# widths spanning every tile-ladder bucket boundary; only 2048 is used by the model
 for H in (2048, 4096, 5120, 128, 3072, 6144):
     w = torch.randn(H, device=dev, dtype=torch.bfloat16) * 0.05  # zero-centred: near 0
     for M in (320, 512, 8192, 1):
@@ -81,7 +75,7 @@ for H in (2048, 4096, 5120, 128, 3072, 6144):
         added_f, normed_f = fused_add_rms_norm_gamma(x, r, w, EPS)
         b1 = report(f"H={H} M={M} added", h_eager, added_f)
         b2 = report(f"H={H} M={M} normed", normed_eager, normed_f)
-        # cross-check: fused normed == K2 kernel applied to the eager-materialised h (must ALWAYS hold)
+        # cross-check: fused normed == K2 applied to the eager-materialised h
         normed_k2 = fused_rms_norm_gamma(h_eager, w, EPS)
         b3 = report(f"H={H} M={M} normed==K2(h)", normed_k2, normed_f)
         ok &= b1 & b2 & b3
