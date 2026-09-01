@@ -1,9 +1,7 @@
 """State and tolerance claims: grounded declaration, hook existence, and the gate reading back.
 
-The StateClaims name lifecycle hooks that ALREADY run (declaration, not machinery) -- each ref must
-resolve to real code. The ToleranceClaim carries the forward gate's qualified thresholds; the gate
-resolves its limits from the claim wherever a contract exists, falling back to its constants (the
-same numbers) where none can be built (the CPU driver).
+StateClaim refs must resolve to real hook code. The gate resolves its thresholds from the
+ToleranceClaim wherever a contract exists, falling back to module constants where none can be built.
 """
 
 import dataclasses
@@ -18,7 +16,9 @@ from skyrl.backends.skyrl_train.isoexec.contract.identity import compute_identit
 from skyrl.backends.skyrl_train.isoexec.core import enforce
 from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
 from skyrl.backends.skyrl_train.isoexec.core.adapter import ToleranceChecker
-from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import write_contract_file
+from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import (
+    write_contract_file,
+)
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
 from skyrl.backends.skyrl_train.isoexec.debug import trace
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
@@ -51,8 +51,7 @@ def test_state_claims_are_declared_facts():
 
 
 def test_state_claim_hooks_exist():
-    # Declaration plus a hook-exists check: every ref is "path::symbol" and the symbol is real
-    # code in that file -- a StateClaim naming a nonexistent hook is refused here, in CI.
+    # Every ref is "path::symbol"; a StateClaim naming a nonexistent hook is refused here.
     for s in _contract().claims.state:
         path, _, symbol = s.ref.partition("::")
         f = _ISOEXEC_DIR / path
@@ -124,8 +123,8 @@ def test_gate_reads_limits_from_contract_claim():
         pc._CONTRACT = c  # production contract -> the claim (same numbers, different authority)
         assert tu.isoexec_gate_limits() == (1.0e-5, 1.0e-4)
 
-        # A contract claiming a TIGHTER envelope must tighten the gate: mean=7e-6 passes the
-        # constants but violates the claim -- the gate now refuses, proving it consumes the claim.
+        # A tighter claim must tighten the gate: mean=7e-6 passes the constants but violates
+        # the claim, so the gate must refuse.
         tight = ToleranceClaim(
             case_pair=GATE_PAIR, bounds=(("abs_diff_mean_max", "5.0e-6"), ("abs_diff_max_max", "1.0e-4"))
         )
@@ -146,12 +145,9 @@ def test_gate_reads_limits_from_contract_claim():
 
 
 def test_cpr_variant_claims_exact_zero():
-    """The cpr composition claims 0.0, and the recurrent one deliberately does not.
+    """The cpr composition claims 0.0; the recurrent one keeps the pre-rowinv bounds.
 
-    The exact-zero envelope is licensed by live evidence produced under
-    SKYRL_ISOEXEC_GDN_KERNEL=cpr (18 gate steps at mean=max=0.000e+00, exact=n/n); the
-    recurrent variant has no such run, so it keeps the pre-rowinv bounds. Evidence licenses the
-    composition that produced it, not the model.
+    Live exact-zero evidence exists only for cpr, and it licenses that composition, not the model.
     """
     reg = build_registry(strict=True)
     cpr = qwen3_5.build(reg, arch="sm90", profile=qwen3_5.CPR_PROFILE)
@@ -161,13 +157,7 @@ def test_cpr_variant_claims_exact_zero():
 
 
 def test_zero_bounds_admit_exactly_zero_and_refuse_one_ulp():
-    """A 0.0 claim is a real gate, not a vacuous one: 0.0 passes, the next float refuses.
-
-    The gate compares with ``>`` against the limit, so 0.0 <= 0.0 is admitted while any positive
-    difference -- a single ULP of an fp32 logprob -- is a violation. With the leaf-tree denominator
-    pinned there is no rounding floor left for a regression to hide under, so this is the property
-    the tightened claim rests on.
-    """
+    """A 0.0 claim is a real gate, not a vacuous one: 0.0 passes, one ULP refuses."""
     from skyrl.train.utils import trainer_utils as tu
 
     saved = pc._CONTRACT
@@ -252,11 +242,9 @@ def _gate_logs(fn):
 
 
 def test_gate_limits_resolve_from_the_delivered_artifact():
-    """The CONTROLLER builds no contract, so the delivered artifact is its honest limit source.
+    """The controller builds no contract, so it must read its limits from the delivered artifact.
 
-    Reading the module fallback 1e-5/1e-4 while the delivered contract for that very composition
-    claims 0.0/0.0 judges the run against the wrong envelope. The artifact is validated (stored identities ==
-    recomputed) by ``contract_delivery.load_contract`` before anything is read out of it.
+    Falling back to the module constants would judge the run against the wrong envelope.
     """
     from skyrl.train.utils import trainer_utils as tu
 
@@ -280,11 +268,10 @@ def test_gate_limits_resolve_from_the_delivered_artifact():
 
 
 def test_gate_limit_fallback_logs_its_provenance():
-    """The module constants stay the documented fallback -- but never a silent one.
+    """The module constants are the fallback, but never a silent one.
 
-    With no artifact configured they are used and named. With one configured that cannot be
-    resolved, falling back IS the defect, so it refuses instead (and debug tracing demotes that
-    refusal to the fallback, still named).
+    A configured-but-unresolvable artifact refuses rather than falling back (debug tracing demotes
+    that refusal to a named fallback).
     """
     from skyrl.train.utils import trainer_utils as tu
 

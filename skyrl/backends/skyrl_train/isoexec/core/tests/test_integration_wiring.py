@@ -1,10 +1,7 @@
 """The wiring between the enforcement core and the two runtimes: one owner per fact.
 
-Each case here pins a place where two files used to answer the same question differently -- the GDN
-kernel vocabulary, the hook-ref resolution, the flag table's default -- or a place where a fact the
-contract hashes was never read back off the running process (the install pins, the engine's step
-key, the TE probe). They are integration tests in the literal sense: nothing here is a new rule,
-only the claim that the single owner is the one actually consulted.
+Each case pins a place where two files could answer the same question differently, or where a
+fact the contract hashes was never read back off the running process.
 """
 
 import os
@@ -53,8 +50,8 @@ class TestGdnKernelSingleOwner(unittest.TestCase):
         return gdn_ops
 
     def test_unset_executes_the_declarable_default(self):
-        # The whole point of the swap: "chunk" was the executing default while no model declares a
-        # chunk composition, so unset named a function the process did not run.
+        # "chunk" was once the executing default while no model declared a chunk composition,
+        # so unset named a function the process did not run.
         with _env(**{KERNEL_ENV: None}):
             self.assertEqual(gdn_kernel_env.DEFAULT_KERNEL, "recurrent")
             self.assertEqual(self._ops().gdn_kernel_mode(), "recurrent")
@@ -176,7 +173,9 @@ class TestLivePins(unittest.TestCase):
 
     def test_unreported_pins_are_named_rather_than_silently_unverified(self):
         from skyrl.backends.skyrl_train.isoexec.core import fingerprint as fp
-        from skyrl.backends.skyrl_train.isoexec.core.process_contract import build_contract_view
+        from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
+            build_contract_view,
+        )
 
         saved = fp._RECORDER
         fp._RECORDER = None
@@ -195,11 +194,8 @@ class TestLivePins(unittest.TestCase):
 class TestEngineInstallPins(unittest.TestCase):
     """The engine's GDN recorders answer for exactly the keys the contract pins.
 
-    ``log_fingerprint`` compares pins only when the recorder reported some, so a site that records
-    an impl id alone leaves ``gdn.core``'s ``kernel`` -- the contract's only representation of which
-    delta-rule kernel runs, under an impl id (``native_fused_sigmoid``) that is deliberately the
-    same for every kernel -- with no live cross-check. The engine site cannot be called on CPU
-    (it needs vLLM), so its recorder calls are read out of the source.
+    ``log_fingerprint`` compares pins only when the recorder reported some, so an impl id alone
+    leaves ``gdn.core``'s ``kernel`` with no live cross-check. Read from source: vLLM-only site.
     """
 
     @classmethod
@@ -269,10 +265,8 @@ class TestEngineInstallPins(unittest.TestCase):
 class TestCollectivePinGuards(unittest.TestCase):
     """A pin is reported only when the thing it pins was installed.
 
-    ``live_pins("collectives.tree_all_reduce")`` reads the ReductionPlan the env asks for, which
-    exists whether or not pik was installed; reporting it beside a ``not_installed`` impl id claims
-    a leaf tree the process is not running. The ``moe.combine`` sibling at both sites already guards
-    on its own predicate. Neither site is callable on CPU, so the guard is read out of the source.
+    The ReductionPlan exists whether or not pik was installed, so reporting it beside a
+    ``not_installed`` impl id claims a leaf tree the process is not running.
     """
 
     @classmethod

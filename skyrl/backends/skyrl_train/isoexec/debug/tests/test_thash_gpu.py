@@ -1,13 +1,7 @@
 """Triton digest backend == eager digest backend == pure-Python reference, bit for bit.
 
-The trace is only meaningful if the two sides digest identically, and the two sides may not run
-the same backend (a CPU-only comparison harness, a torch build without triton, one side pinned
-to ``SKYRL_ISOEXEC_DEBUG_DIGEST=eager``). So this is an equality suite, not a numerics suite:
-every dtype in the table, edge and ragged shapes, every ladder rung, every segmentation, both
-devices, several chunkings -- all against the independent reference in ``test_thash_cpu``.
-
-Skipped without CUDA. Run:
-    python -m pytest skyrl/backends/skyrl_train/isoexec/debug/tests/test_thash_gpu.py
+An equality suite, not a numerics suite: the two sides may run different backends, so every dtype,
+shape, ladder rung, segmentation and chunking must agree. Skipped without CUDA.
 """
 
 from __future__ import annotations
@@ -22,7 +16,10 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[6]))
 
 from skyrl.backends.skyrl_train.isoexec.debug import thash  # noqa: E402
-from skyrl.backends.skyrl_train.isoexec.debug.tests.test_thash_cpu import ref_digest, ref_segments  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.debug.tests.test_thash_cpu import (  # noqa: E402
+    ref_digest,
+    ref_segments,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 

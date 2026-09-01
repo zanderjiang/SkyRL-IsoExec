@@ -1,8 +1,6 @@
 """Qwen3.5-35B-A3B (hybrid GDN + MoE) composition, declared as a ``ModelProfile``.
 
-The six structural facts here are what ``policy.derive_selections`` turns into the contract; there
-are no exceptions to policy for this model. Sites are TF=trainer_fwd, TS=trainer_score,
-EP=engine_prefill, ED=engine_decode.
+``policy.derive_selections`` turns these structural facts into the contract; no exceptions here.
 """
 
 from __future__ import annotations
@@ -22,8 +20,8 @@ MODEL = "qwen3.5-35b-a3b"
 
 PROFILE = ModelProfile(
     model=MODEL,
-    # The HF classes megatron-bridge registers for this family. These are the dispatch key; the name
-    # patterns below are only the no-config.json fallback, and a missing class here disables the census.
+    # The HF classes megatron-bridge registers for this family; the dispatch key. The name patterns
+    # below are only the no-config.json fallback.
     architectures=(
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -51,21 +49,8 @@ PROFILE = ModelProfile(
             ),
         ),
     ),
-    # Proven parallelism envelopes -> contract TopologyClaims. Each value is grounded in a
-    # colocated recorded gate, not asserted here:
-    #   TP  -- the pik leaf-tree row-parallel output is bitwise-identical to the TP=1 reference at
-    #          every world in the domain (divisors of pik_leaves=8), asserted by the named gate.
-    #   SP  -- trainer sequence parallelism on/off is the same expression: RS == AR-then-slice,
-    #          bitwise, on both transports, at the tested TP sizes.
-    #   PP  -- pinned 1: no pipeline entry anywhere in the composition; the engine adapter forces
-    #          pipeline_model_parallel_size=1 (runtimes/vllm/gptmodel_vllm.py).
-    #   CP  -- pinned 1: the GDN packed-meta shim keeps every cp_size!=1 path unreachable until
-    #          the CP=1 tautology is discharged (the named gate pins that unreachability).
-    # EP  -- the composition is EP-invariant: the two sides may run different expert-parallel
-    #        degrees (live: trainer EP=8, engine EP=1) without moving forward bits. Not declared
-    #        as a TopologyAxisFact here only because an `invariant` axis requires a repo-relative
-    #        proof ref naming the gate that measured it (profile.TopologyAxisFact refuses an
-    #        unproven domain); add the axis once that gate has a path in this tree.
+    # Proven parallelism envelopes -> contract TopologyClaims, each grounded in the named gate. EP is
+    # invariant in practice but undeclared: an `invariant` axis needs a proof ref, and it has none.
     topology=(
         TopologyAxisFact(
             axis="TP",
@@ -88,12 +73,8 @@ PROFILE = ModelProfile(
             proof="ops/gdn/tests/test_packed_meta_cache_cpu.py",
         ),
     ),
-    # Engine state lifecycle -> StateClaims. DECLARATIONS of hooks that already run, each ref
-    # naming the implementing code (checked for existence by the colocated core test):
-    #   engine_prefix_cache -- flush-on-sync invariant (lifecycle ordering check; the hard backstop
-    #       is the prefix-hit-without-held-state REFUSE in ops/gdn/gdn_recurrent_state.py).
-    #   gdn_recurrent_state -- sleep/wake re-allocates kv storage, so the state core rebinds on a
-    #       (data_ptr, shape) key change every call; weight sync bumps the sync epoch.
+    # Engine state lifecycle -> StateClaims. Declarations of hooks that already run; each ref names
+    # the implementing code.
     states=(
         StateFact(
             state_id="engine_prefix_cache",
@@ -108,15 +89,8 @@ PROFILE = ModelProfile(
             ref="runtimes/vllm/gdn_engine_patch.py::_get_layer_state",
         ),
     ),
-    # The controller's forward acceptance gate (rollout logprobs vs identical-weight trainer
-    # scoring) -> a ToleranceClaim. Values are the qualified thresholds the gate enforced
-    # (skyrl/train/utils/trainer_utils.py); the gate now READS them back from this claim wherever
-    # a contract exists, so the envelope is contract data, not a controller constant.
-    #
-    # These are the RECURRENT variant's bounds, and they are the pre-rowinv envelope: the live
-    # evidence for the exact-zero claim (below, on CPR_PROFILE) was produced under
-    # SKYRL_ISOEXEC_GDN_KERNEL=cpr, and evidence licenses only the composition that
-    # produced it. Tighten this to 0.0 when a recurrent-variant run serves it, not before.
+    # The controller's forward acceptance gate -> a ToleranceClaim it reads back from here. These
+    # are the recurrent variant's pre-rowinv bounds; the exact-zero evidence below is cpr-only.
     tolerances=(
         ToleranceFact(
             case_pair=("engine_decode", "trainer_score"),
@@ -129,22 +103,8 @@ PROFILE = ModelProfile(
 # No departures from policy. Kept explicit so absence of overrides is machine-visible.
 EXCEPTIONS: dict = {}
 
-# The second live variant. ``gdn_kernel`` decides TWO ops: the ``gdn.core`` kernel pin, and the
-# ``gdn.state`` impl -- cpr owns its own pools and the engine refuses ``GDN_NATIVE_STATE=1``
-# under it, so ``native_kv_cache`` is not selectable there. Declaring the variant here gives it a
-# contract entry and an identity of its own.
-#
-# ``build()`` selects between the two by ``SKYRL_ISOEXEC_GDN_KERNEL`` when no profile is passed:
-# both runtimes read the same forwarded env var, so a matched pair derives the same variant and a
-# one-sided flip is a hash mismatch that refuses at the handshake.
-#
-# It also carries the only tolerance claim proven at EXACT ZERO. The leaf-tree logprob makes the
-# engine's and the trainer's denominator the same expression at every row count and TP degree, so
-# the gate's admitted envelope is not "small" but "no difference at all": measured on this
-# composition over 18 gate steps, every step
-# reported mean=0.000e+00 max=0.000e+00 with exact=n/n on ~4M tokens per step. A single ULP now
-# fails the gate -- which is the point: with the denominator pinned there is no floor left for a
-# real regression to hide under.
+# The second live variant, with its own contract identity: ``gdn_kernel`` decides both the
+# ``gdn.core`` pin and the engine's ``gdn.state``. Its tolerance claim is proven at exact zero.
 CPR_PROFILE = PROFILE.with_overrides(
     gdn_kernel="cpr",
     tolerances=(
@@ -155,13 +115,11 @@ CPR_PROFILE = PROFILE.with_overrides(
     ),
 )
 
-# The kernel names this model has a DECLARED variant for. "chunk" is absent by construction, not by
-# omission: the native fused core's schedule admits kernel=OneOf("recurrent", "cpr")
-# (ops/gdn/_register.py), so a chunk composition has no impl to name and cannot be pinned.
+# The kernels this model declares a variant for. "chunk" is absent by construction: the fused core's
+# schedule admits only recurrent/cpr, so a chunk composition has no impl to name.
 PROFILE_BY_KERNEL = {"recurrent": PROFILE, "cpr": CPR_PROFILE}
 
-# UN-SHARDED widths, derived from the checkpoint's config (NOT back-derived from the legacy
-# cuBLASLt shape table, which omits the gate projections).
+# Un-sharded widths, from the checkpoint's config.
 HIDDEN = 2048
 LAYERS = 40
 GDN_IN_PROJ = 12352  # in_proj_qkvzba: q 16*128 + k 16*128 + v 32*128 + z 32*128 + b 32 + a 32
@@ -169,10 +127,9 @@ ATTN_QKV = 9216  # q 16*256 + k 2*256 + v 2*256 + gate 16*256 -- Qwen3.5 gates i
 MOE_FFN = 512  # shared expert; SwiGLU makes fc1 2x this
 NUM_EXPERTS = 256
 VOCAB = 248320  # vocab_size from the checkpoint's config.json
-# `GemmSite.calls` is passes per forward PER TOKEN, not launches: `SKYRL_ISOEXEC_SPLIT_LM_HEAD=1`
-# chunks this projection over the token axis, so the chunks partition tokens and each crosses once.
+# `GemmSite.calls` is passes per forward per token, not launches.
 LM_HEAD_PASSES_PER_TOKEN = 1
-# The hybrid's layer mix, used only to rank the coverage banner (3 GDN : 1 attention is the shipped ratio).
+# The hybrid's layer mix, used only to rank the coverage banner.
 GDN_LAYERS = 30
 ATTN_LAYERS = 10
 
@@ -180,10 +137,8 @@ ATTN_LAYERS = 10
 def gemm_census(*, tp: int, etp: int) -> list:
     """Every dense 2-D GEMM this model runs through ``batch_invariant.matmul_persistent``.
 
-    The row-parallel sites (GDN out_proj, attn o_proj, shared-expert fc2) are absent: under
-    ``SKYRL_ISOEXEC_PIK=1`` pik rebinds ``RowParallelLinear.forward`` and calls cuBLASLt directly,
-    never reaching ``aten::mm``. The routed experts are absent because the fused MoE path consumes
-    them as batched/indexed kernels.
+    Row-parallel sites are absent (pik calls cuBLASLt directly), as are the routed experts (the
+    fused MoE path consumes them as batched/indexed kernels).
     """
     from ..ops.mm.mm_shapes import GemmSite, dtype_of
 
@@ -204,8 +159,7 @@ def build(registry, *, arch=None, profile=None):
     """Build the Qwen3.5 ExecutionContract against a registry.
 
     ``profile`` selects the variant explicitly; by default it follows ``SKYRL_ISOEXEC_GDN_KERNEL``
-    through the same parser the read sites use (``core/gdn_kernel_env``), so the declaration
-    matches what installs. Same derivation, different hash, so a one-sided flip refuses to run.
+    through the same parser the read sites use, so a one-sided flip is a hash mismatch that refuses.
     """
     from ..core.arch import ARCH
     from ..core.contract_build import ContractBuildError, build_execution_contract

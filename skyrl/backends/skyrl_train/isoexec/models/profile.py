@@ -1,10 +1,7 @@
 """``ModelProfile`` -- the structural facts about an architecture, with no impl choices in it.
 
-``policy.py`` holds the model-independent derivation from these facts to ``(op, site) -> impl``, so a
-``models/<name>.py`` file is a profile plus an exception list. A profile is either DECLARED in such a
-file or read off a live provider by ``profile_from_megatron_config``; the two are reconciled at
-startup by ``assert_profile_matches_config``, which refuses to run on a disagreement -- a declared
-fact that has rotted is wrong identically on both runtimes, so no bitwise gate would catch it.
+A profile is either declared in a ``models/<name>.py`` file or read off a live provider by
+``profile_from_megatron_config``; ``assert_profile_matches_config`` reconciles the two at startup.
 """
 
 from __future__ import annotations
@@ -32,8 +29,7 @@ class ProfileError(ValueError):
 class TrainerNcclAdmission:
     """Capability admission for one exact trainer NCCL composition.
 
-    The derivation matches the requested effective tuple and checks the named premise contract. A
-    profile with no matching admission stays pinned, or refuses if a caller requests that tuple.
+    A profile with no matching admission stays pinned, or refuses if a caller requests that tuple.
     """
 
     algo: Optional[str]
@@ -60,11 +56,8 @@ class TrainerNcclAdmission:
 class TopologyAxisFact:
     """One parallelism axis's proven envelope, declared with the gate that proved it.
 
-    ``kind="invariant"`` states the composition is bitwise-identical at every degree in ``domain``
-    and requires ``proof`` -- a repo-relative path to the colocated gate that measured it.
-    ``kind="pinned"`` states exactly one supported ``degree`` (with its ``collective_plan``).
-    These derive the contract's ``TopologyClaim``s verbatim; an undeclarable axis is simply absent,
-    and absence means "no claim", never "any value".
+    ``kind="invariant"`` needs a ``domain`` and a ``proof``; ``kind="pinned"`` one ``degree`` and its
+    ``collective_plan``. An absent axis means "no claim", never "any value".
     """
 
     axis: str
@@ -101,9 +94,8 @@ class TopologyAxisFact:
 
 @dataclass(frozen=True)
 class StateFact:
-    """One engine-side state pool's lifecycle fact: what invalidates it and the EXISTING hook that
-    implements the invalidation. Declaration only -- ``ref`` names code that already runs
-    (``"path/inside/isoexec.py::symbol"``); it never introduces hook machinery of its own."""
+    """One engine-side state pool's lifecycle fact: what invalidates it, and the ``ref`` naming the
+    existing hook (``"path/inside/isoexec.py::symbol"``) that implements the invalidation."""
 
     state_id: str
     invalidated_by: Tuple[str, ...]
@@ -142,8 +134,7 @@ class ToleranceFact:
                 parsed = float(v)
             except (TypeError, ValueError):
                 raise ProfileError(f"tolerance fact {self.case_pair!r}: bound {k}={v!r} is not a decimal string")
-            # "nan"/"inf" parse fine and are exactly the values that make the gate's comparison
-            # against the bound vacuous, so float() alone is not the check.
+            # "nan"/"inf" parse fine and make the gate's comparison vacuous.
             if not math.isfinite(parsed):
                 raise ProfileError(
                     f"tolerance fact {self.case_pair!r}: bound {k}={v!r} is not a finite threshold; "
@@ -153,11 +144,9 @@ class ToleranceFact:
 
 @dataclass(frozen=True)
 class RouterProfile:
-    """The MoE router's shape: decides which ``moe.router`` impl is eligible and the pins that ride along.
+    """The MoE router's shape: decides which ``moe.router`` impl is eligible and its pins.
 
-    ``fused_o2`` requires ``score_function == "softmax"`` and no expert bias and declines otherwise,
-    so ``policy.router_is_fusable`` consults that up front rather than letting the manifest name an
-    impl that will decline at install time.
+    ``fused_o2`` requires ``score_function == "softmax"`` and no expert bias.
     """
 
     score_function: str = SCORE_SOFTMAX
@@ -178,26 +167,16 @@ class ModelProfile:
     """Structural facts about one architecture. No impl ids and no site policy -- those live in
     ``policy.py``.
 
-    architectures:      HF ``config.architectures`` class names this profile claims -- the primary
-                        dispatch key. ``name_patterns`` is the fallback; see ``resolve.py``.
-    has_gdn:            GatedDeltaNet hybrid (megatron ``experimental_attention_variant``).
-    has_moe:            any sparse layer (megatron ``num_moe_experts``); requires ``router``.
-    zero_centered_norms: gamma applied as ``* (1 + w)``. A function difference, not a constant, so
-                        ``norms.rms`` has two impls; the engine's fused twin exists only for this form.
-    tensor_parallel:    TP>1 anywhere, i.e. the pik collectives install. At TP=1 they carry no entry.
-    gdn_kernel:         which GDN core kernel is pinned. Decides two ops: the ``gdn.core`` kernel pin
-                        and, since cpr owns its own state pool, the engine's ``gdn.state``.
-    gdn_chunk_size:     C, the chunk-boundary period; only reaches the manifest under
-                        ``gdn_kernel="cpr"``, where trainer and engine agree only at equal C.
-    trainer_nccl_admissions: effective NCCL tuples this profile admits on trainer sites. Empty means
-                        a non-pinned trainer manifest must refuse before NCCL initialization.
+    ``architectures`` is the primary dispatch key, ``name_patterns`` the fallback (see
+    ``resolve.py``). ``zero_centered_norms`` (gamma as ``* (1 + w)``) is a function difference, not a
+    constant. ``tensor_parallel`` means TP>1 anywhere, i.e. the pik collectives install.
     """
 
     model: str
     architectures: Tuple[str, ...] = ()
     name_patterns: Tuple[str, ...] = ()
     # Disambiguator for an architecture shared by models with different IsoExec compositions.
-    # Signature ``(raw_hf_config_dict) -> bool``; consulted only when a config dict is readable.
+    # ``(raw_hf_config_dict) -> bool``; consulted only when a config dict is readable.
     arch_discriminator: Optional[object] = field(default=None, compare=False)
     attention: str = ATTN_GQA
     has_gdn: bool = False
@@ -212,11 +191,10 @@ class ModelProfile:
     # Both values are TP-invariant but their bits differ: the manifest pins whichever is resolved,
     # and install refuses an env/manifest split.
     pik_leaf_dtype: str = "bf16"
-    # Admission evidence, not an architecture discriminator. Excluded from profile equality so
-    # reconciliation cannot mistake a composition capability for structure.
+    # Admission evidence, not architecture: excluded from profile equality so reconciliation cannot
+    # mistake a composition capability for structure.
     trainer_nccl_admissions: Tuple[TrainerNcclAdmission, ...] = field(default=(), compare=False)
-    # Proven parallelism envelopes (TopologyAxisFact per axis) -> contract TopologyClaims. Proof
-    # evidence like the NCCL admissions, so excluded from live-config structural equality.
+    # Proven parallelism envelopes -> contract TopologyClaims. Evidence, so excluded from equality.
     topology: Tuple[TopologyAxisFact, ...] = field(default=(), compare=False)
     # Lifecycle facts (StateFact) -> contract StateClaims; each names its existing hook.
     states: Tuple[StateFact, ...] = field(default=(), compare=False)
@@ -259,8 +237,8 @@ class ModelProfile:
         return replace(self, **kw)
 
 
-# The config field each profile fact is read from. Kept as data so ``assert_profile_matches_config``
-# and the onboarding probe agree by construction, and so a megatron rename shows up in one place.
+# The config field each profile fact is read from, kept as data so a megatron rename shows up in
+# one place.
 _CONFIG_FIELDS = {
     "attention": "multi_latent_attention",
     "has_gdn": "experimental_attention_variant",
@@ -273,8 +251,7 @@ _CONFIG_FIELDS = {
 def profile_from_megatron_config(cfg, *, model: str, architectures: Tuple[str, ...] = ()) -> ModelProfile:
     """Read a ``ModelProfile`` off a live ``TransformerConfig`` / ``GPTModelProvider``.
 
-    Reads only fields megatron itself declares (``_CONFIG_FIELDS`` plus the ``moe_router_*`` block);
-    anything not readable here is a fact the profile must declare.
+    Only fields megatron declares; anything not readable here is a fact the profile must declare.
     """
     g = lambda name, default=None: getattr(cfg, name, default)  # noqa: E731
 
@@ -304,19 +281,17 @@ def profile_from_megatron_config(cfg, *, model: str, architectures: Tuple[str, .
     )
 
 
-# Facts whose megatron field is authoritative and therefore worth cross-checking a declared profile
-# against. Router pins (topk / scaling_factor / eps) are deliberately excluded: a recipe may force
-# provider fields, so the declared pin is the post-forcing truth and a difference there is intended.
+# Facts whose megatron field is authoritative. Router pins are excluded: a recipe may force provider
+# fields, so the declared pin is the post-forcing truth.
 _CROSS_CHECKED = ("attention", "has_gdn", "has_moe", "zero_centered_norms")
 
 
 def assert_profile_matches_config(profile: ModelProfile, cfg, *, strict: bool = True) -> list:
-    """Reconcile a declared profile against the config actually built. Returns the disagreements, and
+    """Reconcile a declared profile against the config actually built; returns the disagreements and
     raises on any when ``strict``.
 
-    Runtime adapters call this once at startup with the provider they just built. The failure mode it
-    catches is not bitwise: both runtimes read the same provider, so a stale declared fact is wrong
-    identically on both sides and the IsoExec gate stays green.
+    Catches a non-bitwise failure: both runtimes read the same provider, so a stale declared fact is
+    wrong identically on both sides and the IsoExec gate stays green.
     """
     live = profile_from_megatron_config(cfg, model=profile.model, architectures=profile.architectures)
     bad = []

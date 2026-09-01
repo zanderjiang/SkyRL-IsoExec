@@ -1,37 +1,7 @@
-"""O2 -- fused MoE router (top-k + softmax + dense scatter) and permute sort: BITWISE gate.
+"""Bitwise gate for the fused MoE router (top-k + softmax + dense scatter) and permute sort.
 
-Ledger cluster **P8** (the private decode-kernel ledger): 952.0 launches/step,
-2.529 ms of a 33.93 ms 35B-A3B TP8 decode step, 23.8 launches per MoE layer. Opportunity **O2**
-prices removing 792 of them at **2.13 ms**. `moe_router_o2_kernel` replaces the cluster with three
-Triton kernels. This asserts the replacement is `torch.equal` to the eager sequence, not close to it.
-
-The kernel touches `exp`, a division AND an fp32 reduction in one op, so three of the four known
-Triton-vs-ATen hazards land here at once and the fourth is checked with live positive controls.
-
-  REF     the reference transcription is FAITHFUL: with vLLM's aten overrides installed,
-          `torch.softmax` really is `softmax_batch_invariant`'s five-op decomposition, and the whole
-          reference really is megatron's `topk_routing_with_score_function`. Gate the gate first.
-  HAZARD  the three numerics hazards, MEASURED on this shape: tl.exp vs libdevice.exp, Triton `/`
-          vs libdevice.div_rn, and four candidate fp32 reduction orders for the softmax denominator.
-          Prints element-diff counts so "close enough" has a scale.
-  FFMA    hazard 4, with TWO LIVE POSITIVE CONTROLS so the check is not vacuous (O3's turned out
-          structurally immune, and would have passed with the protection deleted): (a) an fp32
-          `acc += b*c` probe whose result flips with `enable_fp_fusion`, (b) an `eager != addcmul`
-          control on the same shape. Then: the real kernel is bit-identical under BOTH settings and
-          equal to the EAGER form. Matching addcmul would mean NOT matching the trainer.
-  ROUTER  dense (routing_probs, routing_map) `torch.equal` vs eager at ragged decode (320x1 token),
-          prefill to 8192, E=256 and E non-power-of-2, k in {1,2,4,8,16}, with/without scaling.
-  TIES    EXACT ties: an all-equal row, ties straddling the top-k boundary, 128 tied even indices,
-          ties at both ends of the index range. Membership is not a rounding detail -- it changes
-          which experts run.
-  SORT    the counting sort vs `argsort(descending=True, stable=True)` + `remainder` + gather:
-          sorted_indices, permuted_probs, tokens_per_expert, incl. empty experts (leading /
-          trailing / interior), all-tokens-to-one-expert, E=1, and T*k straddling the tile.
-  DEGEN   NaN/inf rows (the class of input that crashed vLLM engine init via an out-of-range expert
-          index), T=1, the host-side envelope fallbacks.
-  SYNC    determinism, `set_sync_debug_mode("error")`, and CUDA-graph capture + replay.
-  BENCH   A/B of the full P8 cluster, eager vs fused, INSIDE A REPLAYED CUDA GRAPH (production
-          decode is graph-replayed; an eager-loop timing is a fantasy -- see O3's note).
+Sections: REF (reference transcription is faithful), HAZARD (exp / division / fp32 reduction order),
+FFMA (contraction, with live positive controls), ROUTER, TIES, SORT, DEGEN, SYNC, BENCH.
 
 Run: CUDA_VISIBLE_DEVICES=0 VLLM_BATCH_INVARIANT=1 uv run --isolated --extra isoexec \
        python skyrl/backends/skyrl_train/isoexec/ops/moe/tests/moe_router_fused_o2_gpu.py [ref|hazard|ffma|router|ties|sort|degen|sync|bench|all]
@@ -46,7 +16,7 @@ os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 
 import torch  # noqa: E402
 
-if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
+if not torch.cuda.is_available():  # needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
 import triton  # noqa: E402
@@ -69,7 +39,7 @@ _n_checks = 0
 
 
 def eq(name, a, b):
-    """torch.equal, and report exact k/n on failure. NEVER allclose."""
+    """torch.equal, reporting exact k/n on failure; never allclose."""
     global _n_checks
     _n_checks += 1
     ok = a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
@@ -86,7 +56,7 @@ def eq(name, a, b):
 
 
 def _install_batch_invariant():
-    """Production installs these globally; measure and compare ON them, not on cuBLAS/ATen softmax."""
+    """Production installs these globally, so compare on them, not on cuBLAS/ATen softmax."""
     from vllm.model_executor.layers import batch_invariant as bi
 
     lib = torch.library.Library("aten", "IMPL")
@@ -110,12 +80,12 @@ def gating_logits(T, e=E, seed=0):
 
 # =================================================================================================
 def test_ref():
-    """Is the reference transcription faithful to what production actually runs?"""
+    """The reference transcription matches the production softmax and megatron's routing."""
     print("[REF] reference transcription vs the real production ops")
     T = 320
     lg = gating_logits(T)
     scores, _ = torch.topk(lg, K, dim=1, sorted=True)
-    # 1. torch.softmax under the vllm override IS the five-op decomposition ref_router_dense spells out
+    # 1. under the vllm override, torch.softmax is ref_router_dense's five-op decomposition
     m = torch.amax(scores, dim=-1, keepdim=True)
     ex = torch.exp(scores - m)
     manual = ex / torch.sum(ex, dim=-1, keepdim=True)
@@ -146,7 +116,7 @@ def test_ref():
 
 # =================================================================================================
 def test_hazard():
-    """The three Triton-vs-ATen hazards this kernel touches, MEASURED. Prints diff counts."""
+    """Measures the three Triton-vs-ATen hazards this kernel touches, printing diff counts."""
     print("[HAZARD] exp / division / fp32 reduction order -- measured element diffs vs ATen")
     T = 8192
     lg = gating_logits(T, seed=3)
@@ -197,8 +167,8 @@ def test_hazard():
         if not rn and d == 0:
             _fail.append("triton `/` control vacuous (expected a large diff)")
 
-    # HAZARD 2b -- FTZ. Both forms above are wrong, in opposite directions, and neither shows it on
-    # well-conditioned data. This is the check the first version of this kernel did not have.
+    # hazard 2b -- FTZ: both forms above are wrong in opposite directions, and neither shows it on
+    # well-conditioned data
     from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_router_o2_kernel import (
         _div_rn_nonftz,  # noqa: F401
     )
@@ -275,13 +245,8 @@ def test_hazard():
 
 # =================================================================================================
 def test_ffma():
-    """Hazard 4 with LIVE POSITIVE CONTROLS, so a pass cannot be an artefact of immunity.
-
-    The O2 kernel has no `acc += b*c` -- the softmax is exp/sum/div and the scatter is a copy -- so
-    it is structurally immune, exactly like O3's conv (0/327,680). A check that passed for THAT
-    reason would also pass with `enable_fp_fusion=False` deleted. So: prove the flag reaches the
-    compiler and that this harness can SEE contraction, then assert the kernel is invariant to it.
-    """
+    """The kernel is invariant to fp contraction, with live positive controls first so a pass
+    cannot be an artefact of the harness being unable to see contraction at all."""
     print("[FFMA] contraction hazard -- positive controls first, then the kernel")
     N = 81920
     g = torch.Generator(device=dev).manual_seed(11)
@@ -289,7 +254,7 @@ def test_ffma():
     b = torch.randn(N, device=dev, dtype=torch.float32, generator=g)
     c = torch.randn(N, device=dev, dtype=torch.float32, generator=g)
 
-    # CONTROL (a): eager (separate mul then add) vs torch.addcmul (one fused op) on fp32.
+    # control (a): eager (separate mul then add) vs torch.addcmul (one fused op) on fp32
     eager = a + b * c
     fused = torch.addcmul(a, b, c)
     d = int((eager != fused).sum().item())
@@ -297,7 +262,7 @@ def test_ffma():
     if d == 0:
         _fail.append("FFMA control (a) VACUOUS -- eager and addcmul agreed, the check proves nothing")
 
-    # CONTROL (b): the same expression through Triton, with fp fusion on vs off.
+    # control (b): the same expression through Triton, with fp fusion on vs off
     @triton.jit
     def _fma_probe(A, B, C, O, N, BLOCK: tl.constexpr):
         p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -320,7 +285,7 @@ def test_ffma():
         f"  control (b) fp_fusion=ON  vs torch.addcmul: {int((outs[True] != fused).sum().item())}/{N} differ (expect 0 -- contraction == addcmul)"
     )
 
-    # THE KERNEL: bit-identical under both settings, and equal to the EAGER reference.
+    # the kernel: bit-identical under both settings, and equal to the eager reference
     from skyrl.backends.skyrl_train.isoexec.ops.moe import moe_router_o2_kernel as m2
 
     lg = gating_logits(4096, seed=5)
@@ -351,8 +316,8 @@ def test_ffma():
 
 # =================================================================================================
 def _router_case(name, lg, k=K, scale=None):
-    # Say WHICH path ran. `fused_router_dense` falls back to the eager sequence outside its
-    # envelope, and a fallback compares the reference against itself -- a vacuous pass.
+    # say which path ran: outside its envelope `fused_router_dense` falls back to eager, and a
+    # fallback compares the reference against itself
     tag = "" if _router_can_handle(lg, k) else "  [FALLBACK -- eager, not the kernel]"
     rp, rm = ref_router_dense(lg, k, scaling_factor=scale)
     fp, fm = fused_router_dense(lg, k, scaling_factor=scale)
@@ -362,17 +327,17 @@ def _router_case(name, lg, k=K, scale=None):
 
 def test_router():
     print("[ROUTER] dense routing_probs / routing_map, torch.equal vs eager")
-    # ragged decode: 320 sequences x 1 token -- the production decode shape
+    # ragged decode: 320 sequences x 1 token, the production decode shape
     _router_case("decode T=320 E=256 k=8", gating_logits(320, seed=1))
     _router_case("decode T=1", gating_logits(1, seed=2))
     _router_case("decode T=7 (partial warp)", gating_logits(7, seed=8))
     # prefill
     for T in (512, 2048, 8192):
         _router_case(f"prefill T={T}", gating_logits(T, seed=T))
-    # E non-power-of-2, and E=128 (the ledger's bench shape)
+    # E non-power-of-2, and E=128
     for e in (128, 192, 255, 100, 8):
         _router_case(f"E={e:<4d} T=320", gating_logits(320, e=e, seed=e), k=min(K, e))
-    # k sweep (power-of-two only -- the envelope refuses the rest, see _router_can_handle)
+    # k sweep: power-of-two only, since the envelope refuses the rest
     for k in (1, 2, 4, 8, 16):
         _router_case(f"k={k:<3d} T=320 E=256", gating_logits(320, seed=100 + k), k=k)
     # scaling factor
@@ -381,7 +346,7 @@ def test_router():
 
 # =================================================================================================
 def _tie_rows(T=64, e=E):
-    """Adversarial EXACT-tie patterns. Tie-break order decides WHICH EXPERTS RUN."""
+    """Adversarial exact-tie patterns; tie-break order decides which experts run."""
     base = gating_logits(T, e=e, seed=42)
     cases = {}
     x = base.clone()
@@ -413,7 +378,7 @@ def test_ties():
     print("[TIES] EXACT ties -- membership is not a rounding detail")
     for name, lg in _tie_rows().items():
         _router_case(f"tie: {name}", lg)
-        # and through the sort, where a different member set would relocate whole rows
+        # and through the sort, where a different member set relocates whole rows
         rp, rm = ref_router_dense(lg, K)
         fs = fused_permute_index(rm, rp, K)
         rs = ref_permute_index(rm, rp, K)
@@ -446,8 +411,8 @@ def test_sort():
     rp, rm = ref_router_dense(lg, 1)
     _sort_case("E=1 (all tokens -> one expert)", rm, rp, 1)
 
-    # EMPTY EXPERT RUNS: leading / trailing / interior. The counting sort's base offsets and the
-    # eager argsort must agree about zero-length segments.
+    # empty expert runs: the counting sort's base offsets and the eager argsort must agree about
+    # zero-length segments
     T = 320
     rp0, rm0 = ref_router_dense(gating_logits(T, seed=5), K)
     for nm, sl in (
@@ -468,11 +433,8 @@ def test_sort():
             rp[t, free] = 0.125
         _sort_case(nm, rm, rp, K)
 
-    # EP>1-STYLE SLICE: fewer than k local experts per token. The kernel must NOT be used here
-    # (dispatch_o2_active refuses ep_size>1) because num_out_tokens=T*k then exceeds the routed-row
-    # count and the eager argsort pads the tail from the FALSE region. Assert the refusal, and
-    # assert that the SEGMENT the kernel does fill still matches -- so if the guard is ever
-    # loosened, the reason it exists is visible here rather than as a garbage read in production.
+    # EP>1-style slice (fewer than k local experts per token): num_out_tokens=T*k then exceeds the
+    # routed-row count, which is why dispatch_o2_active refuses ep_size>1
     rp_s, rm_s = ref_router_dense(gating_logits(T, seed=6), K)
     rm_sl, rp_sl = rm_s[:, :64].contiguous(), rp_s[:, :64].contiguous()
     n_routed = int(rm_sl.sum().item())
@@ -483,7 +445,7 @@ def test_sort():
     print(f"  note: {n_routed}/{T * K} slots are routed here -- the {T * K - n_routed}-slot tail is why")
     print("        dispatch_o2_active requires ep_size==1; the fused path is never taken at EP>1.")
 
-    # ALL TOKENS TO ONE EXPERT (a single maximal segment)
+    # all tokens to one expert (a single maximal segment)
     rm = torch.zeros(T, E, dtype=torch.bool, device=dev)
     rm[:, :K] = True
     rp = torch.zeros(T, E, dtype=torch.float32, device=dev)
@@ -499,18 +461,8 @@ def test_sort():
 
 # =================================================================================================
 def test_dist():
-    """UNREPRESENTATIVE INPUTS ARE HOW O3 PASSED OFFLINE AND FAILED LIVE BY 2e-02.
-
-    O6's gap analysis: `randn` rows are well-conditioned, while real residual streams carry
-    massive-activation outliers orders of magnitude above the row, and an outlier DOMINATES the
-    fp32 reduction these kernels must reproduce bit for bit. So gate on heavy-tailed and
-    outlier-injected logits, not just on a well-behaved matmul.
-
-    O2 is *structurally* far less exposed than O3 was -- the only fp32 reduction is a sum of k=8
-    values in (0, 1] whose largest term is exactly 1.0 by construction (the max is subtracted
-    first), so the summands cannot span orders of magnitude however wild the logits are. That is an
-    argument; these are the measurements.
-    """
+    """Bitwise equality on adversarial logit distributions, not just well-conditioned `randn` rows:
+    real residual streams carry massive-activation outliers that dominate an fp32 reduction."""
     print("[DIST] adversarial input distributions -- the O3 lesson, applied")
     g = torch.Generator(device=dev).manual_seed(1234)
     T = 1024
@@ -539,7 +491,7 @@ def test_dist():
     for name, lg in cases.items():
         rp, rm = ref_router_dense(lg, K)
         fp_, fm = fused_router_dense(lg, K)
-        # NaN == NaN is False for torch.equal, so compare bit patterns where NaNs are expected.
+        # NaN == NaN is False for torch.equal, so compare bit patterns where NaNs are expected
         if torch.isnan(rp).any():
             eq(f"dist: {name} probs (bit pattern)", fp_.view(torch.int32), rp.view(torch.int32))
         else:
@@ -552,24 +504,19 @@ def test_dist():
 
 # =================================================================================================
 def test_ftz():
-    """The FTZ check, through the SHARED helper -- and it must not be vacuous.
-
-    ``ftz_check.assert_no_ftz`` separates a FLUSHED subnormal from ordinary disagreement, and fails
-    when the reference contains no subnormal at all -- because then the input cannot detect FTZ and
-    a pass proves nothing. That is the same vacuity rule the FFMA controls follow.
-    """
+    """The kernel flushes no subnormal, via ``ftz_check.assert_no_ftz``, which itself fails when the
+    reference holds no subnormal and the input therefore could not detect FTZ."""
     print("[FTZ] flushed-subnormal check on the real kernel, via the shared helper")
     from _ftz_check import assert_no_ftz, ftz_inputs_for
 
-    # The massive-activation router row: this is the input that caught the bug.
+    # the massive-activation router row: the input that caught the bug
     lg = ftz_inputs_for("softmax_row", n=256 * 1024).float()
     rp, rm = ref_router_dense(lg, K)
     fp_, fm = fused_router_dense(lg, K)
     st = assert_no_ftz("O2 router probs (massive-activation rows)", rp, fp_, fail_list=_fail)
     print(f"       ({st['subnormal']} of {rp.numel()} reference probs are subnormal -- the check has teeth)")
 
-    # NEGATIVE CONTROL: the same kernel body with libdevice.div_rn must FLUSH, or the helper is
-    # not actually detecting anything and this whole section is decoration.
+    # negative control: libdevice.div_rn must flush, or the helper detects nothing
     @triton.jit
     def _ftz_div(A, B, O, N, BLOCK: tl.constexpr):
         p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -585,14 +532,8 @@ def test_ftz():
 
 # =================================================================================================
 def test_steps():
-    """A LONG, RAGGED, CHANGING SEQUENCE OF CALLS -- the second hole O3 exposed.
-
-    O3's failure was partly that no test ran its recurrence for more than one step. O2 carries NO
-    state: three kernels, all outputs freshly allocated, no module-level buffer, no cache, no slot
-    map, nothing that persists between calls. This asserts that rather than claiming it -- 200
-    consecutive calls at *changing ragged* shapes, each still bitwise vs eager, and the first shape
-    re-checked at the end to prove nothing drifted.
-    """
+    """The path carries no state: 200 consecutive calls at changing ragged shapes stay bitwise vs
+    eager, and the first shape is re-checked at the end."""
     print("[STEPS] 200 consecutive calls at changing ragged shapes -- statelessness")
     g = torch.Generator(device=dev).manual_seed(7)
     first = gating_logits(320, seed=4242)
@@ -627,19 +568,10 @@ def test_steps():
 
 # =================================================================================================
 def test_invar():
-    """BATCH INVARIANCE -- and the reason no 8-rank test is needed for O2.
+    """A token's dense row is a pure function of its own logits, independent of T and position.
 
-    THE TP ARGUMENT, stated so it can be checked rather than assumed. The production engine runs
-    EP=1/ETP=TP, so (a) every rank sees all E=256 experts -- the router's expert axis is NOT
-    sharded -- and (b) under the no-gather dispatch every rank already holds the full batch, so T is
-    the same on every rank. The router's `logits` are the output of a TP-replicated gating GEMM.
-    So all 8 ranks feed this kernel IDENTICAL bits and it has no rank-dependent shape, stride or
-    layout: there is nothing for TP to vary. (Contrast O3, whose gate ran 4/8 k/v heads while
-    production runs 2/4 -- a head-count-dependent kernel wearing TP8 clothing.)
-
-    What that argument REDUCES TO is batch invariance: a token's dense row must be a pure function
-    of its own logits, independent of T, of its position, and of who else is in the batch. That is
-    directly testable in one process, and it is what is tested here.
+    With EP=1 and replicated gating logits every rank feeds identical bits, so this stands in for
+    an 8-rank test.
     """
     print("[INVAR] a token's dense row is a pure function of its own logits")
     g = torch.Generator(device=dev).manual_seed(31)
@@ -669,8 +601,8 @@ def test_degen():
     lg[2] = float("inf")
     lg[3] = float("-inf")
     fp_, fm = fused_router_dense(lg, K)
-    # THE INVARIANT that the engine-init crash was: the scattered map must have exactly k experts
-    # per row and never write outside [0, E). A sentinel index would corrupt memory, not just bits.
+    # the scattered map must have exactly k experts per row and never write outside [0, E): an
+    # out-of-range index corrupts memory rather than only bits (this was an engine-init crash)
     cnt = fm.sum(dim=1)
     ok = bool((cnt == K).all().item())
     print(
@@ -678,14 +610,13 @@ def test_degen():
     )
     if not ok:
         _fail.append("degenerate rows produced an out-of-range / duplicate expert index")
-    # NaN rows produce NaN probs under either ranking, so nothing numerical is at stake; finite rows
-    # must still be bitwise.
+    # NaN rows give NaN probs under either ranking; finite rows must still be bitwise
     fin = torch.isfinite(lg).all(dim=1)
     rp, rm = ref_router_dense(lg, K)
     eq("finite rows still bitwise alongside NaN/inf rows", fp_[fin], rp[fin])
     eq("finite rows map still bitwise", fm[fin], rm[fin])
 
-    # envelope: these must be REFUSED (fall back), not asserted -- an assert here kills a Ray actor
+    # envelope: these must fall back, not assert -- an assert here kills a Ray actor
     checks = [
         ("k=3 (non power of two -> reduction order re-associates)", torch.zeros(4, 16, device=dev), 3, False),
         ("bf16 logits", torch.zeros(4, 16, device=dev, dtype=torch.bfloat16), 8, False),
@@ -759,7 +690,7 @@ def test_sync():
     rs = ref_permute_index(rm, rp, K)
     eq("graph replay: sorted_indices", gs[0], rs[0])
     eq("graph replay: permuted_probs", gs[1], rs[1])
-    # a second replay with different data must track it (nothing baked in at capture)
+    # a second replay with different data must track it: nothing baked in at capture
     lg2 = gating_logits(320, seed=99)
     static.copy_(lg2)
     g.replay()
@@ -770,8 +701,7 @@ def test_sync():
 
 # =================================================================================================
 def _bench(fn, iters=50):
-    """Median wall time of `fn` inside a REPLAYED CUDA graph (production decode is graph-replayed;
-    an eager-loop number is a fantasy -- O3's eager arm read 15.75 ms for a 0.278 ms kernel)."""
+    """Median wall time of `fn` inside a replayed CUDA graph, as production decode runs it."""
     for _ in range(5):
         fn()
     torch.cuda.synchronize()
@@ -798,12 +728,7 @@ def _bench(fn, iters=50):
 
 
 def test_count():
-    """CUDA kernel launches per MoE layer, eager vs fused -- the quantity the ledger prices.
-
-    The ledger measures cluster P8 at 23.8 launches/layer (952.0/step over 40 layers) and prices
-    O2 at 792 launches removed. This counts the same thing offline, so the live A/B has a
-    prediction to land against rather than a hope.
-    """
+    """Counts CUDA kernel launches per MoE layer, eager vs fused."""
     print("[COUNT] CUDA kernel launches per MoE layer (torch profiler), eager vs fused")
     from torch.profiler import ProfilerActivity, profile
 

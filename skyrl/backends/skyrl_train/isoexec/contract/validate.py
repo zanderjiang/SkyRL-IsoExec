@@ -25,8 +25,7 @@ class ValidationError(Exception):
 
 
 def _is_finite_threshold(value) -> bool:
-    # A bound is a decimal string, so "nan"/"inf" parse: they are the values that make a comparison
-    # against the bound vacuous, which is why float() alone is not the check.
+    # Bounds are decimal strings, so "nan"/"inf" parse -- and make the comparison vacuous.
     try:
         return math.isfinite(float(value))
     except (TypeError, ValueError):

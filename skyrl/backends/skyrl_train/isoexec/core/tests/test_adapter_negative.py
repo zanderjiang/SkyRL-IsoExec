@@ -1,11 +1,6 @@
-"""The negative-path battery: every designed refusal, proven to refuse (or to record exactly its
-designed severity), each scenario through the REAL adapter/ledger path with state restored.
+"""Negative-path battery: every designed refusal proven to refuse at its designed severity.
 
-Scenarios: topology outside the claimed domain; perturbed weight-sync stamp; install-vs-declaration
-divergence (wrong impl, wrong pin) refusing at FIRST_FORWARD; a suppressed reporter surfacing as a
-missing-violation; an unknown claim kind; attestation-digest divergence breaking the pair; every
-EXCEPTIONS entry soft exactly at its target with a non-excepted neighbor still refusing; and the
-SKYRL_ISOEXEC_MANIFEST_STRICT=0 demotion of each refusal to warn-only.
+Each scenario runs through the real adapter/ledger path with process state restored afterwards.
 """
 
 import dataclasses
@@ -31,7 +26,7 @@ from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.adapter import VLLMContrac
 # torch-first, as in production.
 from skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy import CudaIpcInitInfo
 
-# CPU-only harness (a live production run owns the GPUs): real builds read core/arch.ARCH.
+# Real builds read core/arch.ARCH; on a CPU-only host point it at the production accelerator.
 if arch_mod.ARCH == arch_mod.NON_ACCELERATOR_ARCH:
     arch_mod.ARCH = "sm90"
 
@@ -166,14 +161,13 @@ def test_perturbed_stamp_refuses_at_weight_sync():
 
 
 def test_wrong_impl_refuses_at_first_forward():
-    # gdn.state carries no fingerprint exception, so a mismatch refuses at FIRST_FORWARD per the
-    # severity table.
+    # gdn.state carries no fingerprint exception, so a mismatch refuses at FIRST_FORWARD.
     target = ("gdn.state", "engine_prefill")
     assert enforce.exemption_for("fingerprint:gdn.state:engine_prefill") is None
     assert enforce.SEVERITY[(enforce.FINGERPRINT, enforce.FIRST_FORWARD)] == enforce.REFUSE
     with _fresh():
         engine = ad.set_process_adapter(_mk_engine(_stub_install("engine", wrong_impl={target: "legacy_pool"})))
-        assert engine.run_install() is True  # attesting the (wrong) install IS the record; INSTALL closes
+        assert engine.run_install() is True  # the wrong install is attested, so INSTALL closes
         msg = _refuses(engine.on_first_forward)
         assert "fingerprint:gdn.state:engine_prefill" in msg and "violation" in msg
         rec = enforce.ledger().records["fingerprint:gdn.state:engine_prefill"][-1]
@@ -226,9 +220,8 @@ def test_unknown_claim_kind_refuses_through_adapter():
 
 
 def test_attestation_divergence_breaks_the_pair():
-    # Two simulated processes with IDENTICAL declarations; one installs differently. The INSTALL
-    # boundary alone cannot see it (fingerprints owe FIRST_FORWARD), but the attestation digest
-    # folds the divergence into the composite and the pair refuses at weight sync.
+    # Identical declarations but a divergent install: INSTALL alone cannot see it, so the
+    # attestation digest must fold it into the composite and refuse at weight sync.
     with _fresh():
         trainer = ad.set_process_adapter(_mk_trainer(_stub_install("trainer")))
         assert trainer.run_install() is True
@@ -284,13 +277,13 @@ def test_every_exception_soft_at_its_target_and_nowhere_else():
 
 
 def test_strictness_demotes_each_refusal_to_warn_only():
-    # (a) topology outside the domain: the sequence completes, the INSTALL close returns False.
+    # (a) topology outside the domain.
     with _fresh():
         os.environ[STRICT_ENV] = "0"
         engine = ad.set_process_adapter(_mk_engine(_stub_install("engine"), tp=16))
         assert engine.run_install() is False
         assert enforce.ledger().records["domain_check:TP"][-1].result == "violation"
-    # (b) perturbed stamp: violation recorded, weight-sync close returns False instead of raising.
+    # (b) perturbed stamp.
     with _fresh():
         os.environ[STRICT_ENV] = "0"
         engine = ad.set_process_adapter(_mk_engine(_stub_install("engine")))
@@ -298,19 +291,19 @@ def test_strictness_demotes_each_refusal_to_warn_only():
         stamp = pc.contract_hash()
         assert engine.on_weight_sync(_stamp(stamp[:-1] + ("0" if stamp[-1] != "0" else "1"))) is False
         assert enforce.ledger().records["handshake:numerical_policy"][-1].result == "violation"
-    # (c) wrong impl: FIRST_FORWARD close returns False instead of raising.
+    # (c) wrong impl.
     with _fresh():
         os.environ[STRICT_ENV] = "0"
         wrong = {("gdn.state", "engine_prefill"): "legacy_pool"}
         engine = ad.set_process_adapter(_mk_engine(_stub_install("engine", wrong_impl=wrong)))
         assert engine.run_install() is True
         assert engine.on_first_forward() is False
-    # (d) suppressed reporter: INSTALL close returns False instead of raising.
+    # (d) suppressed reporter.
     with _fresh():
         os.environ[STRICT_ENV] = "0"
         trainer = ad.set_process_adapter(_mk_trainer(_stub_install("trainer", skip={("mm", "trainer_fwd")})))
         assert trainer.run_install() is False
-    # (e) unknown claim kind: error-logged, the sequence still runs, the violation is on record.
+    # (e) unknown claim kind.
     with _fresh():
         os.environ[STRICT_ENV] = "0"
         ExtClaims = dataclasses.make_dataclass(

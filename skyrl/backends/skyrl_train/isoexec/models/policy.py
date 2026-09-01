@@ -1,10 +1,7 @@
 """The derivation: ``ModelProfile`` -> ``{(op, site) -> Selection}``. Model-independent.
 
-The site policy, stated once: the trainer runs the grad-capable reference at both of its sites, and
-the engine runs the fused twin wherever one exists and declares
-``capabilities["bitwise_equal_to"]`` naming that reference. Where no such twin exists both sides run
-the same impl and the op owes no equivalence proof; ``policy_matches_registry_capabilities``
-re-derives that rule from the registry so the two cannot drift.
+Site policy: the trainer runs the grad-capable reference, the engine the fused twin wherever one
+declares ``capabilities["bitwise_equal_to"]`` naming that reference; otherwise both run one impl.
 """
 
 from __future__ import annotations
@@ -23,9 +20,8 @@ Key = Tuple[str, str]  # (op, site)
 class Selection:
     """One resolved (op, site) selection; identity is impl@version x arch.
 
-    ``pinned_constants`` (autotune index, boundary dtypes, block sizes, leaf counts) move bits, so
-    they are hashed into the contract's function half. ``neutrality_proof`` is mandatory for a
-    DEPLOYMENT selection: it points at the gate run that proved this selection bitwise-neutral.
+    ``pinned_constants`` move bits and are hashed into the contract's function half.
+    ``neutrality_proof`` is mandatory for a DEPLOYMENT selection.
     """
 
     impl_id: str
@@ -46,7 +42,6 @@ class Selection:
                 "on; refusing to classify without one."
             )
         if self.classification == FUNCTION and self.neutrality_proof:
-            # A function-half selection is hashed regardless, so carrying a proof is a classification bug.
             raise ContractBuildError(
                 "a function-half entry must not carry a neutrality_proof; either it is proven "
                 "neutral (classify it deployment) or it is not (leave it function)."
@@ -58,8 +53,8 @@ TRAINER = ("trainer_fwd", "trainer_score")
 ENGINE = ("engine_prefill", "engine_decode")
 ALL_SITES = TRAINER + ENGINE
 
-# The engine-unpin neutrality proof is entry-scoped: the trainer selection stays FUNCTION-classified
-# because changing it changes the trainer composition and reassociates backward reductions.
+# Entry-scoped: the trainer selection stays FUNCTION-classified, since changing it reassociates
+# backward reductions.
 NCCL_ENGINE_UNPIN_PROOF = "engine-unpin measured bitwise-neutral (perf-attribution A/B)"
 
 # Sentinel for an exception that DELETES a derived key (the model has no such site after all).
@@ -82,9 +77,7 @@ _e = entry  # internal shorthand used by the derivation below
 def router_is_fusable(router: RouterProfile) -> bool:
     """Is the engine's fused ``moe.router`` (``fused_o2``) eligible for this router shape?
 
-    The kernel carries the same guard internally and declines when it fails; consulting it here keeps
-    the contract from naming an impl that will decline at install time. There is no fused sigmoid twin
-    at the same bits, and there cannot be one.
+    Mirrors the kernel's own guard, so the contract never names an impl that declines at install.
     """
     return router.score_function == SCORE_SOFTMAX and not router.expert_bias
 
@@ -92,25 +85,21 @@ def router_is_fusable(router: RouterProfile) -> bool:
 def mm_impl_for_process() -> str:
     """Which global GEMM provider this process will install.
 
-    Flag-conditional on purpose: if only one process enables ``SKYRL_ISOEXEC_MM_CUBLASLT`` the two
-    contract hashes diverge and the weight-sync handshake refuses to run, rather than silently
-    mixing GEMM providers across the two forwards.
+    Flag-conditional on purpose: a one-sided ``SKYRL_ISOEXEC_MM_CUBLASLT`` diverges the contract
+    hashes so the weight-sync handshake refuses, rather than silently mixing GEMM providers.
     """
     return "cublaslt_pinned" if os.environ.get("SKYRL_ISOEXEC_MM_CUBLASLT", "0") == "1" else "triton_batch_invariant"
 
 
-#: The fixed per-leaf tile of the rowinv Kahan exp sum. A contract constant, not a tuning knob:
-#: it must equal the BLOCK ``ops/logprobs/rowinv.py`` compiles with, and the registry declares the
-#: same literal, so a drifted kernel refuses at pin validation instead of hashing a schedule the
-#: process does not run.
+#: Per-leaf tile of the rowinv Kahan exp sum. A contract constant, not a knob: it must equal the
+#: BLOCK ``ops/logprobs/rowinv.py`` compiles with, else pin validation refuses.
 ROWINV_BLOCK = 4096
 
 
 def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
     """``ModelProfile`` -> the complete ``{(op, site): Selection}`` selection set.
 
-    Every ``(op, site)`` this architecture installs gets an explicit entry, and an op the architecture
-    does not run gets no key at all -- absence means "no such site", never "default".
+    An op the architecture does not run gets no key: absence means "no such site", never "default".
     """
     s: Dict[Key, Selection] = {}
 
@@ -121,9 +110,7 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
     # Global GEMM.
     put("mm", ALL_SITES, impl=mm_impl_for_process())
 
-    # Attention.
-    # torch FA3 varlen on the trainer (grad-capable reference), vLLM's FA3 varlen on the engine at the
-    # same num_splits=1 pin -- that pin is the contract, since split-K is what makes decode != prefill.
+    # Attention. The num_splits=1 pin is the contract: split-K is what makes decode != prefill.
     put("attention.varlen", TRAINER, impl="varlen_custom", pinned={"num_splits": 1})
     put("attention.varlen", ENGINE, impl="vllm_flash_ns1", pinned={"num_splits": 1, "fa_version": 3})
 
@@ -131,8 +118,7 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
     put("rope.rope", TRAINER, impl="eager")
     put("rope.rope", ENGINE, impl="fused")
 
-    # Norms.
-    # The fused engine twin exists only for the zero-centred form: it rebinds forward on
+    # Norms. The fused engine twin exists only for the zero-centred form: it rebinds forward on
     # ZeroCenteredTorchRMSNorm instances, of which a plain-RMS model builds none.
     if profile.zero_centered_norms:
         put("norms.rms", TRAINER, impl="eager_zero_centered")
@@ -140,36 +126,27 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
     else:
         put("norms.rms", ALL_SITES, impl="eager_torch_rms")
 
-    # Logprobs.
-    # The leaf-tree impl is ONE function at all four sites -- that is the whole point (aten's
-    # vocab sum is neither row-count- nor TP-invariant, so no twin of it can serve both runtimes),
-    # so there is no engine-only variant and no site keeps the incumbent. Unconditional: this is
-    # the composition, not a choice, and the aten-order selection it replaced is gone rather than
-    # flag-reachable. FUNCTION-classified (the default): it moves bits, so it is hashed, never
-    # proof-carried.
+    # Logprobs. One function at all four sites, unconditionally: aten's vocab sum is neither
+    # row-count- nor TP-invariant, so no twin of it can serve both runtimes.
     put(
         "logprobs.log_softmax",
         ALL_SITES,
         impl="rowinv_leaftree",
-        # The pins ARE the function: G fixes the leaf boundaries and the combine tree, BLOCK the
-        # per-leaf tile, and the accumulator names the per-leaf summation.
+        # The pins are the function: leaf boundaries, per-leaf tile, per-leaf summation.
         pinned={"leaves": profile.pik_leaves, "block": ROWINV_BLOCK, "accum": "kahan_fp32"},
     )
-    # The lm_head row slice is engine-only either way: the trainer scores every position, the
-    # engine sampled rows -- a pure row selection, orthogonal to which denominator schedule runs.
+    # Engine-only: the trainer scores every position, the engine only sampled rows.
     put("logprobs.lm_head_slice", ENGINE, impl="sampled_rows")
 
     # GatedDeltaNet.
     if profile.has_gdn:
-        # The native fused core subsumes gdn.l2norm and gdn.gating, so those get no standalone entry;
-        # the registry's `subsumes` field drives the adapter's derived passthrough.
+        # The fused core subsumes gdn.l2norm and gdn.gating, so those get no standalone entry.
         put("gdn.core", ALL_SITES, impl="native_fused_sigmoid", pinned={"kernel": profile.gdn_kernel})
         # Distinct kernels per site, parity-proven: the fn form at prefill/trainer, update at decode.
         put("gdn.conv", TRAINER + ("engine_prefill",), impl="causal_conv1d_fn")
         put("gdn.conv", ("engine_decode",), impl="causal_conv1d_update")
-        # Engine-only state, and which object owns it is decided by the GDN mode: under
-        # `cpr` the engine refuses GDN_NATIVE_STATE=1 and CprGDN raises on a
-        # handed-in state tensor, so `native_kv_cache` is not selectable there.
+        # Engine-only state; the GDN mode decides the owner. Under `cpr` the engine refuses
+        # GDN_NATIVE_STATE=1, so `native_kv_cache` is not selectable there.
         if profile.gdn_kernel == "cpr":
             put(
                 "gdn.state",
@@ -177,15 +154,14 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
                 impl="cpr_pool",
                 pinned={
                     "ssm_state_dtype": profile.ssm_cache_dtype,
-                    # The trainer's segmented scan and this pool's boundary pass are the same
-                    # function only at the same C, so C is pinned rather than assumed.
+                    # The trainer's segmented scan and this pool's boundary pass agree only at the
+                    # same chunk size, so it is pinned rather than assumed.
                     "chunk_size": profile.gdn_chunk_size,
                 },
             )
         else:
             # fp32 SSM cache pinned (the boundary-dtype guard).
             put("gdn.state", ENGINE, impl="native_kv_cache", pinned={"ssm_cache_dtype": profile.ssm_cache_dtype})
-        # The GDN gated output norm: fused engine twin of the eager reference.
         put("norms.gated_out", TRAINER, impl="eager")
         put("norms.gated_out", ENGINE, impl="fused")
 
@@ -194,12 +170,11 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
         r = profile.router
         if router_is_fusable(r):
             # Site-asymmetric, membership-equivalent. No pins: the softmax router's shape lives in
-            # the config, not in the rounding schedule.
+            # the config, not the rounding schedule.
             put("moe.router", TRAINER, impl="deterministic")
             put("moe.router", ENGINE, impl="fused_o2")
         else:
-            # One impl at every site, and the pins are part of the function: expert bias, top-k,
-            # scaling factor and epsilon each move bits; group_topk=None records a bypassed path.
+            # One impl at every site; every pin moves bits (group_topk=None records a bypassed path).
             put(
                 "moe.router",
                 ALL_SITES,
@@ -213,26 +188,23 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
                 },
             )
         put("moe.dispatch", ALL_SITES, impl="index_build")
-        # Site-asymmetric, max|diff|=0 proven. Fusing both sides loses on the backward: the fused
-        # forward is padding-free and every bmm-shaped backward must rebuild that padding.
+        # Site-asymmetric, max|diff|=0 proven. Fusing both sides loses on the backward, which would
+        # have to rebuild the padding the fused forward avoids.
         put("moe.experts", TRAINER, impl="batched_bmm")
         put("moe.experts", ENGINE, impl="fused")
         # Deliberately NOT ``_pik(profile)``: the MoE combine's leaves are per-rank fc2 partials and
-        # stay fp32 whatever the dense plan's leaf dtype is (its bf16 wire is a lossless narrowing,
-        # not a leaf rounding). Sharing _pik here would refuse a sound dense bf16-leaf deployment.
+        # stay fp32 whatever the dense plan's leaf dtype is.
         put("moe.combine", ALL_SITES, impl="pik_leaf_tree", pinned={"leaves": profile.pik_leaves, "leaf_dtype": "fp32"})
         put("moe.weights", ENGINE, impl="fused_buffer")
         put("moe.epilogue", ENGINE, impl="fused_swiglu")
         put("moe.blockmap", ENGINE, impl="fused")
 
-    # Collectives.
-    # Present iff TP>1: at TP=1 they do not install, so they must carry no entry at all.
+    # Collectives. Present iff TP>1: at TP=1 they do not install, so they carry no entry at all.
     if profile.tensor_parallel:
         put("collectives.tree_all_reduce", ALL_SITES, impl="pik_tree", pinned=_pik(profile))
         put("collectives.row_parallel", ALL_SITES, impl="pik_tree")
-        # Trainer pinning is an explicit FUNCTION composition choice. Read the same flag as the
-        # runtime installer so an unpinned arm is represented in the contract rather than tolerated
-        # as a fingerprint mismatch; the default stays pinned. The engine entry is DEPLOYMENT-neutral.
+        # Trainer pinning is a FUNCTION composition choice, read from the same flag as the runtime
+        # installer so an unpinned arm shows up in the contract. The engine entry is DEPLOYMENT.
         from ..ops.collectives.nccl_identity import (
             PINNED,
             constants_for_impl,
@@ -244,8 +216,8 @@ def derive_selections(profile: ModelProfile) -> Dict[Key, Selection]:
             trainer_nccl = requested_trainer_identity()
         except ValueError as exc:
             raise ProfileError(f"{profile.model!r}: invalid trainer NCCL composition request: {exc}") from exc
-        # Always declare the exact installed tuple: the trainer pin is FUNCTION-half, so its
-        # constants belong in the hash (the live fingerprint compares them verbatim).
+        # Always the exact installed tuple: the trainer pin is FUNCTION-half, so its constants are
+        # hashed and the live fingerprint compares them verbatim.
         trainer_pins = constants_for_impl(trainer_nccl)
         if trainer_nccl != PINNED:
             requested = trainer_pins
@@ -292,17 +264,15 @@ def _pik(profile: ModelProfile) -> dict:
 def apply_exceptions(selections: Dict[Key, Selection], exceptions: Optional[dict]) -> Dict[Key, Selection]:
     """Apply a model file's exception list on top of the derived selections.
 
-    An exception key is ``(op, site)`` or ``(op, "*")`` (all sites the derivation produced for that
-    op); the value is a ``Selection``, or ``DROP`` to delete the key. Every exception changes the
-    contract's numerical_policy identity, and therefore the gate signature key.
+    A key is ``(op, site)`` or ``(op, "*")``; the value is a ``Selection`` or ``DROP``. Every
+    exception rotates the contract's numerical_policy identity.
     """
     if not exceptions:
         return selections
     out = dict(selections)
     for key, val in exceptions.items():
         op, site = key
-        # For an exact site the key must already exist: an exception overrides, and may never
-        # introduce a site the derivation says the architecture does not have.
+        # An exception overrides or drops; it may never introduce a site the derivation lacks.
         targets = [k for k in out if k[0] == op] if site == "*" else [(op, site)] if (op, site) in out else []
         if not targets:
             raise ValueError(
@@ -326,16 +296,10 @@ def build_selections(profile: ModelProfile, exceptions: Optional[dict] = None) -
 def policy_matches_registry_capabilities(profile: ModelProfile, registry) -> list:
     """Re-derive the site policy from the registry and report where this module disagrees.
 
-    An op whose sites do not all resolve to one impl must carry an equivalence claim, in one of three
-    forms, kept distinct so a pair is never pushed into the wrong one:
-
-      1. ``capabilities["bitwise_equal_to"] = <a trainer impl id>`` -- a byte-equal engine twin.
-      2. ``capabilities["equivalence_proof"] = "<pointer to the proving gate>"`` -- distinct kernels
-         exact for a reason other than kernel equality (``gdn.conv``'s fn/update pair, which does
-         NOT agree bitwise and rests on split-exactness at any token boundary).
-      3. A DEPLOYMENT-classified engine entry carrying a ``neutrality_proof``, scoped to that entry.
-
-    Returns a list of human-readable disagreements (empty == agreement).
+    An op whose sites do not all resolve to one impl must carry an equivalence claim in one of three
+    forms: ``capabilities["bitwise_equal_to"]`` naming a trainer impl, ``capabilities
+    ["equivalence_proof"]``, or a DEPLOYMENT-classified engine entry with a ``neutrality_proof``.
+    Returns human-readable disagreements; empty means agreement.
     """
     problems = []
     sel = derive_selections(profile)
@@ -353,7 +317,7 @@ def policy_matches_registry_capabilities(profile: ModelProfile, registry) -> lis
         if not tr or not en or tr == en:
             continue  # symmetric, or single-sided: no equivalence obligation to check
 
-        # Form 3 first: a deployment-classified engine entry is licensed by its own neutrality proof.
+        # Form 3: a deployment-classified engine entry is licensed by its own neutrality proof.
         engine_entries = [sel[(op, s)] for s in ENGINE if (op, s) in sel]
         if engine_entries and all(e.classification == DEPLOYMENT and e.neutrality_proof for e in engine_entries):
             continue

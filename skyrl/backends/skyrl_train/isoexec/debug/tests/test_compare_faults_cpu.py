@@ -1,14 +1,7 @@
-"""Fault-matrix guarantees for the comparator, on the two-sided pipeline in ``pipeline_fixture``.
+"""Fault-matrix tests for the comparator, on the two-sided pipeline in ``pipeline_fixture``.
 
-One test per guarantee: causal (not alphabetical) first divergence and contamination marking,
-shape/dtype divergences
-that keep their step and print their shapes, absent records as divergences instead of shifted
-alignment, rank-aware grouping and structural rank mismatch, honest sampling coverage, k-ladder
-brackets that do not saturate into a magnitude claim, surfaced unrecordable outputs, segment row
-localization, refusal of old trace formats, and a torch-free CLI.
-
-Run (CPU only):
-    python skyrl/backends/skyrl_train/isoexec/debug/tests/test_compare_faults_cpu.py
+One test per guarantee: causal first divergence and contamination, shape/dtype and absent records,
+rank awareness, sampling coverage, k-ladder brackets, segments, format refusal, torch-free CLI.
 """
 
 from __future__ import annotations
@@ -79,8 +72,7 @@ def _write(d, name, recs):
 
 
 def test_first_divergence_is_causal_not_alphabetical():
-    """A fault in the pipeline-FIRST region must not be reported as collectives.row_parallel_ar,
-    the alphabetically first contaminated region."""
+    """First divergence names the causally first region, not the alphabetically first one."""
     base = _tmp()
     try:
         da, db = pf.run_pair(base, fault={"kind": "add", "region": "norms.rms", "layer": 1, "step": 1, "delta": 1.0})
@@ -106,7 +98,6 @@ def test_downstream_regions_are_marked_contaminated():
         assert all(d["region"] != "norms.rms" or d["step"] != 1 for d in later[:1])
         text = compare.render_text(rep)
         assert "contaminated (after first divergence)" in text
-        # the per-region table names the cause once and marks the consequences
         origin_rows = [ln for ln in text.splitlines() if "[ORIGIN]" in ln]
         assert len(origin_rows) == 1 and "layer=1 step=1" in origin_rows[0]
         assert text.count("[contaminated: after the first divergence]") == 5
@@ -133,7 +124,7 @@ def test_shape_divergence_keeps_step_and_prints_both_shapes():
 
 
 def test_shape_divergence_does_not_outrank_an_earlier_value_divergence():
-    """kind='shape/dtype' used to omit step, so _order_key read 0 -- the global minimum."""
+    """A later shape/dtype divergence must not outrank an earlier value divergence in ordering."""
     base = _tmp()
     try:
         a, b = os.path.join(base, "a"), os.path.join(base, "b")
@@ -152,8 +143,7 @@ def test_shape_divergence_does_not_outrank_an_earlier_value_divergence():
 
 
 def test_absent_region_is_a_divergence_with_the_cuda_graph_hint():
-    """The CUDA-graph decode case: a region never traced on the engine used to render as
-    'NO DIVERGENCE ... exit 0' with a bare count."""
+    """A region never traced on the engine reports as a divergence with the enforce_eager hint."""
     base = _tmp()
     try:
         da, db = pf.run_pair(base, fault={"kind": "drop_region", "region": "collectives.row_parallel_ar"})
@@ -170,8 +160,7 @@ def test_absent_region_is_a_divergence_with_the_cuda_graph_hint():
 
 
 def test_missing_record_does_not_fabricate_value_divergences():
-    """One record missing mid-stream used to shift every later pair, producing value
-    divergences (with magnitude verdicts) for bits that were never compared."""
+    """One record missing mid-stream yields a single 'absent' divergence, not shifted value ones."""
     base = _tmp()
     try:
         da, db = pf.run_pair(
@@ -194,7 +183,7 @@ def test_missing_record_does_not_fabricate_value_divergences():
 
 
 def test_two_ranks_per_side_align_by_rank():
-    """Records from several processes in one directory used to align by pid sort order."""
+    """Records from several processes in one directory align by rank, not by file order."""
     base = _tmp()
     try:
         da, db = pf.run_pair(base, ranks_a=(0, 1), ranks_b=(0, 1), steps=2)
@@ -245,8 +234,7 @@ def test_first_divergence_names_the_rank():
 
 
 def test_side_disjoint_sampling_is_inconclusive_not_divergent():
-    """set_step wired on the trainer only + SAMPLE=2 selects disjoint records on the two sides;
-    the comparator used to report the resulting misalignment as a numerical divergence."""
+    """Disjoint sampling across the two sides reports inconclusive, not divergent."""
     base = _tmp()
     try:
         da, db = pf.run_pair(
@@ -298,7 +286,7 @@ def _verdict(a, b):
 
 
 def test_ladder_bracket_resolves_one_ulp_fp32():
-    """DEFAULT_LADDER stopped at k=6, so a 1e-07 difference was reported as '~2e-02'."""
+    """A one-ULP fp32 difference brackets below 2^-22 rather than at the coarse rungs."""
     x = torch.randn(128, 64, dtype=torch.float32)
     y = x.clone()
     y.view(-1).view(torch.int32)[100] ^= 1
@@ -330,8 +318,7 @@ def test_ladder_bracket_for_one_ulp_bf16_is_the_finest_rung():
 
 
 def test_reduction_order_magnitude_is_not_overstated():
-    """The measured reduction-order fault (true max rel err 8.8e-03) used to render as
-    'exponent-level (>~1 relative)'."""
+    """A reduction-order fault reports a bound that contains the true error, not exponent-level."""
     x = (torch.randn(1024, 512, generator=torch.Generator().manual_seed(2)) * 0.7).bfloat16()
     shards = [x * torch.tensor(c, dtype=torch.bfloat16) for c in (0.1, 0.2, 0.30000001, 0.4)]
     fwd, rev = shards[0].clone(), shards[::-1][0].clone()
@@ -375,7 +362,7 @@ def test_verdict_without_a_ladder_claims_no_magnitude():
 
 
 def test_segments_localize_rows_and_flag_whole_tensor_differences():
-    """segment_digests was exported and unit-tested but unreachable from debug mode."""
+    """SEGMENTS mode localizes a differing row range, and flags whole-tensor differences."""
     base = _tmp()
     env = {"SKYRL_ISOEXEC_DEBUG_SEGMENTS": "16"}
     try:

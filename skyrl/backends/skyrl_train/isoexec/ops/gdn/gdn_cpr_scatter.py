@@ -1,9 +1,7 @@
 """One-launch open-chunk buffer scatter for CprGDN.decode.
 
-Replaces four advanced-index scatters (k/v/g/beta), the ``pos`` index_put and the optional ``last_used``
-LRU stamp with one Triton program per decode lane. Pure data movement: values are stored in the dtype they
-arrived in. Pad lanes resolve to row 0 (the null row), whose ``pos`` is re-stored as 0; host-free and
-shape-static so it captures into a CUDA graph.
+Pure data movement in the arrival dtypes; pad lanes resolve to row 0 (the null row).
+Host-free and shape-static so it captures into a CUDA graph.
 """
 
 from __future__ import annotations
@@ -73,8 +71,7 @@ def _cpr_scatter_kernel(
     # Live lanes advance; the null row is re-stored as 0 (racing pad lanes all store the same 0).
     tl.store(pos_ptr + row, pos + tl.where(row > 0, 1, 0))
 
-    # The caller bumps the clock before this launch, so every program reads the same value and none
-    # writes it; duplicate (null) rows therefore all store an identical stamp.
+    # The clock is bumped by the caller, so racing null rows all store an identical stamp.
     if HAS_LU:
         tl.store(lastused_ptr + row, tl.load(clock_ptr))
 
@@ -84,14 +81,12 @@ def cpr_buffer_scatter(
 ) -> None:
     """Scatter this step's post-prep values into the open-chunk buffers and advance ``pos``.
 
-    k ``[N, HV, K]`` / v ``[N, HV, V]`` / beta ``[N, HV]`` in the buffer dtypes; g ``[N, HV]`` fp32.
-    Rows may repeat only on the null row. Inner dims must be contiguous; row strides are free.
-    ``last_used``/``clock`` are optional but passed together: the int64 LRU array and a 0-d int64 clock
-    the caller has already bumped for this step. Omit both to stamp the LRU yourself.
+    Inner dims must be contiguous (row strides are free); rows may repeat only on the null row.
+    ``last_used`` (int64 LRU array) and ``clock`` (0-d int64, pre-bumped) are passed together or not at all.
     """
     N, Hk, K = k.shape  # Hk may be the GQA-compressed head count (the native path buffers raw k)
     V = v.shape[-1]
-    HV = g.shape[-1]  # the gating slots are always HV-wide (fp32 g eagerly, raw a natively)
+    HV = g.shape[-1]
     HVpow = triton.next_power_of_2(HV)
     if HVpow != HV:
         raise ValueError(f"[isoexec-gdn] cpr scatter: HV={HV} must be a power of 2 (pad the head dim path)")

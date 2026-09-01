@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
 """Bounded, model-free GPU qualification for exact-vocab TP transport.
 
-This battery invokes the production ``gather_rank_ordered_fp32`` entry point. It
-does not load a model, mutate a launcher, or decide promotion.  Run BF16 and FP32
-as separate torchrun invocations so each process-group lifecycle has one stable
-wire contract::
+Checks the gathered FP32 bit pattern from ``gather_rank_ordered_fp32`` against all-gather+cat and
+the historical gather-to-owner P2P transport, timing all three. Run each dtype as its own torchrun
+invocation so a process-group lifecycle carries one wire contract; each rank writes one JSON file::
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
       skyrl/backends/skyrl_train/isoexec/ops/logprobs/tests/exact_vocab_transport_dist.py \
       --dtype bf16 --rows 17,257,1024 --shard-widths 257,62080 \
       --warmup 3 --repeats 10 --output-prefix /tmp/exact_vocab_transport_bf16
-
-    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
-      skyrl/backends/skyrl_train/isoexec/ops/logprobs/tests/exact_vocab_transport_dist.py \
-      --dtype fp32 --rows 17,257,1024 --shard-widths 257,62080 \
-      --warmup 3 --repeats 10 --output-prefix /tmp/exact_vocab_transport_fp32
-
-Each rank writes one JSON file. Rank zero additionally prints a single RESULT
-row.  The battery checks the complete gathered FP32 bit pattern against both
-all-gather+cat and the historical gather-to-owner P2P transport.  It times all
-three transports and records first-lazy non-Torch memory independently, so a
-candidate is never admitted against a slower comparator than the live incumbent.
-``--transport-init prewarmed`` mirrors production's TP A2A prewarm before the
-baseline and requires the explicit post-lazy-zero tolerance.  Every shape still
-times both owners, including shapes sent to canonical fallback by the production
-64 MiB full-wire threshold.
 """
 
 from __future__ import annotations
@@ -170,10 +154,7 @@ def _incumbent(wire: torch.Tensor, world: int, group) -> torch.Tensor:
 def _owner_p2p(wire: torch.Tensor, world: int, group, owner: int = 0) -> torch.Tensor | None:
     """Historical gather-to-owner byte transport, reconstructed from its contract.
 
-    All peers enter one ``batch_isend_irecv`` epoch.  The owner receives directly
-    into rank-major slots and copies its own shard locally.  Nonowners send one
-    contiguous shard.  P2P only moves bytes; FP32 widening and final layout match
-    the production A2A and all-gather references exactly.
+    P2P only moves bytes; the FP32 widening and final layout match the other references exactly.
     """
 
     rank = int(dist.get_rank(group=group))
@@ -301,9 +282,8 @@ def main() -> None:
     try:
         if args.expected_tp_world and world != args.expected_tp_world:
             raise RuntimeError(f"expected TP world {args.expected_tp_world}, torchrun built {world}")
-        # Initialize the ordinary TP communicator before transport's first-lazy
-        # memory baseline. The measured delta then isolates the new A2A transport,
-        # rather than charging generic ProcessGroupNCCL initialization to it.
+        # Initialize the ordinary TP communicator before transport's first-lazy memory baseline,
+        # so the measured delta isolates the A2A transport from generic NCCL setup.
         warm = torch.ones(1, dtype=torch.float32, device=device)
         dist.all_reduce(warm, group=tp_group)
         torch.cuda.synchronize()

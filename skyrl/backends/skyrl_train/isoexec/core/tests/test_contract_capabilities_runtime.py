@@ -1,9 +1,6 @@
-"""Manifest-era runtime-seam capabilities on the ExecutionContract: the extension composite, the
-weight-sync handshake, the fingerprint/view projection, and the NCCL contract check.
-
-Split from test_contract_capabilities.py (which owns build/classification/pins/identity/delivery)
-and shares its tiny synthetic registry. Same hygiene rule: every process-global (extension
-registry, cached contract, fingerprint recorder, env vars) is saved and restored per test.
+"""Runtime-seam capabilities: extension composite, weight-sync handshake, fingerprint/view
+projection, and the NCCL contract check. Shares the synthetic registry of
+test_contract_capabilities.py and restores every process-global per test.
 """
 
 import logging
@@ -100,11 +97,11 @@ def _captured(logger):
 def test_composite_hash_base_semantics():
     with _extensions():
         assert pc.composite_hash(None) is None
-        assert pc.composite_hash("base") == "base"  # no extensions: the identity, byte-for-byte
+        assert pc.composite_hash("base") == "base"  # no extensions: the identity
         pc.register_contract_extension("a", lambda: "1")
         h = pc.composite_hash("base")
         assert h != "base" and pc.composite_hash("base") == h  # deterministic
-        assert pc.composite_hash(None) is None  # no contract yet stays "no contract yet"
+        assert pc.composite_hash(None) is None  # no contract stays no contract
 
 
 def test_alias_hits_the_same_registry():
@@ -134,7 +131,7 @@ def test_extension_error_marker_prevents_agreement():
         pc.register_contract_extension("ext", lambda: "ok")
         hok = pc.composite_hash("base")
     assert hv != "base"  # a broken extension must not fake agreement with the plain identity
-    assert len({hv, hk, hok}) == 3  # two sides with different errors do not agree
+    assert len({hv, hk, hok}) == 3  # sides with different errors must not agree
 
 
 def test_reregistration_same_name_last_wins():
@@ -184,13 +181,13 @@ def test_negative_control_flag_perturbs_composite():
         _env(SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL="1", SKYRL_ISOEXEC_MANIFEST_STRICT=None),
     ):
         clean = pc.contract_hash()
-        # the trainer stamp site (workers/worker.py) registers this extension when the flag is ON
+        # workers/worker.py registers this extension when the flag is on.
         if os.environ.get("SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL") == "1":
             pc.register_contract_extension("negative_control", lambda: "tampered")
         perturbed = pc.contract_hash()
         assert perturbed != clean
         _refuses(RuntimeError, pc.assert_contract_agreement, clean, other_side="engine")
-    with _extensions():  # extension registry restored: composite is the plain identity again
+    with _extensions():  # registry restored: composite is the plain identity again
         assert pc.composite_hash(c.identities.numerical_policy) == c.identities.numerical_policy
 
 
@@ -238,8 +235,7 @@ def test_pin_disagreements_names_every_drifted_key():
 
 
 def test_drifted_pin_is_caught_against_the_contract_view():
-    # The pin is the contract's only statement about WHICH function the impl runs; an install that
-    # binds the same impl_id with a different pin is exactly what the recorded pins exist to catch.
+    # Guards an install binding the right impl_id under a drifted pin.
     reg = _registry()
     view = pc.build_contract_view(_build(reg=reg), reg)
     with _fresh_recorder():
@@ -300,8 +296,7 @@ def test_nccl_assert_against_a_built_view():
 
 
 def test_nccl_mismatch_demotes_under_debug_tracing():
-    # It goes through enforce.refuse like the sibling pik plan check: a debug run must reach the
-    # trace it was started for, and the ledger keeps the violation either way.
+    # A debug run must reach the trace it was started for; the ledger keeps the violation anyway.
     from skyrl.backends.skyrl_train.isoexec.core import enforce
 
     pins = dict(ni.PINNED_CONSTANTS)

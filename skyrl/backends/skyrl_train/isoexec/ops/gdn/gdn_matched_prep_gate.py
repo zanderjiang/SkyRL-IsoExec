@@ -1,9 +1,7 @@
 """Byte-exact launch fusion for the elementwise half of ``native_matched_prep``.
 
-The canonical boundary preparation stays defined by ``gdn_cpr.native_matched_prep``; this
-module only collapses its eager ``a/b -> g/beta`` expression into one launch. The key normalisation
-is deliberately left alone, because PyTorch's fp32 reduction order differs from vLLM's row-norm
-kernel for some 128-wide rows and substituting it would change bits.
+Only the ``a/b -> g/beta`` expression is fused. The key normalisation's fp32 reduction order is
+canonical and must not be replaced by a Triton row reduction.
 """
 
 from __future__ import annotations
@@ -47,18 +45,12 @@ def _matched_prep_finish_l2_kernel(
     mask = i < N
     x = tl.load(x_ptr + i, mask=mask, other=0.0).to(tl.float32)
     square_sum = tl.load(square_sum_ptr + i // K, mask=mask, other=0.0)
-    # Canonical post-reduction sequence: add eps, rsqrt, multiply, wire cast.
     y = x * tl.rsqrt(square_sum + 1e-6)
     tl.store(out_ptr + i, y, mask=mask)
 
 
 def maybe_matched_prep_fused_l2(k_raw: torch.Tensor, *, force: bool = False) -> torch.Tensor | None:
-    """Exact key normalisation with PyTorch's reduction association preserved.
-
-    The square and post-reduction elementwise chains are fused, but the middle ``torch.sum`` is
-    retained: its fp32 association is the canonical pin and differs from a one-kernel Triton row
-    reduction on 128-wide inputs.
-    """
+    """Exact key normalisation; the middle ``torch.sum`` stays eager because its fp32 association is pinned."""
     if not matched_prep_fused_gate_enabled():
         _COUNTS["l2_declined"] += 1
         return None
@@ -69,8 +61,7 @@ def maybe_matched_prep_fused_l2(k_raw: torch.Tensor, *, force: bool = False) -> 
         or k_raw.shape[-1] <= 0
         or not k_raw.is_contiguous()
         or k_raw.numel() == 0
-        # The three-launch form only pays off on large bf16 inputs on SM90; elsewhere the eager
-        # chain is exact and faster.
+        # The three-launch form only pays off on large bf16 inputs on SM90.
         or (not force and (k_raw.dtype != torch.bfloat16 or k_raw.numel() < _L2_MIN_ELEMENTS))
         or (not force and torch.cuda.get_device_capability(k_raw.device) != (9, 0))
     ):
@@ -106,8 +97,7 @@ def maybe_matched_prep_fused_l2(k_raw: torch.Tensor, *, force: bool = False) -> 
 
 @triton.jit
 def _div_rn_nonftz(a, b):
-    # Triton's `/` is reciprocal-approximate and libdevice div flushes subnormal quotients; ATen
-    # sigmoid does neither. Same contract as gdn_fused_prep._sigmoid, signed zeros included.
+    # Triton's `/` is reciprocal-approximate and libdevice div flushes subnormals; ATen sigmoid does neither.
     return tl.inline_asm_elementwise(
         "div.rn.f32 $0, $1, $2;",
         "=r,r,r",
@@ -120,11 +110,7 @@ def _div_rn_nonftz(a, b):
 
 @triton.jit
 def _neg_preserve_zero(a):
-    """Flip the fp32 sign bit without letting LLVM reassociate ``-(a*b)``.
-
-    Harmless except when ``exp(A_log)`` underflows: eager materialises ``-0`` before multiplying,
-    while the reassociated form yields ``+0`` for a positive softplus.
-    """
+    """Flip the fp32 sign bit without letting LLVM reassociate ``-(a*b)``, which loses eager's ``-0``."""
     return tl.inline_asm_elementwise(
         "xor.b32 $0, $1, 0x80000000;",
         "=r,r",
@@ -174,8 +160,8 @@ def _matched_prep_gate_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    # Character-for-character native_matched_prep arithmetic: log(1 + exp(x)), not softplus/log1p,
-    # with a <= 20 threshold. `enable_fp_fusion=False` prevents contraction across these fp32 ops.
+    # Must stay log(1 + exp(x)) with the <= 20 threshold, not softplus/log1p; `enable_fp_fusion=False`
+    # blocks contraction across these fp32 ops.
     x = av + db
     ex = libdevice.exp(x)
     softplus = tl.where(x <= 20.0, libdevice.log(1.0 + ex), x)
@@ -192,17 +178,12 @@ def maybe_matched_prep_fused_gate(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return exact ``(g fp32, beta b.dtype)``, or ``None`` for the eager fallback.
-
-    Admission is the kernel's complete indexing contract and depends only on runtime shape, dtype,
-    layout and device.
-    """
+    """Return exact ``(g fp32, beta b.dtype)``, or ``None`` for the eager fallback."""
     if not matched_prep_fused_gate_enabled():
         _COUNTS["gate_declined"] += 1
         return None
 
-    # Trainer scoring carries the packed batch singleton as [1,T,H] and the engine uses [T,H];
-    # requiring viewability keeps that squeeze free and rejects a materialising reshape.
+    # Trainer scoring uses [1,T,H], the engine [T,H]; requiring viewability rejects a materialising reshape.
     if a.ndim not in (2, 3) or (a.ndim == 3 and a.shape[0] != 1) or b.shape != a.shape:
         _COUNTS["gate_declined"] += 1
         return None
@@ -243,8 +224,7 @@ def maybe_matched_prep_fused_gate(
         or A_log.dtype not in (torch.bfloat16, torch.float32)
         or dt_bias.dtype not in (torch.bfloat16, torch.float32)
         or any(t.device != a.device for t in (b, A_log, dt_bias))
-        # Projection splits are dense along heads but row-strided by the full packed width;
-        # arbitrary inner strides or overlapping rows still decline.
+        # Projection splits are row-strided by the full packed width; arbitrary inner strides decline.
         or not _dense_rows(a_rows)
         or not _dense_rows(b_rows)
         or a.numel() == 0
@@ -252,7 +232,6 @@ def maybe_matched_prep_fused_gate(
         _COUNTS["gate_declined"] += 1
         return None
 
-    # Eager pointwise outputs are compact even when their projection inputs are views.
     g = torch.empty(a_rows.shape, dtype=torch.float32, device=a.device)
     beta = torch.empty(a_rows.shape, dtype=b.dtype, device=b.device)
     block_t = 64

@@ -1,9 +1,7 @@
 """The Qwen3.5 composition, built from the op registry into an ExecutionContract.
 
-Every assertion here is about what the CODE composes by default. The derivation reads launcher
-environment (the NCCL identities in particular), so every test builds under a cleared environment
-and the one test that cares about a non-default composition sets it explicitly -- otherwise these
-tests pass or fail according to whatever shell happened to invoke them.
+The derivation reads launcher environment, so every test builds under a cleared environment;
+tests that need a non-default composition set it explicitly.
 """
 
 import os
@@ -17,9 +15,7 @@ _SITES = ("trainer_fwd", "trainer_score", "engine_prefill", "engine_decode")
 
 _SUBSUMED = {("gdn." + op, site) for op in ("l2norm", "gating") for site in _SITES}
 
-# Every key the registry licenses is now selected: log_softmax:trainer_fwd used to sit here
-# because the aten-order default declared no logprob contract at the training forward, and
-# rowinv_leaftree -- one function at all four sites -- is the composition now.
+# Every key the registry licenses is currently selected by the composition.
 _LICENSED_UNSELECTED: set = set()
 
 

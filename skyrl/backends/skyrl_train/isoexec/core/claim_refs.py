@@ -1,12 +1,7 @@
 """Resolve the refs a claim names to real in-tree code.
 
-A ref is the only thing standing between a declared claim and prose: a ``StateClaim``'s
-``path::symbol`` hook and a proof pointer are what make the claim checkable at all. Both
-resolutions live here so the build path, the runtime claim checkers and CI answer the same way.
-Two rules the obvious implementations get wrong: a ref is containment-checked, because a
-``../``-prefixed path reaches any file on the host and attesting one attests nothing about this
-package; and the symbol check PARSES the file, because ``^def hook(`` also matches a line inside a
-docstring, a comment or a string literal.
+Refs are containment-checked (a ``../`` path reaches any file on the host) and symbols are
+resolved by parsing, not by regex, which would also match text inside docstrings and comments.
 """
 
 from __future__ import annotations
@@ -16,7 +11,7 @@ import pathlib
 
 ISOEXEC_DIR = pathlib.Path(__file__).resolve().parents[1]
 
-# Where a gate pointer may resolve: the colocated op gates. Read lazily and once per process.
+# Where a gate pointer may resolve: the colocated op gates. Read lazily, once per process.
 _GATE_DIRS = ("ops",)
 _gate_sources: dict[str, str] | None = None
 
@@ -68,10 +63,7 @@ def _gates() -> dict[str, str]:
 def proof_ref_problem(ref: str) -> str | None:
     """Why a proof pointer resolves to no gate; None when it does.
 
-    Accepts the two forms the tree uses: a repo-relative path to the gate file that measured the
-    claim, and a gate/test name followed by the property it proved (``"<name>: <what it shows>"``).
-    The name half must appear in a colocated gate's filename or source -- a pointer nobody can
-    follow is the claim's evidence being asserted rather than recorded.
+    Accepts a repo-relative path to the gate file, or ``"<gate name>: <what it shows>"``.
     """
     name = ref.strip().split(":")[0].split()[0] if ref.strip() else ""
     if not name:

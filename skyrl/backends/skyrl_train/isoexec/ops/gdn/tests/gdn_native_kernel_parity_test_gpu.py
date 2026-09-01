@@ -1,40 +1,8 @@
-"""Bitwise parity tests for the native-kernel GDN forward (G4: match native vLLM's GDN path).
+"""Bitwise parity tests for the native-kernel GDN forward (vLLM's own fused conv + recurrent core).
 
-THE DESIGN UNDER TEST. To close the rollout gap to stock vLLM, the zero-KL GDN engine path adopts
-vLLM's OWN fused kernels -- ``causal_conv1d_fn`` (prefill conv), ``causal_conv1d_update`` (decode
-conv) and ``fused_sigmoid_gating_delta_rule_update`` (the varlen recurrent core with in-kernel
-l2norm + fp32-exp sigmoid gating) -- over vLLM's native mamba kv_cache state, with prefix caching
-(align mode) and chunked prefill ON. The trainer shim then adopts the SAME composition, so zero-KL
-holds by construction. Prefill runs the recurrent kernel instead of the chunk kernel; that latency
-is the one accepted cost (see the 2026-07-16 design memo / PERFORM_GAMEPLAN G4).
-
-Every test here is a bitwise claim that design rests on and that has never been directly A/B'd
-(the per-op inventory flagged them as untested):
-
-  T1  conv continuity        : fn(T) then update(1 tok) == fn(T+1) at the last position, and the
-                               conv_state after either path is bitwise identical.
-  T2  conv chunked resume    : fn(chunk1) + fn(chunk2, has_initial_state) == fn(whole), outputs
-                               and final conv_state bitwise. (What chunked prefill + APC does.)
-  T3  core prefill==decode   : fused_sigmoid_gating over T tokens in ONE call == T sequential
-                               1-token calls resuming through the fp32 state row. (Why decode is a
-                               bitwise continuation of recurrent prefill, and why an APC hit at any
-                               block boundary is exact.)
-  T4  core chunked resume    : one call over [T1] then one over [T2] (same state row) == a single
-                               call over [T1+T2], outputs + final state bitwise.
-  T5  l2norm in-kernel vs out: kernel(use_qk_l2norm_in_kernel=True) on raw q/k == l2norm_fwd
-                               outside + kernel(False). Decides whether the trainer shim may keep
-                               its standalone l2norm or must move it in-kernel.
-  T6  old-vs-native diff     : the CURRENT isoexec composition (elementwise conv + gdn_l2norm +
-                               bf16-exp gate + gdn_recurrent_kernel) vs the native composition on
-                               the same inputs. EXPECTED NONZERO -- this is the mismatch that
-                               forces the trainer to switch compositions in the same commit.
-
-Dims are the 35B TP=8 local shard (H=2 k-heads, HV=4 v-heads, K=V=128, conv W=4, D=1024) so what
-passes here is what the production engine runs.
-
-Run (1 GPU):
-    CUDA_VISIBLE_DEVICES=0 uv run --isolated --extra isoexec \
-      python skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/gdn_native_kernel_parity_test_gpu.py
+T1/T2 pin conv continuity and chunked resume; T3/T4 pin that decode is a bitwise continuation of
+recurrent prefill and that a chunked resume equals the whole; T5/T6 are informational. Dims are the
+35B TP=8 local shard, so what passes here is what the production engine runs.
 """
 
 import os
@@ -197,9 +165,7 @@ def test_core(results, y_conv):
     def grid_idx(row, t):
         """[1, t] per-token state-index grid: col 0 = load slot, col t-1 = final store, 0 = skip.
 
-        With inplace_final_state the kernel reads indices[i_n, 0] for the initial-state load and
-        stores the running state at EVERY token whose index is > 0 -- so all columns except the
-        first and last stay 0. Same contract as isoexec's gdn_recurrent_kernel (modeled on this).
+        The kernel stores at every token whose index is > 0, so all other columns must stay 0.
         """
         g = torch.zeros(1, t, dtype=torch.int32)
         g[0, 0] = row
@@ -305,9 +271,8 @@ def test_core(results, y_conv):
         ssm_state_indices=idx,
         use_qk_l2norm_in_kernel=False,
     )
-    # INFORMATIONAL, not a gate: the in-kernel l2norm is an rsqrt-MULTIPLY on the fp32 upcast
-    # (kernel line ~139) while l2norm_fwd is a separate kernel; if they differ, composition A
-    # (the same kernel with in-kernel l2norm on BOTH trainer and engine) is the only choice.
+    # Informational, not a gate: if the in-kernel l2norm and l2norm_fwd differ, trainer and engine
+    # must both use the in-kernel form.
     same = torch.equal(o_a, o_d)
     d5 = (o_a.float() - o_d.float()).abs()
     print(
@@ -320,7 +285,7 @@ def test_core(results, y_conv):
 
 
 def test_old_vs_native(results, pack):
-    """T6: the current isoexec composition vs the native one. Expected NONZERO -- report the size."""
+    """T6: the current isoexec composition vs the native one; a nonzero diff is expected."""
     from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_ops import (
         gdn_gate_and_beta,
         gdn_l2norm,

@@ -1,27 +1,8 @@
-"""CPU tests for the BATCHED prefill row claim (``RecurrentGDN._assign_many``).
+"""CPU tests for the batched prefill row claim (``RecurrentGDN._assign_many``).
 
-WHAT THIS GATES. ``_assign`` used to run once per request per GDN layer and do device work every
-time -- two pageable blocking HtoD in ``flush_slot_map``, an ``argmin`` readback per eviction, two
-more ops for the clock. Profiled at 24,665 pageable copies and 24,207 stream syncs per production
-prefill forward against native's zero, ~49% of the prefill gap. ``_assign_many`` hoists all three
-out of the per-slot loop.
-
-The hoist is only allowed to be a THROUGHPUT change, so what needs testing is that it is nothing
-else: the same rows, in the same order, with the same free list, the same evictions, the same
-``last_used`` ticks and the same device slot map as the per-slot code it replaces. Every test here
-is therefore an equivalence against ``_assign_legacy`` below -- a verbatim copy of the pre-change
-body, kept as the reference oracle rather than as history.
-
-THE TRAP THIS FILE EXISTS FOR (``test_two_evictions_in_one_batch_*``). ``_assign`` bumped
-``last_used[row]`` immediately, so a second eviction inside the same batch could never re-pick the
-row the first one had just handed out. Deferring the clock update -- which is the whole point of
-the batching -- removes that protection, and the obvious batched form (run ``argmin`` K times over
-one stale snapshot) then returns the SAME row K times: two live requests sharing one state row,
-which is silent corruption, not a slow path. ``test_naive_repeated_argmin_is_the_bug`` pins that
-the naive form really does fail, so the passing test next to it is not vacuous.
-
-Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_assign_many_cpu.py -q
+The batching must be a throughput change only, so every test is an equivalence against
+``_assign_legacy`` (a verbatim copy of the pre-change body). The trap it guards: deferring the
+clock bump lets a naive batched argmin hand the same row to K slots -- silent state sharing.
 """
 
 import random
@@ -31,7 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import (
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import (  # noqa: E402
     gdn_recurrent_state as _grs,  # noqa: E402
 )
 from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_state import (  # noqa: E402
@@ -49,16 +30,10 @@ from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_recurrent_state import (  # 
 )
 
 
-# ================================================================================================
 # a pool with only the slot bookkeeping in it
-# ================================================================================================
 def make_pool(capacity: int = 8, map_size: int = 4096) -> RecurrentGDN:
-    """A ``RecurrentGDN`` carrying ONLY the fields the row claim touches, on the CPU.
-
-    Deliberately not a constructed layer: ``__init__`` allocates the state arena and resolves the
-    kernel flags, none of which the bookkeeping reads. The methods under test are the real,
-    unmodified ones -- this only supplies their state.
-    """
+    """A ``RecurrentGDN`` carrying only the fields the row claim touches (``__init__`` would
+    allocate the state arena and resolve kernel flags the bookkeeping never reads)."""
     p = object.__new__(RecurrentGDN)
     p._native = False
     p.capacity = capacity
@@ -75,7 +50,7 @@ def make_pool(capacity: int = 8, map_size: int = 4096) -> RecurrentGDN:
 
 
 def _assign_legacy(p: RecurrentGDN, slot: int) -> int:
-    """The pre-2026-08-13 ``_assign`` body, verbatim. The oracle every test compares against."""
+    """The pre-change ``_assign`` body, verbatim: the oracle every test compares against."""
     row = p._slot2row.pop(slot, None)
     if row is None:
         if p._free:
@@ -119,9 +94,7 @@ def run_both(batches, capacity=8, map_size=4096):
     return (old, rows_old), (new, rows_new)
 
 
-# ================================================================================================
 # equivalence with the per-slot code it replaces
-# ================================================================================================
 def test_free_list_phase_is_identical():
     """Before anything is evicted the claim is pure free-list order, and it must not drift."""
     (old, ro), (new, rn) = run_both([[10, 11, 12], [13, 14]])
@@ -171,16 +144,10 @@ def test_randomised_workloads_are_identical(seed):
     assert snapshot(old) == snapshot(new)
 
 
-# ================================================================================================
-# THE K-SMALLEST TRAP
-# ================================================================================================
+# the k-smallest trap
 def _naive_batched_rows(p: RecurrentGDN, slots):
-    """The WRONG batched eviction: argmin re-run K times over ONE stale ``last_used`` snapshot.
-
-    This is the form the hoist invites -- take the host read out of the loop, leave the rest alone
-    -- and it is exactly what ``_assign_many`` must not do. Kept executable so the correct test
-    beside it is demonstrably non-vacuous.
-    """
+    """The wrong batched eviction -- argmin re-run K times over one stale ``last_used`` snapshot --
+    kept executable so the correct test beside it is demonstrably non-vacuous."""
     snap = p.last_used.clone()
     rows = []
     for s in slots:
@@ -198,7 +165,7 @@ def _fill(p: RecurrentGDN, n: int):
 
 
 def test_naive_repeated_argmin_is_the_bug():
-    """FAILING-BEFORE: the stale-snapshot form hands the same row to every slot in the batch."""
+    """The stale-snapshot form hands the same row to every slot in the batch."""
     p = make_pool(capacity=4)
     _fill(p, 4)
     naive = _naive_batched_rows(p, [900, 901, 902])
@@ -206,7 +173,7 @@ def test_naive_repeated_argmin_is_the_bug():
 
 
 def test_two_evictions_in_one_batch_take_the_k_smallest():
-    """PASSING-AFTER: K evictions in one batch take the K least-recently-used rows, all distinct."""
+    """K evictions in one batch take the K least-recently-used rows, all distinct."""
     p = make_pool(capacity=4)
     _fill(p, 4)  # rows claimed in order -> last_used is strictly increasing over rows 1..4
     lru_order = sorted(range(1, 5), key=lambda r: (p.last_used[r].item(), r))
@@ -216,7 +183,7 @@ def test_two_evictions_in_one_batch_take_the_k_smallest():
 
 
 def test_a_four_eviction_batch_matches_the_oracle():
-    """The oracle again, on the path the trap lives on: a batch that evicts four times over."""
+    """A batch that evicts four times over still matches the oracle."""
     (old, ro), (new, rn) = run_both([[500 + i] for i in range(6)] + [[900, 901, 902, 903]], capacity=6)
     assert ro == rn
     assert len(set(rn[-1])) == 4, f"four claims must occupy four rows, got {rn[-1]}"
@@ -233,12 +200,8 @@ def test_ties_break_on_the_lowest_row_like_argmin():
 
 
 def test_a_row_claimed_from_the_free_list_is_not_evicted_later_in_the_same_batch():
-    """The claimed-row exclusion, on the path that does not go through eviction at all.
-
-    The batch takes the last free row, then must evict for the rest. The free row's ``last_used``
-    is stale (the batch has not flushed its clock yet), so a candidate order built from the raw
-    snapshot would rank it evictable and hand it out twice.
-    """
+    """A row taken from the free list has stale ``last_used``, so it must still be excluded from
+    the same batch's eviction candidates."""
     p = make_pool(capacity=4)
     _fill(p, 3)  # rows 4, 3, 2 claimed (free list pops from the end); row 1 still free
     assert p._free == [1]
@@ -265,11 +228,9 @@ def test_oversubscribed_batch_raises_instead_of_double_claiming():
         p._assign_many([900, 901, 902, 903])
 
 
-# ================================================================================================
 # what the hoist was for: the device traffic
-# ================================================================================================
 def test_one_flush_and_one_clock_scatter_per_batch(monkeypatch):
-    """The whole point: device work is per BATCH, not per slot."""
+    """Device work is per batch, not per slot."""
     p = make_pool(capacity=16)
     flushes = []
     real = RecurrentGDN.flush_slot_map
@@ -301,8 +262,7 @@ def test_clock_advances_one_tick_per_slot_in_order():
 
 
 def test_duplicate_slot_inside_one_batch_keeps_the_last_tick():
-    """Not a shape the scheduler produces, but a duplicate index_put_ is nondeterministic in torch,
-    so the dedup is pinned rather than assumed."""
+    """A duplicate ``index_put_`` is nondeterministic in torch, so the dedup is pinned."""
     p = make_pool(capacity=8)
     rows = p._assign_many([21, 21])
     assert rows[0] == rows[1]
@@ -311,7 +271,7 @@ def test_duplicate_slot_inside_one_batch_keeps_the_last_tick():
 
 
 def test_slot_past_the_map_still_raises_loudly():
-    """The [K] battery edge: the map cannot grow under a captured graph, so this must not fold."""
+    """The slot map cannot grow under a captured graph, so an out-of-range slot must raise."""
     p = make_pool(capacity=8, map_size=64)
     with pytest.raises(RuntimeError, match="SLOT_MAP_SIZE"):
         p._assign_many([10, 64])
@@ -333,9 +293,7 @@ def test_assign_is_assign_many_of_one():
     assert new._slot_pending == {}, "_assign must still write through, not defer"
 
 
-# ================================================================================================
 # driver-managed ownership and exact direct/offline fallback
-# ================================================================================================
 def _device_decode_touch(p: RecurrentGDN, slots) -> None:
     """The two device bookkeeping ops decode enqueues, expressed on CPU for the oracle."""
 
@@ -347,8 +305,8 @@ def _device_decode_touch(p: RecurrentGDN, slots) -> None:
 def test_offline_full_pool_reads_device_truth_once_per_batch():
     p = make_pool(capacity=3)
     p._assign_many([10, 11, 12])
-    # A direct/offline decode has no scheduler lifecycle oracle. Make row 2 newest and prove the
-    # one batch-level fallback imports device truth rather than guessing from host token touches.
+    # A direct/offline decode has no scheduler lifecycle oracle, so make row 2 newest on device
+    # only: the batch-level fallback must import device truth, not guess from host touches.
     _device_decode_touch(p, [next(s for s, r in p._slot2row.items() if r == 2)])
     expected = min(range(1, 4), key=lambda r: (int(p.last_used[r]), r))
     before = host_bookkeeping_stats()["lru_device_fallback"]

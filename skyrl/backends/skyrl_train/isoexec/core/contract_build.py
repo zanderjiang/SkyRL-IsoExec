@@ -1,12 +1,7 @@
 """Build the ExecutionContract directly from a registry and per-(op, site) selections.
 
-The one composition object: ``models/policy.build_selections`` emits the selections, this validates
-them against the registry (unknown op / undeclared site / unregistered impl / contradicted pins all
-refuse), then projects them into contract entries -- sites whose resolved selection is identical
-merge into one entry, a region is the op plus the impls it subsumes, and float pins encode as fp64
-bit patterns. A DEPLOYMENT selection is discharged by its neutrality proof; a FUNCTION op that
-resolves to different impls across sites needs a declared ``bitwise_equal_to`` or
-``equivalence_proof`` or it refuses.
+Validates the selections against the registry, then projects them into contract entries: sites
+with an identical selection merge, a region is the op plus what it subsumes, floats encode as fp64.
 """
 
 from __future__ import annotations
@@ -37,8 +32,7 @@ from . import claim_refs
 from .arch import ARCH, HardwareTarget, is_accelerator_arch
 from .registry import Registry, RegistryError
 
-# Per-selection classification vocabulary: FUNCTION halves are hashed, DEPLOYMENT halves are
-# proven bitwise-neutral and logged but not hashed.
+# FUNCTION halves are hashed; DEPLOYMENT halves are proven bitwise-neutral and logged, not hashed.
 FUNCTION = "function"
 DEPLOYMENT = "deployment"
 
@@ -62,8 +56,7 @@ class ContractBuildError(ValueError):
 
 
 class PinValidationError(ContractBuildError):
-    """Raised when a selection's pinned constants disagree with the selected impl's declared
-    ``machine_assertable`` rounding schedule (``validate_pins``)."""
+    """Raised when pinned constants disagree with the impl's declared rounding schedule."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,15 +111,8 @@ def _norm_selection(op: str, site: str, val) -> _Sel:
 def validate_pins(registry: Registry, selections: Dict, model: Optional[str] = None) -> None:
     """Refuse any pinned constant the selected impl does not declare, or contradicts.
 
-    Every other check compares the composition against itself or against the other runtime, so none
-    of them can see a composition that is internally consistent, delivered intact, identical on both
-    sides -- and names the wrong function. An unchecked pin is exactly that: it hashes, it matches
-    across runtimes, and it constrains nothing, so the gate goes green on the wrong model. The
-    impl's schedule is the authority, since it is a claim about the code while the profile is a
-    claim about the model. A failure means the profile or the declaration is wrong, never that the
-    pin should be dropped or the schedule loosened.
-
-    Raises ``PinValidationError`` naming every offending pin at once.
+    An unchecked pin hashes and cross-matches while constraining nothing, so the gate would go
+    green on the wrong model. Raises ``PinValidationError`` naming every offending pin at once.
     """
     problems = []
     who = f"model {model!r}" if model else "selections"
@@ -179,9 +165,8 @@ def _impl_spec(registry: Registry, op: str, impl_id: str):
 def _bitwise_edges(registry: Registry, op: str, impl_ids: list) -> dict:
     """``{declaring impl -> sibling it claims byte-equality with}``, every claim checked first.
 
-    A claim that names the declarer itself, an impl the op does not register, or an impl this
-    composition does not select proves nothing about the group, so each of those refuses here
-    rather than discharging it.
+    A claim naming the declarer itself, an unregistered impl, or one this composition does not
+    select proves nothing about the group and refuses.
     """
     edges = {}
     for impl_id in impl_ids:
@@ -214,10 +199,8 @@ def _bitwise_edges(registry: Registry, op: str, impl_ids: list) -> dict:
 def _group_discharge(registry: Registry, op: str, entries: dict) -> Optional[EquivalenceProof]:
     """The claim discharging an op whose sites resolve to more than one impl.
 
-    The discharge licenses the WHOLE group, so it is chosen only after the group's claims are
-    checked: bitwise_equal_to claims must link every selected impl (a pairwise claim leaves an
-    unclaimed third impl undischarged), and an equivalence_proof must resolve to a gate in the
-    tree. ``ops/AGENT.md`` §3 is the rule these enforce.
+    The discharge licenses the whole group: bitwise_equal_to claims must link every selected impl,
+    and an equivalence_proof must resolve to a gate in the tree.
     """
     impl_ids = sorted({e.impl_id for e in entries.values()})
     if len(impl_ids) <= 1:
@@ -260,11 +243,9 @@ def _group_discharge(registry: Registry, op: str, entries: dict) -> Optional[Equ
 
 
 def derive_topology_claims(topology) -> tuple:
-    """Project the profile's declared ``TopologyAxisFact``s into contract ``TopologyClaim``s.
+    """Project the profile's ``TopologyAxisFact``s into ``TopologyClaim``s.
 
-    Pure projection, no invention: every degree/domain/proof is the profile's recorded fact
-    (``models/profile.TopologyAxisFact`` already refuses an invariant axis with no proven domain or
-    no proof ref). Sorted by axis so declaration order never moves the hash.
+    Sorted by axis so declaration order never moves the hash.
     """
     claims = []
     for t in sorted(topology or (), key=lambda t: t.axis):
@@ -320,11 +301,8 @@ def build_execution_contract(
 ) -> ExecutionContract:
     """Derive the contract from ``{(op, site) -> selection}``. The single build path.
 
-    Every selection key must name a site the registry's op declares. ``validate_pins=True`` is the
-    derivation-time gate on pins and the only supported production setting -- turning it off
-    re-opens the hole where a composition hashes and cross-matches while naming the wrong function.
-    Completeness against what was actually installed is a separate, adapter-time check
-    (``contract_delivery.validate_contract_against_installed``).
+    ``validate_pins=True`` is the only supported production setting; turning it off re-opens the
+    hole where a composition hashes and cross-matches while naming the wrong function.
     """
     if not allow_non_accelerator_arch and not is_accelerator_arch(arch):
         raise ContractBuildError(
@@ -374,8 +352,8 @@ def build_execution_contract(
                 f"on the op (known: {sorted(op_spec.impls)})"
             )
         impl_spec = op_spec.impls[sel.impl_id]
-        # Arch admission, skipped only under the sentinel arch, which names no accelerator and so
-        # is not a claim any battery could have been run on.
+        # Arch admission, skipped only under the sentinel arch, which names no accelerator any
+        # battery could have run on.
         if is_accelerator_arch(arch) and not target.supports(impl_spec.supported_archs):
             raise ContractBuildError(
                 f"selection for ({op!r}, {site!r}) names impl {sel.impl_id!r}, which declares "

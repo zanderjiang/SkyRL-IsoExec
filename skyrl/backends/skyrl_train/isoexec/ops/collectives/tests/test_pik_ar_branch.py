@@ -1,15 +1,7 @@
-"""CPU gates for the all-reduce branch POLICY (pik/ar_branch.py).
+"""CPU gates for the all-reduce branch policy (pik/ar_branch.py).
 
-The branch choice cannot move a bit -- both branches evaluate the identical tree -- so nothing
-here is about numerics. It is about the two ways this selector can go wrong:
-
-  A. it silently changes what production runs. ``legacy`` is the default and must reproduce the
-     shipped byte threshold EXACTLY, at every payload, world and dtype.
-  B. it makes two ranks disagree. The branches issue DIFFERENT barrier counts (1 vs 2), and a
-     symmetric-memory barrier is a rendezvous, so disagreement is a HANG, not a slowdown. The
-     predicate must therefore be a pure function of facts every rank shares.
-
-Also gated: an unmeasured architecture must FALL BACK, never extrapolate.
+Both branches evaluate the identical tree, so this is not about numerics: ``legacy`` must stay
+bit-identical to the shipped threshold, and the predicate must be rank-invariant or ranks hang.
 """
 
 import importlib
@@ -54,11 +46,8 @@ def test_unknown_mode_is_a_loud_error(monkeypatch):
 
 # ------------------------------------------------------------------- B. the rank-agreement gate
 def test_predicate_depends_only_on_rank_invariant_facts():
-    """THE anti-hang property, asserted on the signature itself.
-
-    If someone ever adds a rank-, device- or time-dependent argument to this predicate, two ranks
-    can pick different branches and park on barriers no peer will reach. The signature IS the
-    contract, so the test reads the signature."""
+    """Anti-hang property: a rank- or time-dependent argument would let ranks pick different
+    branches and park on barriers no peer reaches. The signature is the contract."""
     ar_branch.self_check(world=4, legacy_budget=BUDGET)
 
 
@@ -79,11 +68,7 @@ def test_arch_mode_falls_back_when_the_device_is_not_in_the_table(monkeypatch):
 
 
 def test_arch_mode_uses_a_measured_entry_and_keys_on_payload_not_bytes_read(monkeypatch):
-    """The arch table is keyed by (arch, world) and compares PAYLOAD.
-
-    The shipped constant folded a `world` factor into a budget that was already world-dependent,
-    which is how one number came to mean two things. Here world is part of the key, so the value
-    is a plain payload crossover."""
+    """The arch table is keyed by (arch, world) and compares payload, not bytes-read."""
     monkeypatch.setenv("SKYRL_ISOEXEC_PIK_AR_CROSSOVER", "arch")
     monkeypatch.setattr(ar_branch, "_arch", lambda: "sm90")
     monkeypatch.setitem(ar_branch.ARCH_CROSSOVER, ("sm90", 4), 1 << 20)  # one-shot up to 1 MiB
@@ -102,7 +87,7 @@ def test_arch_entry_for_one_world_does_not_leak_to_another(monkeypatch):
 
 
 def test_shipped_arch_table_is_empty_until_it_is_measured():
-    """A table of guesses is worse than no table. It ships empty and the harness fills it."""
+    """The table ships empty; only the measurement harness fills it."""
     assert ar_branch.ARCH_CROSSOVER == {}, (
         "ARCH_CROSSOVER must only ever contain rows emitted by "
         "the private repo's nightly pik_oneshot_crossover.py --emit-arch-table"
@@ -134,7 +119,7 @@ def test_bucketing_is_power_of_two_and_shared_by_neighbouring_batch_sizes():
 
 
 def test_force_override_is_off_by_default_and_restores(monkeypatch):
-    """calibrate() pins the branch to time the real path; the pin must never survive the call."""
+    """calibrate() pins the branch; the pin must never survive the call."""
     assert ar_branch._FORCE[0] is None
     ar_branch._FORCE[0] = 0
     try:

@@ -1,41 +1,11 @@
-"""Pre-flight engagement smoke for the rowinv logprob: minutes, not hours into a run.
+"""Pre-flight engagement smoke for the rowinv logprob: single GPU, one process, ~a minute.
 
-The failure this exists to catch BEFORE a launch: both processes compose rowinv, the contract
-hashes match, the handshake passes -- and only one side actually EXECUTES it (trainer
-served=4096/4096 against engine served=0 on every worker). Composed is not executed;
-``stats()['served'] > 0`` is the ONLY evidence of engagement, and this script judges nothing else.
-With rowinv the unconditional default, a structural decline is the only way one side falls off it,
-and it is silent until a boundary.
-
-WHAT IT PROVES (single GPU, one process, ~a minute):
-
-  * the rowinv kernel compiles, admits, and SERVES on this node under this env/stack, for BOTH
-    call shapes the two runtimes present: the trainer's grad-bearing chunk ([B, chunk, V], plus a
-    no-grad scoring call) and the engine's sampled-rows decode shape ([N, V], no_grad) -- every
-    real dispatch funnels into the one entry point exercised here;
-  * per side, ``served`` moved and the script prints ``served / declined / last_decline`` so a
-    decline is diagnosable from the census, not from a banner;
-  * the enforcement wiring is LIVE, both directions: a serving census passes
-    ``enforce.rowinv_engagement_boundary(side, require=True)``, and the negative control (census
-    reset to zero) must make the same boundary REFUSE -- a preflight whose refusal path is inert
-    proves nothing.
-
-WHAT IT CANNOT PROVE (the honest floor): that the production trainer wrapper
-(distributed/megatron/model_utils.py) and the vLLM hook (runtimes/vllm/vllm_patches.py) actually
-route into rowinv inside REAL Megatron and vLLM worker processes -- with the flag forwarded by
-both actor channels, real TP groups voting admission, and vLLM's own logprob path patched. That is
-a full engine+trainer bring-up by definition (two conflicting runtime environments); the in-run
-boundaries cover it instead: the trainer refuses at the first post-step weight sync
-(megatron_worker.broadcast_to_inference_engines) and every engine worker at its once-per-sync
-reapply seam (vllm_worker.isoexec_reapply_cached_weights), i.e. within ONE training step of a
-one-sided composition, not hours.
+Checks that rowinv compiles, admits and SERVES both runtimes' call shapes on this node, and that
+the engagement boundary refuses on a zero census. Exit 0 iff every check passes.
 
 Run (repo root, one idle GPU):
     CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=. python \
         skyrl/backends/skyrl_train/isoexec/ops/logprobs/tests/rowinv_preflight.py
-
-Exit 0 iff every check passes AND the negative control refuses. No CUDA exits nonzero: a preflight
-that cannot observe engagement must not bless a launch.
 """
 
 # ruff: noqa: E402 -- the env pins and the CUDA gate must precede the isoexec imports by design.
@@ -111,7 +81,7 @@ gen = torch.Generator(device=DEV).manual_seed(20260826)
 
 
 def exercise(side: str) -> dict:
-    """Run the side's call shape through the one dispatch entry; return the census DELTA."""
+    """Run the side's call shape through the one dispatch entry; return the census delta."""
     before = rowinv.stats()
     if side == "trainer":
         # Grad-bearing training chunk + no-grad scoring call, the two trainer grad modes.
@@ -157,7 +127,7 @@ for side in ("trainer", "engine"):
     except RuntimeError as e:
         check(f"{side} engagement boundary passes on a serving census", False, str(e)[:200])
 
-# NEGATIVE CONTROL: a zero census on a selecting side must REFUSE, or this preflight is inert.
+# Negative control: a zero census on a selecting side must refuse, or this preflight is inert.
 enforce._reset_for_tests()
 pc._CONTRACT, pc._VIEW = contract, pc.build_contract_view(contract, reg)  # keep rowinv selected
 rowinv._reset_for_test()

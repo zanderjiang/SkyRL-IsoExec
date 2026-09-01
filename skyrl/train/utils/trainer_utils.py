@@ -82,8 +82,7 @@ def _log_gate_limit_source(source: str, limits: Tuple[float, float], detail: str
 
 
 def _gate_limits_from_artifact(path: str) -> Tuple[float, float]:
-    """Limits from the DELIVERED contract at ``path`` (``core/contract_delivery.load_contract``,
-    which validates stored identities == recomputed before anything is read out of it)."""
+    """Limits from the DELIVERED contract at ``path``; ``load_contract`` revalidates its identities."""
     from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import load_contract
 
     last: Optional[Exception] = None
@@ -110,15 +109,9 @@ def _gate_limits_from_artifact(path: str) -> Tuple[float, float]:
 
 
 def isoexec_gate_limits() -> Tuple[float, float]:
-    """``(mean_max, max_max)`` for the forward gate, from the CONTRACT wherever one is reachable.
-
-    The envelope is contract data -- hashed into the deployment identity -- not a controller
-    constant, so the module constants are the last resort, never a silent one. Two contract
-    sources, in order: the ExecutionContract this process built (workers), then the delivered
-    artifact at ``ISOEXEC_CONTRACT_PATH`` (the controller, which builds no contract of its own and
-    would otherwise run the gate on the module fallback while the delivered contract claims
-    something else entirely). A configured artifact that cannot be resolved REFUSES rather than
-    falling back, because falling back is that defect.
+    """``(mean_max, max_max)`` for the forward gate: this process's contract (workers), else the
+    delivered artifact at ``ISOEXEC_CONTRACT_PATH`` (controller), else the module constants.
+    A configured artifact that cannot be resolved refuses rather than falling back.
     """
     try:
         from skyrl.backends.skyrl_train.isoexec.core.process_contract import (
@@ -177,12 +170,7 @@ finalize_minibatch_rollout_logprob_diff_std = finalize_post_update_rollout_logpr
 
 
 def _refuse_isoexec_gate(msg: str) -> bool:
-    """A gate refusal through the enforcement layer: strict raises, debug tracing demotes.
-
-    Same strict behavior as the bare ``raise`` this replaced; what it adds is that a traced run
-    reaches the trace it was started for instead of dying at the gate, with the ledger record just
-    as red either way.
-    """
+    """A gate refusal through the enforcement layer: strict raises, debug tracing demotes."""
     try:
         from skyrl.backends.skyrl_train.isoexec.core import enforce
     except Exception:  # noqa: BLE001 -- no isoexec package: the gate keeps its own hard refusal
@@ -198,8 +186,7 @@ def isoexec_step1_boundary() -> None:
 
 
 def _report_isoexec_gate(result: str, evidence: str) -> None:
-    # Reporter: the tolerance gate's verdict into the obligation ledger. Fail-safe; the gate's own
-    # refusal logic is unchanged and remains the enforcement.
+    # Records the gate's verdict in the obligation ledger; fail-safe, the gate itself enforces.
     try:
         from skyrl.backends.skyrl_train.isoexec.core import enforce
 

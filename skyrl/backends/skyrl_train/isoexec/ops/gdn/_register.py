@@ -1,11 +1,7 @@
 """Registry entries for the GatedDeltaNet (GDN) op family.
 
-Declarative metadata only: this module wires no behavior and imports no kernels. It transcribes the
-rounding schedules implemented in ``ops/gdn/*`` into the registry's checkable form. Five ops are
-declared -- ``gdn.core`` (the delta-rule scan, with several algebraically equal but numerically
-distinct impls, one selected per site by the manifest), ``gdn.l2norm`` and ``gdn.gating`` (both
-subsumed by the fused native core, and registered here so ``assert_subsumption_closed`` passes),
-``gdn.conv``, and ``gdn.state`` (engine sites only).
+Declarative metadata only: no behavior, no kernel imports. Transcribes the rounding schedules
+implemented in ``ops/gdn/*`` into the registry's checkable form.
 """
 
 from __future__ import annotations
@@ -23,12 +19,11 @@ _ALL_SITES = ["trainer_fwd", "trainer_score", "engine_prefill", "engine_decode"]
 
 
 def register(reg) -> None:
-    # gdn.core -- the delta-rule scan. The manifest selects one impl per site; each shipped mode
-    # resolves all four sites to the same impl, so no intra-mode equivalence proof is owed.
+    # gdn.core -- the delta-rule scan. Each shipped mode resolves all four sites to the same impl,
+    # so no intra-mode equivalence proof is owed.
     reg.register_op(
         OpSpec(name="gdn.core", sites=list(_ALL_SITES))
-        # vLLM ``fused_sigmoid_gating_delta_rule_update``: l2norm, GQA mapping and fp32 sigmoid gating
-        # are all in-kernel, so this impl absorbs gdn.l2norm and gdn.gating.
+        # vLLM ``fused_sigmoid_gating_delta_rule_update``: l2norm, GQA and gating are in-kernel.
         .add_impl(
             ImplSpec(
                 impl_id="native_fused_sigmoid",
@@ -36,18 +31,14 @@ def register(reg) -> None:
                 supported_archs=_SM90,
                 rounding=RoundingSchedule(
                     machine_assertable={
-                        # The fp32 ssm state round-trip is the whole recurrent design.
                         "boundary_dtypes": {"in": "bf16", "state": "fp32", "out": "bf16"},
                         "use_qk_l2norm_in_kernel": True,
                         "gating_in_kernel_fp32": True,  # g=-exp(fp32 A_log)*softplus(a+dt_bias)
                         "gqa_map": "i_h = i_hv // (HV // H)",  # in-kernel GQA
                         "scale": "K**-0.5",
                         "inplace_final_state": True,
-                        # The manifest pin key (policy pins `kernel` = profile.gdn_kernel =
-                        # SKYRL_ISOEXEC_GDN_KERNEL). This is the native core, reached only via
-                        # gdn_fla_shim._use_native, i.e. the two modes below and no other; `chunk`
-                        # selects the sibling `chunk` impl, so pinning kernel="chunk" here would name
-                        # a function that never installs.
+                        # Manifest pin key (= SKYRL_ISOEXEC_GDN_KERNEL). Only these two modes reach the
+                        # native core; kernel="chunk" selects the sibling impl, so it must not appear here.
                         "kernel": OneOf("recurrent", "cpr"),
                     },
                     documentary=(
@@ -65,16 +56,13 @@ def register(reg) -> None:
                 ),
                 capabilities={"cuda_graph": True, "apc": True, "chunked_prefill": True},
                 subsumes=["gdn.l2norm", "gdn.gating"],
-                # null_lanes: graph-padded decode lanes fold to block 0, kernel skips state_index<=0.
-                # non_contiguous: transposed conv_state view feeds the paired conv.
-                # t_zero: varlen empty lanes.
+                # null_lanes: padded decode lanes fold to block 0 (kernel skips state_index<=0).
+                # non_contiguous: transposed conv_state view. t_zero: varlen empty lanes.
                 hazards=["null_lanes", "non_contiguous", "t_zero"],
             )
         )
-        # RECURRENT scan: fused_recurrent_gated_delta_rule. l2norm + gating done
-        # OUTSIDE (use_qk_l2norm_in_kernel=False) -> does NOT subsume them. Invariant by
-        # construction: grid (1,NV,N*HV) so no reduction crosses a sequence, fp32
-        # register state walked in a plain token loop (prefix invariance), do_not_specialize=[N,T].
+        # RECURRENT scan: fused_recurrent_gated_delta_rule; l2norm + gating stay OUTSIDE, so it
+        # subsumes neither. Grid (1,NV,N*HV) keeps every reduction inside one sequence.
         .add_impl(
             ImplSpec(
                 impl_id="recurrent",
@@ -106,9 +94,7 @@ def register(reg) -> None:
             )
         )
         # Chunk-parallel: chunk_gated_delta_rule with autotune pinned to configs[0] by
-        # gdn_batch_invariant.pin_fla_autotune_configs; l2norm stays outside. Engine reproduces the
-        # trainer's chunked forward via chunk-consistent decode, which rests on prefix invariance and
-        # exact state chaining.
+        # gdn_batch_invariant.pin_fla_autotune_configs; l2norm stays outside.
         .add_impl(
             ImplSpec(
                 impl_id="chunk",
@@ -119,9 +105,8 @@ def register(reg) -> None:
                         "boundary_dtypes": {"in": "bf16", "state": "fp32", "out": "bf16"},
                         "use_qk_l2norm_in_kernel": False,
                         "scale": "K**-0.5",  # q scaled by k_dim**-0.5
-                        # The load-bearing pin: FLA chunk kernels forced to configs[0], identical in
-                        # every process. Avoids the RACY
-                        # chunk_scaled_dot_kkt config BK=64/num_warps=4/num_stages>=2.
+                        # Load-bearing pin: FLA chunk kernels forced to configs[0] in every process,
+                        # which also avoids the racy chunk_scaled_dot_kkt BK=64/num_warps=4/num_stages>=2.
                         "autotune_pin_index": 0,
                         "chunk_size": "FLA_CHUNK_SIZE",
                     },
@@ -142,11 +127,8 @@ def register(reg) -> None:
                 hazards=["non_contiguous", "null_lanes", "t_zero"],
             )
         )
-        # CHUNK-SYNCED: boundary states by the chunk STATE pass (wy prep + fwd_h, autotune pinned),
-        # within-chunk outputs by the recurrent scan from bf16(h_c) -- the mixed evaluation strategy.
-        # Trainer/prefill: gdn_cpr_fwd (segmented
-        # varlen scan, T/C-way parallel). Decode: recurrent T=1 steps + a boundary RESYNC once per C
-        # tokens (CprGDN). l2norm + gating outside, as in recurrent.
+        # CHUNK-SYNCED: boundary states from the chunk state pass (wy prep + fwd_h, autotune pinned),
+        # within-chunk outputs from the recurrent scan starting at bf16(h_c). l2norm + gating outside.
         .add_impl(
             ImplSpec(
                 impl_id="cpr",
@@ -182,8 +164,8 @@ def register(reg) -> None:
         )
     )
 
-    # gdn.l2norm -- standalone q/k L2 norm, subsumed by native_fused_sigmoid. Registered so the
-    # subsumes edge closes (assert_subsumption_closed).
+    # gdn.l2norm -- standalone q/k L2 norm, subsumed by native_fused_sigmoid; registered so the
+    # subsumes edge closes.
     reg.register_op(
         OpSpec(name="gdn.l2norm", sites=list(_ALL_SITES)).add_impl(
             ImplSpec(
@@ -225,9 +207,8 @@ def register(reg) -> None:
                     machine_assertable={
                         "g_dtype": "fp32",
                         "beta_dtype": "input",  # sigmoid(b) in b's dtype
-                        # A_log.exp() taken in the PARAMETER dtype (bf16), NOT upcast first: megatron
-                        # stores A_log bf16 and exponentiates before the fp32 multiply, and
-                        # exp(bf16(x)).float() != exp(float(x)). IsoExec lives in that last ulp.
+                        # A_log.exp() in the PARAMETER dtype (bf16), NOT upcast first, matching megatron:
+                        # exp(bf16(x)).float() != exp(float(x)).
                         "A_log_exp_in_param_dtype": True,
                         "formula": "g = -A_log.exp() * softplus(a.float()+dt_bias.float()); beta = b.sigmoid()",
                     },
@@ -294,14 +275,8 @@ def register(reg) -> None:
                         "equivalence-proof note on causal_conv1d_fn."
                     ),
                 ),
-                # `equivalence_proof`, NOT `bitwise_equal_to` -- and the distinction is the whole
-                # point of having two fields. This pair is the second kind of site asymmetry:
-                # distinct kernels with a colocated proof. They do NOT agree bitwise natively, so
-                # claiming byte-equality here would be false; what holds the composition together is
-                # the split-exactness gate named below. The auditor
-                # (`policy_matches_registry_capabilities`) accepts either form, so an asymmetric op
-                # can discharge its equivalence obligation honestly instead of being pushed into the
-                # wrong claim to satisfy a check.
+                # `equivalence_proof`, NOT `bitwise_equal_to`: the fn/update pair does not agree
+                # bitwise natively, so a byte-equality claim here would be false.
                 capabilities={
                     "cuda_graph": True,
                     "equivalence_proof": (
@@ -315,8 +290,8 @@ def register(reg) -> None:
                 hazards=["null_lanes", "non_contiguous"],
             )
         )
-        # ELEMENTWISE shifted-sum conv (serves ALL four sites) -- invariant by CONSTRUCTION; the
-        # fallback that sidesteps the prefill/decode kernel mismatch by running ONE conv on both sides.
+        # ELEMENTWISE shifted-sum conv (all four sites): one conv on both sides, so the native
+        # prefill/decode kernel mismatch cannot arise.
         .add_impl(
             ImplSpec(
                 impl_id="elementwise_shifted_sum",
@@ -357,9 +332,8 @@ def register(reg) -> None:
                 supported_archs=_SM90,
                 rounding=RoundingSchedule(
                     machine_assertable={
-                        # MANDATORY fp32 ssm cache: mamba_ssm_cache_dtype=auto resolves to bf16, which
-                        # rounds the state every read/write and breaks the fp32 prefill->decode
-                        # round-trip. Asserted loudly at first forward.
+                        # MANDATORY: mamba_ssm_cache_dtype=auto resolves to bf16, which rounds the state
+                        # on every read/write and breaks the fp32 prefill->decode round-trip.
                         "ssm_cache_dtype": "float32",
                         "conv_state_orientation": "(num_blocks, D, W-1)",  # SD/DS transpose
                         "block_id_is_row": True,  # identity index; block-id space == num_gpu_blocks
@@ -384,9 +358,8 @@ def register(reg) -> None:
                     ),
                     hook=None,
                 ),
-                # null_lanes: graph-padded lanes fold to block 0.
-                # profiling_shapes: the minimal graph-profiling cache bound before the real one.
-                # non_contiguous: transposed conv_state view.
+                # null_lanes: graph-padded lanes fold to block 0. profiling_shapes: the throwaway
+                # profiling cache bound before the real one. non_contiguous: transposed conv_state view.
                 hazards=["null_lanes", "profiling_shapes", "non_contiguous"],
             )
         )
@@ -414,9 +387,8 @@ def register(reg) -> None:
                     ),
                 ),
                 capabilities={"cuda_graph": True, "chunked_prefill": True},
-                # The map/pool is sized ONCE and NEVER reallocated: a captured graph holds the
-                # tensor's address, so a realloc would replay against a stale pointer. Overflow raises
-                # rather than grows.
+                # Sized ONCE and never reallocated: a captured graph holds the tensor's address, so a
+                # realloc would replay against a stale pointer. Overflow raises rather than grows.
                 state_invalidation=StateInvalidation(
                     condition=(
                         "slot->row map + state pool are allocated once and never reallocated (a "
@@ -429,10 +401,8 @@ def register(reg) -> None:
                 hazards=["null_lanes", "non_contiguous"],
             )
         )
-        # cpr (GDN_KERNEL=cpr, which requires GDN_NATIVE_STATE=0). A distinct object
-        # from `private_pool` above: that pool holds one tensor per row (the running ssm state) plus the
-        # conv window, while CprGDN also holds the fp32 entry state the boundary chain rests on
-        # and the open-chunk buffers the boundary pass re-reads at every C-th token.
+        # cpr (GDN_KERNEL=cpr, which requires GDN_NATIVE_STATE=0). Unlike `private_pool` it also holds
+        # the fp32 entry state and the open-chunk buffers the boundary pass re-reads every C tokens.
         .add_impl(
             ImplSpec(
                 impl_id="cpr_pool",
@@ -440,19 +410,16 @@ def register(reg) -> None:
                 supported_archs=_SM90,
                 rounding=RoundingSchedule(
                     machine_assertable={
-                        # The running scan state, fp32 like the recurrent pool it inherits.
                         "ssm_state_dtype": "float32",
-                        # The chunk-pass accumulator at the row's last crossed boundary. It must never
-                        # round through bf16: that is what makes the bf16 snapshots exact.
+                        # The chunk-pass accumulator at the last crossed boundary; must never round
+                        # through bf16, which is what makes the bf16 snapshots exact.
                         "entry_state_dtype": "float32",
-                        # The handoff rule: at a boundary the running state becomes bf16(final) upcast
-                        # to fp32, while the fp32 `final` becomes the next entry state. The trainer's
-                        # scan segments load exactly that snapshot, so this is a rounding-schedule fact.
+                        # At a boundary the running state becomes bf16(final) upcast to fp32 while the
+                        # fp32 final becomes the next entry state; trainer segments load that snapshot.
                         "boundary_snapshot_dtype": "bf16",
                         "boundary_chain_dtype": "fp32",
-                        # Buffers are [rows, C, ...] and a resync fires once per C tokens. Pinned by the
-                        # manifest so the two runtimes cannot pick different C: the trainer's segmented
-                        # scan and this boundary pass are the same function only at the same C.
+                        # Manifest-pinned so the two runtimes cannot pick different C: the trainer's
+                        # segmented scan and this boundary pass are the same function only at the same C.
                         "chunk_size": 64,  # FLA_CHUNK_SIZE
                         "capacity": "max_num_seqs",
                         "null_row": 0,  # rows = capacity + 1; row 0 never handed out
@@ -481,9 +448,8 @@ def register(reg) -> None:
                         "never a correctness event, so it moves no bits and adds no key here."
                     ),
                 ),
-                # cuda_graph: decode IS capturable -- the boundary resync is hoisted to the host
-                # driver that runs BEFORE the step's forward (lazy_resync), which is the
-                # difference between this pool and a self-resyncing decode.
+                # cuda_graph: decode is capturable because the boundary resync is hoisted to the host
+                # driver that runs before the step's forward (lazy_resync).
                 capabilities={"cuda_graph": True, "chunked_prefill": True, "apc": "cpr_boundary_store"},
                 state_invalidation=StateInvalidation(
                     condition=(

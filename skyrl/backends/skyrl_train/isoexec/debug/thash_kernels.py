@@ -1,13 +1,7 @@
 """Triton kernels for the debug-mode tensor digest (see ``thash.py`` for the scheme).
 
-Split out of ``thash`` so that module imports on a machine with no triton: everything here is
-reached only through :func:`available`, and every function has a bit-identical eager twin in
-``thash`` that is used when this module cannot load.
-
-One pass over the tensor does the whole digest: the int view is loaded once, the position weight
-is computed in registers, and every mantissa rung of the ladder is accumulated from that same
-load. Per-block partial sums land in an int64 buffer that is reduced with one ``sum``; integer
-addition mod 2**64 is associative, so the block decomposition does not change the result.
+Split out of ``thash`` so that module imports without triton: everything here is reached only
+through :func:`available`, and every function has a bit-identical eager twin in ``thash``.
 """
 
 from __future__ import annotations
@@ -24,7 +18,7 @@ _MIX1 = -4658895280553007687  # 0xBF58476D1CE4E5B9
 _MIX2 = -7723592293110705685  # 0x94D049BB133111EB
 _GOLDEN = -7046029254386353131  # 0x9E3779B97F4A7C15
 _LANE = -7046029254386353131  # per-lane decorrelation multiplier (odd)
-_GROUP_SHIFT = 3  # one splitmix64 per 2**3 elements; see thash's scheme note
+_GROUP_SHIFT = 3  # one splitmix64 per 2**3 elements
 
 _MAX_MASKS = 8  # deepest ladder is fp64: full + 7 rungs
 BLOCK = 4096
@@ -33,9 +27,7 @@ NUM_WARPS = 4
 
 @triton.jit
 def _lsr(z, n: tl.constexpr):
-    """Logical right shift. ``>>`` on int64 is arithmetic, and triton mis-widens the 37-bit mask
-    literal that would undo the sign fill, so the shift is done in uint64 (verified equal to
-    ``thash._lsr`` bit for bit)."""
+    """Logical right shift; done in uint64 because ``>>`` on int64 is arithmetic."""
     return (z.to(tl.uint64) >> n).to(tl.int64)
 
 
@@ -74,10 +66,7 @@ def _digest_kernel(
 ):
     """Accumulate sum_i (x_i & mask_j) * w_i into out[j], one atomic per block per mask.
 
-    Atomics rather than per-block partials + a torch ``sum``: integer addition is associative, so
-    the atomic order is irrelevant, the reduction costs no second launch (measured the same
-    kernel time and 0.012ms less end to end at 67MB), and the result is already the ONE value the
-    caller needs -- which is what makes the fixed floor a single launch plus a single D2H.
+    Atomic order is irrelevant: integer addition mod 2**64 is associative.
     """
     pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
@@ -114,12 +103,8 @@ def _segment_kernel(iv_ptr, out_ptr, n, seg_numel, seed, and_mask, BLOCK: tl.con
     tl.atomic_add(out_ptr + seg, tl.sum(raw * _weights(offs, salt), axis=0))
 
 
-# -- zeroed output arena ----------------------------------------------------------------------
-#
-# The kernels accumulate, so their output must start at zero, and a `torch.zeros` per digest is
-# another launch on the critical path. Instead: one zeroed buffer per device, handed out with a
-# bump cursor and re-zeroed in one shot when it wraps. A slot is always read (the caller's D2H)
-# before the cursor can wrap back onto it, so a wrap can never clear a live slot.
+# Zeroed output arena: the kernels accumulate, so output must start at zero. One buffer per device,
+# bump-allocated and re-zeroed on wrap; a slot is always read (caller's D2H) before the wrap reaches it.
 
 _ARENA_SLOTS = 1 << 13
 _arenas: dict = {}

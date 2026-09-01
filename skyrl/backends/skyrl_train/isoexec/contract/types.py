@@ -9,10 +9,8 @@ COVERAGE_KINDS = frozenset({"enumerated_shapes", "symbolic_domain"})
 HALVES = frozenset({"function", "deployment"})
 TOPOLOGY_KINDS = frozenset({"pinned", "invariant"})
 
-# The lifecycle events a StateClaim may name. An event is listed only if some consumer reads it:
-# "weight_sync" is the enforce.WEIGHT_SYNC boundary and the flush-on-sync ordering assert,
-# "sleep_wake" the wake/sleep ordering asserts (lifecycle/ordering.py) that the engine's state
-# rebind rides on. An event nothing observes is prose the identity hashes, so it is not declarable.
+# Lifecycle events a StateClaim may name. Only events some consumer actually observes are listed;
+# an unobserved event would be prose that the identity hashes.
 STATE_EVENTS = frozenset({"weight_sync", "sleep_wake"})
 
 

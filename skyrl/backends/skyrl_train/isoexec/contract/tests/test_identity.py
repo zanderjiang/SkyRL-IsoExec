@@ -85,8 +85,7 @@ class TestIdentity(unittest.TestCase):
         self.assertEqual(compute_identities(c2).numerical_policy, self.ids.numerical_policy)
 
     def test_rotates_on_case_conditions(self):
-        # A case's declared conditions are what the composition was claimed to hold under, so each
-        # is both a bit-relevant fact and part of what the model means.
+        # A case's declared conditions are both bit-relevant and part of what the model means.
         for field, value in (
             ("grad_mode", "grad"),
             ("runtime_role", "trainer"),
@@ -110,8 +109,7 @@ class TestIdentity(unittest.TestCase):
         self.assertNotEqual(compute_identities(c2).numerical_policy, self.ids.numerical_policy)
 
     def test_coverage_description_is_documentary(self):
-        # Deliberate: the kind is the scope CLASS and is hashed; the description is prose, like
-        # RoundingSchedule.documentary, which reaches the hash through an impl version bump.
+        # Deliberate: the kind is hashed, the description is documentary prose.
         idx = _coverage_idx(self.c)
         c2 = _replace_entry(self.c, idx, coverage=Coverage(self.c.composition[idx].coverage.kind, "reworded"))
         self.assertEqual(compute_identities(c2), self.ids)

@@ -1,35 +1,7 @@
-"""CPU proofs for the MoE combine's ROUND FOLD and the no-grad bypass.
+"""CPU tests for the MoE combine's round fold and the no-grad bypass.
 
-WHAT IS BEING PROVEN, AND WHY IT IS NOT AUTOMATIC
--------------------------------------------------
-Unlike the permute, the combine is NOT pure data movement -- it contains a k-term sum. So byte
-identity is a claim that has to be discharged, not a property that comes for free. This lever
-does not touch the sum. It moves the SINGLE trailing round the caller already performs
-(``combine_postprocess``: ``output.view(...).to(torch.bfloat16)``) from a separate pass over a
-materialized ``[T, H]`` fp32 tensor into the store of the kernel that produced it. The arithmetic
-content of that claim is exactly
-
-    reference(out_dtype=bf16)  ==  reference(out_dtype=None).to(bf16)          (bit for bit)
-
-i.e. one round-to-nearest-even of one fp32 accumulator, whether it is applied at the store or one
-op later. That is a statement about fp32 -> bf16 rounding and about NOTHING ELSE, so it is fully
-provable on CPU -- including on the inputs where a sloppier implementation would differ:
-subnormals, signed zeros, NaN/inf, and the exact halfway values where RTNE's tie rule bites.
-
-The three things that could turn this into a COMPOSITION EVENT are each tested with teeth:
-
-  1. keying ``ROUND_BF16`` on the STORE dtype instead of the ACCUMULATE dtype -- that would turn an
-     fp32 sum into a per-term-rounded bf16 sum. ``test_accumulate_and_store_are_different_axes``
-     shows the two schedules are genuinely different functions (a positive control), and
-     ``legal_fold_dtype`` is what keeps them separate;
-  2. accepting some other dtype pair (bf16 accumulate widened to fp32, fp16, ...) -- refused with a
-     raise rather than silently honoured;
-  3. the request leaking into megatron's own ``unpermute``, which has no such parameter -- the
-     kwarg is zero-KL-private and every fallback path is checked for it.
-
-The Triton kernel itself is GPU-only; the private repo's nightly ``moe_combine_fold_test.py`` closes
-the remaining step (that the kernel's store agrees with this reference) with ``torch.equal`` on the
-real operands before it times anything.
+The fold moves the caller's trailing ``.to(bfloat16)`` into the kernel's store, so the claim is
+``reference(out_dtype=bf16) == reference(out_dtype=None).to(bf16)``, bit for bit.
 """
 
 from __future__ import annotations
@@ -51,7 +23,7 @@ def _combine_backward_stats():
 
 
 def _fixed_order_combine_reference(permuted_tokens, rows, *, permuted_probs=None, out_dtype=None):
-    # inlined verbatim from the private module: the eager chain as a callable oracle (CPU, no Triton)
+    # the eager chain as a callable oracle (CPU, no Triton)
     x = permuted_tokens if permuted_probs is None else permuted_tokens * permuted_probs.unsqueeze(-1)
     out = x.index_select(0, rows[:, 0].contiguous().long())
     for j in range(1, rows.shape[1]):
@@ -63,13 +35,9 @@ def _fixed_order_combine_reference(permuted_tokens, rows, *, permuted_probs=None
 # the adversarial fp32 population
 # =================================================================================================
 def _bf16_tie_values(n: int) -> torch.Tensor:
-    """fp32 values sitting EXACTLY halfway between two adjacent bf16 values.
+    """fp32 values exactly halfway between adjacent bf16 values (low 16 bits == 0x8000).
 
-    bf16 keeps the top 16 bits of an fp32. The halfway point between bf16 ``b`` and its successor
-    has the low 16 bits equal to 0x8000. Round-to-nearest-EVEN then decides by the low bit of the
-    kept mantissa, so a population that alternates that bit exercises both directions of the tie
-    rule -- the one place where "round twice" and "round once" can disagree if anything about the
-    schedule is wrong.
+    The kept mantissa's low bit alternates, so both directions of the RTNE tie rule are exercised.
     """
     out = []
     for i in range(n):
@@ -114,7 +82,7 @@ def _routing(num_tokens: int, num_experts: int, topk: int, seed: int) -> torch.T
 
 
 def _permute_expression(tokens: torch.Tensor, routing_map: torch.Tensor):
-    """Megatron's own unfused permute, verbatim -- the producer of ``sorted_indices``."""
+    """Megatron's own unfused permute, verbatim; produces ``sorted_indices``."""
     num_tokens = tokens.shape[0]
     num_out = int(routing_map.sum().item())
     flat = routing_map.bool().T.contiguous().reshape(-1).argsort(descending=True, stable=True)[:num_out]
@@ -130,7 +98,7 @@ def _rows(sorted_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
 SHAPES = [
     (1, 1, 1, 1),
     (3, 4, 1, 7),
-    (5, 8, 8, 3),  # topk == num_experts: every token owns every expert
+    (5, 8, 8, 3),  # topk == num_experts
     (17, 64, 8, 2048),
     (64, 256, 8, 129),  # 192 empty experts, unaligned hidden
     (8, 16, 3, 65),
@@ -139,7 +107,7 @@ SHAPES = [
 
 
 # =================================================================================================
-# 1. THE FOLD IDENTITY -- the entire arithmetic content of the lever
+# 1. the fold identity
 # =================================================================================================
 @pytest.mark.parametrize("T,E,K,H", SHAPES)
 def test_fold_is_byte_identical_to_the_trailing_cast(T, E, K, H):
@@ -148,17 +116,17 @@ def test_fold_is_byte_identical_to_the_trailing_cast(T, E, K, H):
     permuted, sidx = _permute_expression(tokens, routing)
     rows = _rows(sidx, T)
 
-    unfolded = _fixed_order_combine_reference(permuted, rows)  # fp32 result, as today
+    unfolded = _fixed_order_combine_reference(permuted, rows)
     folded = _fixed_order_combine_reference(permuted, rows, out_dtype=torch.bfloat16)
 
     assert unfolded.dtype is torch.float32
     assert folded.dtype is torch.bfloat16
-    # uint8 view so a moved bit cannot hide behind float comparison semantics (NaN != NaN).
+    # uint8 view so a moved bit cannot hide behind float comparison semantics (NaN != NaN)
     assert torch.equal(folded.view(torch.uint8), unfolded.to(torch.bfloat16).view(torch.uint8))
 
 
 def test_fold_identity_on_bf16_tie_boundaries():
-    """The population where "round once" and "round twice" would diverge if anything were wrong."""
+    """The fold identity holds on the bf16 halfway values, where a wrong schedule would diverge."""
     vals = _bf16_tie_values(512)
     permuted = vals.view(64, 8).repeat(1, 1)  # P=64 rows, H=8
     sidx = torch.arange(8).repeat_interleave(8)  # 8 tokens x k=8, already grouped
@@ -166,7 +134,7 @@ def test_fold_identity_on_bf16_tie_boundaries():
     a = _fixed_order_combine_reference(permuted, rows, out_dtype=torch.bfloat16)
     b = _fixed_order_combine_reference(permuted, rows).to(torch.bfloat16)
     assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-    # ...and the test is not vacuous: at least one element really did land on a tie.
+    # not vacuous: at least one element really landed on a tie
     exact = _fixed_order_combine_reference(permuted, rows).view(torch.int32) & 0xFFFF
     assert int((exact == 0x8000).sum()) > 0, "no element landed on a bf16 halfway point; test is vacuous"
 
@@ -186,19 +154,16 @@ def test_fold_preserves_nan_inf_and_signed_zero():
     a = _fixed_order_combine_reference(permuted, rows, out_dtype=torch.bfloat16)
     b = _fixed_order_combine_reference(permuted, rows).to(torch.bfloat16)
     assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-    # -0.0 + -0.0 == -0.0 must survive the fold as a NEGATIVE zero (0x8000 in bf16, not 0x0000).
+    # -0.0 + -0.0 must survive the fold as a negative zero (0x8000, not 0x0000)
     assert (a[1, 3].view(torch.int16).item() & 0xFFFF) == 0x8000
 
 
 # =================================================================================================
-# 2. THE ACCUMULATE AXIS IS NOT THE STORE AXIS
+# 2. the accumulate axis is not the store axis
 # =================================================================================================
 def test_accumulate_and_store_are_different_axes():
-    """POSITIVE CONTROL. bf16-accumulate and fp32-accumulate-then-round are different functions.
-
-    If they were not, keying ``ROUND_BF16`` on the store dtype would be harmless and the guard in
-    ``legal_fold_dtype`` would be theatre. This constructs a case where they visibly differ, which
-    is what gives every other assertion in this file its meaning.
+    """Positive control: bf16-accumulate and fp32-accumulate-then-round are different functions,
+    which is what makes ``legal_fold_dtype``'s guard load-bearing.
     """
     one = torch.tensor(1.0, dtype=torch.float32)
     eps = torch.tensor(2.0**-9, dtype=torch.float32)  # below bf16's resolution at 1.0
@@ -218,7 +183,7 @@ def test_legal_fold_dtype_admits_only_the_one_fold():
     assert CK.legal_fold_dtype(torch.bfloat16, None) is torch.bfloat16
     assert CK.legal_fold_dtype(torch.float32, torch.bfloat16) is torch.bfloat16
     for acc, out in (
-        (torch.bfloat16, torch.float32),  # widening a per-term-rounded sum -- a DIFFERENT function
+        (torch.bfloat16, torch.float32),  # widening a per-term-rounded sum is a different function
         (torch.float32, torch.float16),
         (torch.bfloat16, torch.float16),
         (torch.float32, torch.float64),
@@ -228,14 +193,14 @@ def test_legal_fold_dtype_admits_only_the_one_fold():
 
 
 def test_reference_matches_the_production_eager_expression():
-    """The oracle used above is the SAME expression ``_fixed_order_combine`` runs, not a rewrite."""
+    """The oracle used above is the same expression ``_fixed_order_combine`` runs."""
     T, E, K, H = 31, 64, 8, 17
     routing = _routing(T, E, K, seed=5)
     tokens = _adversarial_fp32(T * H, seed=6).view(T, H)
     permuted, sidx = _permute_expression(tokens, routing)
     rows = _rows(sidx, T)
 
-    # literal transcription of moe_batch_invariant._fixed_order_combine's tail
+    # transcription of moe_batch_invariant._fixed_order_combine's tail
     out = permuted.index_select(0, rows[:, 0].contiguous())
     for j in range(1, K):
         out = out + permuted.index_select(0, rows[:, j].contiguous())
@@ -243,11 +208,11 @@ def test_reference_matches_the_production_eager_expression():
 
 
 # =================================================================================================
-# 3. PLUMBING -- the request must reach the kernel, and must never reach megatron
+# 3. plumbing: the request reaches the kernel and never megatron
 # =================================================================================================
 def test_every_combine_binding_publishes_the_marker():
-    """The pik call site refuses to send the kwarg to an unmarked binding, so the marker IS the
-    contract. All four bindings that can be installed on ``moe_utils.unpermute`` must carry it."""
+    """Every binding installable on ``moe_utils.unpermute`` carries the out-dtype marker, which is
+    what the call site checks before sending the kwarg."""
     from skyrl.backends.skyrl_train.isoexec.ops.moe import moe_batch_invariant as MBI
 
     for fn in (
@@ -273,8 +238,8 @@ def test_eager_unpermute_honours_the_request_and_agrees_bitwise():
 
 
 def test_request_is_never_forwarded_to_megatron(monkeypatch):
-    """``_orig_unpermute`` is megatron's own function and has no such parameter. Every fallback
-    branch must strip the kwarg; a leak here is a TypeError in the middle of a production step."""
+    """Every fallback branch strips ``isoexec_out_dtype``; megatron's ``unpermute`` has no such
+    parameter, so a leak is a TypeError mid-step."""
     from skyrl.backends.skyrl_train.isoexec.ops.moe import moe_batch_invariant as MBI
 
     seen = {}
@@ -286,14 +251,14 @@ def test_request_is_never_forwarded_to_megatron(monkeypatch):
     monkeypatch.setattr(MBI, "_orig_unpermute", fake_orig)
     permuted = torch.randn(6, 4)
     sidx = torch.tensor([0, 1, 2, 0, 1, 2])
-    # fused=True forces the very first fallback; drop_and_pad and the non-topk layout take the others
+    # fused=True forces the first fallback; drop_and_pad and the non-topk layout take the others
     MBI._deterministic_unpermute(permuted, sidx, (3, 4), fused=True, isoexec_out_dtype=torch.bfloat16)
     assert "isoexec_out_dtype" not in seen, f"the private kwarg leaked into megatron: {seen}"
     seen.clear()
     CB.differentiable_unpermute(permuted, sidx, (3, 4), drop_and_pad=True, isoexec_out_dtype=torch.bfloat16)
     assert "isoexec_out_dtype" not in seen, f"the private kwarg leaked into megatron: {seen}"
     seen.clear()
-    # non-topk layout (5 routed rows for 3 tokens) -> build_combine_rows declines
+    # non-topk layout: 5 routed rows for 3 tokens -> build_combine_rows declines
     CB.differentiable_unpermute(
         torch.randn(5, 4), torch.tensor([0, 1, 2, 0, 1]), (3, 4), isoexec_out_dtype=torch.bfloat16
     )
@@ -312,11 +277,10 @@ def test_decline_is_counted_and_named(monkeypatch):
 
 
 # =================================================================================================
-# 4. THE NO-GRAD BYPASS
+# 4. the no-grad bypass
 # =================================================================================================
 def _stub_kernel(monkeypatch):
-    """Stand in for the GPU-only Triton call with the pure-torch reference, so the WIRING is
-    testable on CPU. Semantics are identical by ``fixed_order_combine_reference``'s definition."""
+    """Replace the GPU-only Triton call with the pure-torch reference so the wiring is CPU-testable."""
 
     def fake(permuted_tokens, sorted_indices, restore_shape, *, permuted_probs=None, rows=None, **kw):
         num_tokens = int(restore_shape[0])
@@ -369,14 +333,11 @@ def test_nograd_bypass_returns_the_same_bytes(monkeypatch):
 
 
 def test_folded_forward_still_produces_the_fp32_row_gradient(monkeypatch):
-    """The fold changes the forward's STORE dtype; the VJP of the removed ``.to(bfloat16)`` is an
-    exact upcast, so ``d(permuted)`` must stay fp32 and must stay equal to the unfolded arm's."""
+    """The fold leaves ``d(permuted)`` fp32 and bit-equal to the unfolded arm's."""
     _stub_kernel(monkeypatch)
     sidx = torch.arange(3).repeat_interleave(8)
-    # ONE cotangent, in the dtype the FOLDED forward emits. The unfolded arm sees it through the
-    # `.to(bfloat16)` this lever removes, whose VJP is an exact upcast -- so `cot.float()` is
-    # literally what autograd hands the unfolded combine today. Comparing the two arms under the
-    # same incoming gradient is the only comparison that means anything.
+    # one cotangent in the folded forward's dtype; `cot.float()` is what autograd hands the
+    # unfolded arm, since the VJP of the removed `.to(bfloat16)` is an exact upcast
     cot = torch.randn(3, 8).to(torch.bfloat16)
     base = torch.randn(24, 8)
 

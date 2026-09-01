@@ -1,20 +1,15 @@
-"""Debug-mode integration: flags registered, adapter arms hooks, and -- the part that decides
-whether debug mode is usable at all -- EVERY refusal demoting at the real call site.
+"""Debug-mode integration: flags registered, adapter arms hooks, every refusal demoting.
 
-The demotion is only worth anything end to end: ``on_weight_sync`` demotes the handshake and then
-closes WEIGHT_SYNC on the record the demotion just wrote, so a test that exercises
-``assert_contract_agreement`` alone proves nothing about the run. The cases below drive the actual
-adapters, and each one asserts BOTH halves: execution continues, and the ledger is exactly as red
-as strict mode would have left it.
+The demotion cases drive the real adapters (not the helpers in isolation) and assert both halves:
+execution continues, and the ledger stays as red as strict mode would have left it.
 """
 
 import os
 import unittest
 from unittest import mock
 
-from skyrl.backends.skyrl_train.isoexec.core import enforce
+from skyrl.backends.skyrl_train.isoexec.core import enforce, process_contract
 from skyrl.backends.skyrl_train.isoexec.core import flags as flags_mod
-from skyrl.backends.skyrl_train.isoexec.core import process_contract
 from skyrl.backends.skyrl_train.isoexec.core.tests.test_adapter_negative import (
     _CONTRACT,
     _fresh,
@@ -75,12 +70,11 @@ class TestHandshakeDemotion(unittest.TestCase):
 
 
 class TestRealCallSiteDemotion(unittest.TestCase):
-    """The demotion at the sites a run actually goes through, not at the helper in isolation."""
+    """Demotion at the sites a run actually goes through, not at the helper in isolation."""
 
     def setUp(self):
-        # These cases arm debug tracing to get the demotion, not to trace: real region hooks are
-        # process-global and idempotent, so leaving them installed changes what every later test in
-        # the session sees. debug/tests owns the hook installation itself.
+        # Debug tracing is armed for the demotion, not to trace: real region hooks are
+        # process-global, so leaving them installed would change what later tests see.
         patcher = mock.patch("skyrl.backends.skyrl_train.isoexec.debug.install.install_debug_hooks", return_value=0)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -90,8 +84,7 @@ class TestRealCallSiteDemotion(unittest.TestCase):
             os.environ.update(_armed({}))
             engine = _mk_engine(install_fn=_stub_install("engine"))
             engine.run_install()
-            # Returns rather than raising: the handshake demotes AND the WEIGHT_SYNC close that
-            # reads its record demotes too (the self-defeating half of the old wiring).
+            # Both the handshake and the WEIGHT_SYNC close that reads its record must demote.
             self.assertIs(engine.on_weight_sync(_stamp("ff" * 32)), False)
             self.assertIn(enforce.VIOLATION, _statuses("handshake:numerical_policy"))
             self.assertGreaterEqual(enforce.verdict_counts()["refused"], 1)
@@ -105,8 +98,8 @@ class TestRealCallSiteDemotion(unittest.TestCase):
                 engine.on_weight_sync(_stamp("ff" * 32))
 
     def test_claims_violation_survives_run_install_under_debug(self):
-        # A debug run started to localize a kernel mix must REACH the trace: deployed outside the
-        # claimed domain, run_install used to die before install() ever ran.
+        # A debug run must reach the trace: deployed outside the claimed domain, run_install must
+        # still call install().
         with _fresh():
             os.environ.update(_armed({}))
             ran = []
@@ -185,10 +178,8 @@ class TestAdapterArmsHooks(unittest.TestCase):
 class TestCudaGraphRefusal(unittest.TestCase):
     """Debug tracing + CUDA-graph decode is refused at init, and not demotable.
 
-    Every other refusal in debug mode demotes (enforce.demoted() is true precisely because debug
-    tracing is armed). This one cannot: its precondition IS debug mode, so demoting it would make
-    it a no-op every time it fired. The failure it prevents is also not a crash -- it is a trace
-    that reads clean because the decode half of the forward was never recorded.
+    Unlike every other debug-mode refusal it cannot demote: its precondition is debug mode itself,
+    and the failure it prevents is a trace that reads clean with the decode half never recorded.
     """
 
     CG = "SKYRL_ISOEXEC_ENABLE_CUDAGRAPH"
@@ -213,7 +204,7 @@ class TestCudaGraphRefusal(unittest.TestCase):
         self.assertIn("SKYRL_ISOEXEC_ENABLE_CUDAGRAPH", msg)
         self.assertIn("SKYRL_ISOEXEC_DEBUG_TRACE", msg)
         self.assertIn("NO trace records", msg)
-        hooks.assert_not_called()  # refused BEFORE anything was installed
+        hooks.assert_not_called()  # refused before anything was installed
 
     def test_demotion_does_not_soften_it(self):
         """enforce.demoted() is true here; the refusal must still raise."""

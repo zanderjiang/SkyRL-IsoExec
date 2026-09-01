@@ -1,16 +1,7 @@
-"""CPU proofs for the fused FORWARD MoE permute (index build + row gather).
+"""CPU tests for the fused forward MoE permute (index build + row gather).
 
-The permute is PURE DATA MOVEMENT: an integer permutation plus a copy. So the acceptance is
-``torch.equal`` -- on ``uint8`` views for the payload, so a bit that moved cannot hide behind a
-float comparison -- and never a tolerance. These tests therefore assert byte-identity against
-megatron's literal eager expression over an adversarial population (empty experts, skewed counts,
-top-k edges, unaligned hidden sizes, subnormal/NaN payloads), plus the row-identity property (row i
-comes back as row i's data), the decline envelope, and the install/revert chain.
-
-The Triton kernels are GPU-only. What is provable here is (a) the ALGORITHM, via the pure-torch
-transcription that the kernels implement, and (b) the KERNEL SHAPE, by compiling both index kernels
-and the gather kernel to TTIR for an explicit SM90 target without opening a CUDA context -- which
-catches the Triton signature/type failures that source inspection cannot.
+The permute is pure data movement, so acceptance is ``torch.equal`` on ``uint8`` views against
+megatron's eager expression. The Triton kernels are checked by compiling them to TTIR for SM90.
 """
 
 from __future__ import annotations
@@ -24,10 +15,8 @@ import torch
 from skyrl.backends.skyrl_train.isoexec.ops.moe import moe_fused_permute as P
 
 # --- compat shims -------------------------------------------------------------------------------
-# The public module ships the fused permute UNCONDITIONALLY: the env gates (enable / gather-impl /
-# validate-budget / preemit), and the stats accessors, were stripped in curation while the _COUNTS /
-# _DECLINE_REASONS census survives. The env names below are therefore INERT here (setting them is a
-# no-op); tests that proved the removed knobs themselves were dropped in this port.
+# The public module ships the fused permute unconditionally, so these env names are inert here
+# (setting them is a no-op); the stats accessors below stand in for stripped ones.
 P.ENABLE_ENV = "SKYRL_ISOEXEC_MOE_FUSED_PERMUTE"
 P.GATHER_ENV = "SKYRL_ISOEXEC_MOE_FUSED_PERMUTE_GATHER"
 P.VALIDATE_ENV = "SKYRL_ISOEXEC_MOE_FUSED_PERMUTE_VALIDATE"
@@ -50,14 +39,16 @@ P.fused_permute_stats = _fused_permute_stats
 P.reset_fused_permute_stats = _reset_fused_permute_stats
 # -------------------------------------------------------------------------------------------------
 
-from skyrl.backends.skyrl_train.isoexec.ops.moe import moe_batch_invariant as MBI
+from skyrl.backends.skyrl_train.isoexec.ops.moe import (  # noqa: E402
+    moe_batch_invariant as MBI,
+)
 
 
 # =================================================================================================
 # the adversarial population
 # =================================================================================================
 def _topk_map(num_tokens: int, num_experts: int, topk: int, seed: int) -> torch.Tensor:
-    """Exact top-k routing: every token picks ``topk`` DISTINCT experts, as torch.topk guarantees."""
+    """Exact top-k routing: every token picks ``topk`` distinct experts."""
     g = torch.Generator().manual_seed(seed)
     routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
     for t in range(num_tokens):
@@ -66,7 +57,7 @@ def _topk_map(num_tokens: int, num_experts: int, topk: int, seed: int) -> torch.
 
 
 def _skewed_map(num_tokens: int, num_experts: int, topk: int, seed: int) -> torch.Tensor:
-    """Every token routes to the SAME topk experts: num_experts-topk empty experts, maximal skew."""
+    """Every token routes to the same topk experts: maximal skew, num_experts-topk empty."""
     routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
     hot = [(seed + j) % num_experts for j in range(topk)]
     routing_map[:, hot] = True
@@ -90,7 +81,7 @@ _CASES = [
 
 @pytest.mark.parametrize("num_tokens,num_experts,topk,hidden,builder", _CASES)
 def test_compaction_is_bitwise_megatrons_argsort_permutation(num_tokens, num_experts, topk, hidden, builder):
-    """The whole bitwise case in one assert: the same int64 permutation, not a similar one."""
+    """Compaction yields the same int64 permutation megatron's argsort does."""
     routing_map = builder(num_tokens, num_experts, topk, seed=num_tokens + num_experts)
     num_out_tokens = int(routing_map.sum())
 
@@ -100,8 +91,7 @@ def test_compaction_is_bitwise_megatrons_argsort_permutation(num_tokens, num_exp
     assert torch.equal(got_idx, ref_idx)
     assert torch.equal(got_expert, ref_expert)
     assert torch.equal(counts, routing_map.sum(dim=0).to(torch.int64))
-    # The permutation must be expert-major and token-ascending within an expert -- the property the
-    # downstream fixed-order combine and the ordered VJP both rest on.
+    # expert-major, token-ascending within an expert: what the fixed-order combine and VJP rest on
     key = got_expert * num_tokens + got_idx
     assert torch.equal(key, torch.sort(key).values)
     assert torch.equal(torch.sort(key).values, torch.unique(key))
@@ -109,7 +99,7 @@ def test_compaction_is_bitwise_megatrons_argsort_permutation(num_tokens, num_exp
 
 @pytest.mark.parametrize("num_tokens,num_experts,topk,hidden,builder", _CASES)
 def test_preemitted_rows_are_exact_stable_argsort_inverse(num_tokens, num_experts, topk, hidden, builder):
-    """Producer metadata is the canonical post-FC2 stable-argsort result, element for element."""
+    """Pre-emitted rows equal the stable-argsort inverse, element for element."""
     routing_map = builder(num_tokens, num_experts, topk, seed=hidden + 17)
     n = int(routing_map.sum())
     sorted_indices, route_expert, _ = P.compact_route_positions_reference(routing_map, n)
@@ -128,13 +118,13 @@ def test_gather_is_byte_identical_and_row_identity_holds(num_tokens, num_experts
         tokens = torch.randn(num_tokens, hidden, dtype=dtype)
         got = P.permute_rows(tokens, sorted_indices)
         assert torch.equal(got.view(torch.uint8), tokens.index_select(0, sorted_indices).view(torch.uint8))
-        # ROW IDENTITY: each routed row carries its own token's bytes, not merely the right multiset.
+        # row identity: each routed row carries its own token's bytes, not just the right multiset
         for r in range(num_out_tokens):
             assert torch.equal(got[r].view(torch.uint8), tokens[int(sorted_indices[r])].view(torch.uint8))
 
 
 def test_gather_preserves_nan_subnormal_and_signed_zero_payloads():
-    """A copy must not normalise anything. Any arithmetic in the path would show up right here."""
+    """The gather is a copy, so NaN, subnormal and signed-zero payloads are not normalised."""
     routing_map = _topk_map(6, 8, 3, seed=5)
     num_out_tokens = int(routing_map.sum())
     sorted_indices, _, _ = P.compact_route_positions_reference(routing_map, num_out_tokens)
@@ -152,7 +142,7 @@ def test_gather_preserves_nan_subnormal_and_signed_zero_payloads():
 def test_end_to_end_wrapper_is_bitwise_megatrons_eager_permute(
     monkeypatch, num_tokens, num_experts, topk, hidden, builder
 ):
-    """The wrapper's three returns, against the six-op eager expression, byte for byte."""
+    """The wrapper's returns match megatron's eager permute expression byte for byte."""
     monkeypatch.setenv(P.ENABLE_ENV, "1")
     routing_map = builder(num_tokens, num_experts, topk, seed=topk * 31 + hidden)
     num_out_tokens = int(routing_map.sum())
@@ -200,7 +190,7 @@ def test_pik_owner_reuses_the_same_preemitted_rows(monkeypatch):
     sidx, experts, _ = P.compact_route_positions_reference(routing_map, 23 * 8)
     rows = P.canonical_combine_rows_reference(routing_map, sidx, experts)
     setattr(sidx, P._PREEMITTED_ROWS_ATTR, rows)
-    # Make every reconstruction path illegal: reaching either one means the owner ignored metadata.
+    # make reconstruction illegal: reaching it means the owner ignored the published rows
     monkeypatch.setattr(
         "skyrl.backends.skyrl_train.isoexec.ops.moe.moe_combine_rows_kernel.stable_combine_rows",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("reconstructed rows")),
@@ -267,8 +257,7 @@ def test_declines_loudly_and_falls_back_to_the_captured_binding(monkeypatch, kwa
     call.update(kwargs)
     assert P._fused_permute(torch.randn(4, 3), routing_map, None, **call) == "FELL-BACK"
     assert seen.get("hit")
-    # the public module dropped the decline-census increments; the decline itself is proven by the
-    # fallback above, and `expected` still names the reason the admission check must fire on
+    # the public module dropped the decline-census increments, so check the reason directly
     full = {"num_out_tokens": None, "fused": False, "drop_and_pad": False}
     full.update(call)
     assert P._decline_reason(torch.randn(4, 3), routing_map, None, **full) == expected
@@ -276,31 +265,28 @@ def test_declines_loudly_and_falls_back_to_the_captured_binding(monkeypatch, kwa
 
 
 def test_grad_without_exact_topk_declines_rather_than_guessing_a_vjp(monkeypatch):
-    """The ordered VJP needs [T, topk] route rows. A layout that cannot have one must not get one."""
+    """A layout with no [T, topk] route rows declines instead of guessing a VJP."""
     monkeypatch.setenv(P.ENABLE_ENV, "1")
     P.reset_fused_permute_stats()
     monkeypatch.setattr(P, "_orig_permute", lambda *a, **k: "FELL-BACK")
     routing_map = torch.zeros(4, 8, dtype=torch.bool)
     routing_map[0, :3] = True
-    routing_map[1, :2] = True  # 5 routed pairs over 4 tokens: not an exact top-k
+    routing_map[1, :2] = True  # 5 routed pairs over 4 tokens: not exact top-k
     x = torch.randn(4, 3, requires_grad=True)
     assert P._fused_permute(x, routing_map, None, 5) == "FELL-BACK"
     assert (
         P._decline_reason(x, routing_map, None, num_out_tokens=5, fused=False, drop_and_pad=False)
         == "grad_without_exact_topk"
     )
-    # DIVERGENCE FROM THE PRIVATE PROOF, kept visible on purpose: privately the same layout was
-    # SERVED under no_grad (row emission was opt-in). This repo emits canonical combine rows on
-    # every served call, and those rows are only lawful for an exact top-k layout -- so a no_grad
-    # non-exact-topk call now fails inside row emission instead of being served or declined.
-    # If no_grad non-exact-topk service is ever needed, _decline_reason must refuse it first.
+    # rows are emitted on every served call and are only lawful for an exact top-k layout, so a
+    # no_grad non-exact-topk call raises inside row emission rather than being served
     P.reset_fused_permute_stats()
     with torch.no_grad(), pytest.raises(ValueError, match="exact-topk"):
         P._fused_permute(x, routing_map, None, 5)
 
 
 def test_live_validation_raises_on_a_corrupted_permutation(monkeypatch):
-    """The live gate must FAIL the arm, not degrade it, if the compaction ever disagrees."""
+    """A compaction that disagrees with the reference raises rather than degrading silently."""
     monkeypatch.setenv(P.ENABLE_ENV, "1")
     monkeypatch.setenv(P.VALIDATE_ENV, "4")
     P.reset_fused_permute_stats()
@@ -322,7 +308,7 @@ def test_live_validation_raises_on_a_corrupted_permutation(monkeypatch):
 # autograd wiring
 # =================================================================================================
 def test_custom_autograd_matches_an_exact_fp64_index_add_oracle():
-    """Integer-valued fp64 makes this a test of MEMBERSHIP and ORDER, not of a reduction tree."""
+    """The permute VJP equals an exact fp64 index_add oracle (integer values, so no reduction tree)."""
     num_tokens, num_experts, topk, hidden = 17, 24, 8, 11
     routing_map = _topk_map(num_tokens, num_experts, topk, seed=9)
     x = torch.randn(num_tokens, hidden, dtype=torch.float64, requires_grad=True)
@@ -354,7 +340,7 @@ def test_probs_gradient_is_the_scatter_back_into_the_dense_map(monkeypatch):
 
 
 def test_preemitted_combine_vjp_and_gradient_accumulation_are_exact(monkeypatch):
-    """Two backwards accumulate in the same order; metadata provenance cannot move a gradient bit."""
+    """Pre-emitted rows give bit-identical outputs and accumulated gradients to reconstructed ones."""
     monkeypatch.setenv(P.ENABLE_ENV, "1")
     monkeypatch.setenv(P.GATHER_ENV, "kernel")
     routing_map = _skewed_map(17, 23, 8, seed=4)
@@ -403,8 +389,8 @@ def test_install_reaches_both_bindings_and_reverts(monkeypatch):
         assert moe_utils.permute is P._fused_permute
         assert token_dispatcher.permute is P._fused_permute
         assert P.install_fused_permute(), "install must be idempotent"
-        # The captured fallback is the binding that was live, so a decline still reaches whatever
-        # wrapper (e.g. the ordered-VJP one) already owned permute.
+        # the captured fallback is the binding that was live, so a decline still reaches whatever
+        # wrapper already owned permute
         assert P._orig_permute is original
 
         P.revert_fused_permute()
@@ -442,7 +428,7 @@ def test_no_atomics_and_one_store_owner_in_source():
 
 @pytest.mark.skipif(not P.HAVE_TRITON, reason="offline SM90 compilation needs Triton")
 def test_kernels_compile_for_sm90_without_cuda_and_carry_no_atomics():
-    """Compile the real specializations to TTIR: source inspection cannot catch a type error."""
+    """The real kernel specializations compile to TTIR for SM90 with no atomics or float math."""
     import triton
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -517,6 +503,6 @@ def test_kernels_compile_for_sm90_without_cuda_and_carry_no_atomics():
         assert "atomic" not in ttir, f"{kernel.__name__} must stay atomics-free"
         if want_stores is not None:
             assert ttir.count("tt.store") == want_stores
-        # The movement kernels must contain no float arithmetic at all -- that is the bitwise case.
+        # movement kernels must contain no float arithmetic at all
         for op in ("arith.addf", "arith.mulf", "arith.subf", "arith.truncf", "arith.extf"):
             assert op not in ttir, f"{kernel.__name__} must not do float arithmetic ({op})"

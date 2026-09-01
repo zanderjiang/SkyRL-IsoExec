@@ -296,14 +296,8 @@ class WorkerWrap(LayerwiseReloadWorkerMixin):
         """
         import torch
 
-        # Rowinv ENGAGEMENT boundary (engine side). This seam runs ONCE PER SYNC in every engine
-        # worker process -- the only per-sync engine hook, never per-forward -- and by the first
-        # post-generation sync this worker has computed sampled logprobs, so a contract that
-        # selects rowinv_leaftree with a census that never served it -- engine served=0 while the
-        # trainer served every row, behind a MATCHING contract hash -- refuses here instead of
-        # running silently. No-op when the flag is off; the init
-        # sync (pre-generation) is granted inside the boundary. Deliberate refusals propagate
-        # through collective_rpc; everything else is fail-safe inside the call.
+        # Rowinv engagement boundary (engine side): the only per-sync engine hook, never per-forward.
+        # No-op when the flag is off; deliberate refusals propagate through collective_rpc.
         try:
             from skyrl.backends.skyrl_train.isoexec.core.enforce import (
                 rowinv_engagement_boundary,

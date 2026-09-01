@@ -1,16 +1,7 @@
 """Tensor-parallel-invariant row-parallel linear, via the vendored ``pik`` package.
 
-A row-parallel layer splits the GEMM's K-reduction across ranks, and floating-point addition is not
-associative, so without this the rollout engine and the trainer must run at the same TP size. pik pins the
-reduction plan instead: K is cut into ``G`` fixed contiguous leaves, each leaf is summed by an ordinary
-non-split-K GEMM, and the leaves are combined by a fixed balanced binary tree, so a rank at TP=C owns a
-contiguous subtree and the expression tree is identical for every C dividing G. Only row-parallel layers
-(``o_proj``/``linear_proj``, ``down_proj``/``linear_fc2``) shard K, so only ``RowParallelLinear.forward`` is
-patched -- and because the engine runs Megatron's ``GPTModel`` inside vLLM, that one patch covers both sides.
-
-Gated by ``SKYRL_ISOEXEC_PIK`` (default off), with ``G`` from ``SKYRL_ISOEXEC_PIK_LEAVES`` (default 8) and the
-leaf dtype from ``SKYRL_ISOEXEC_PIK_LEAF_DTYPE`` (default ``fp32``; ``bf16`` is also TP-invariant but is a
-different composition and must be pinned as one). Idempotent and reversible.
+K is cut into ``G`` fixed leaves summed by a fixed balanced tree, so the expression tree is identical
+for every TP size dividing G. Gated by ``SKYRL_ISOEXEC_PIK``; idempotent and reversible.
 """
 
 from __future__ import annotations
@@ -37,9 +28,7 @@ def pik_enabled() -> bool:
 def trainer_sp_enabled() -> bool:
     """``SKYRL_ISOEXEC_TRAINER_SP`` (default off): Megatron sequence parallelism in the trainer.
 
-    Gates both halves of the feature -- keeping ``provider.sequence_parallel`` on, and routing a
-    sequence-parallel RowParallelLinear through pik's ``tree_reduce_scatter``. One flag must gate both,
-    because SP with the native reduce-scatter is not slower but wrong: it breaks TP-invariance.
+    Must gate both halves: SP with the native reduce-scatter breaks TP-invariance.
     """
     return os.environ.get("SKYRL_ISOEXEC_TRAINER_SP", "0") == "1"
 
@@ -56,8 +45,7 @@ def _num_leaves() -> int:
 
 
 def _leaf_dtype() -> torch.dtype:
-    # The manifest pins the resolved value, so trainer and engine cannot split: a one-sided value is refused
-    # at weight sync, and _assert_plan_matches_manifest refuses an env/manifest split at install.
+    # The manifest pins the resolved value, so trainer and engine cannot split on it.
     s = os.environ.get("SKYRL_ISOEXEC_PIK_LEAF_DTYPE", "bf16").lower()
     if s in ("bf16", "bfloat16"):
         return torch.bfloat16
@@ -67,12 +55,10 @@ def _leaf_dtype() -> torch.dtype:
 
 
 def _disable_pik_p2p() -> None:
-    """Force pik's tree all-reduce onto the NCCL transport, disabling the P2P symmetric-memory path.
+    """Force pik's tree all-reduce onto NCCL, disabling the P2P symmetric-memory path.
 
-    Under a colocated placement the trainer's TP ranks share GPUs with the engine workers and
-    ``symm_mem.rendezvous`` aborts; the symmetric buffer is allocated before pik's own NCCL fallback, so the
-    path is disabled at the source. The arithmetic is unchanged -- NCCL moves bytes, pik owns the tree -- so
-    this stays bitwise TP-invariant, just without the NVLink fast path.
+    Colocated trainer/engine ranks share GPUs and ``symm_mem.rendezvous`` aborts. Bitwise neutral:
+    NCCL moves bytes, pik still owns the tree.
     """
     import pik.allreduce as _ar  # type: ignore
     import pik.linear as _lin  # type: ignore
@@ -93,18 +79,12 @@ def _disable_pik_p2p() -> None:
     )
 
 
-# Which transport actually ran. The install banner states an intention, not an outcome: `tree_all_reduce`
-# swallows P2P exceptions and returns the bitwise-identical NCCL result, so a process whose symm-mem
-# rendezvous failed would otherwise pay NCCL latency for the whole run with no symptom. pik's allreduce
-# therefore fires a hook the first time a transport resolves, and again the first time a P2P process
-# degrades, recording the qualname of the function that actually moved the bytes. The impl_id stays
-# `pik_tree` either way, since both transports evaluate the same tree.
+# Which transport actually ran: a silent P2P->NCCL degradation costs latency with no other symptom.
+# impl_id stays `pik_tree` either way, since both transports evaluate the same tree.
 def pik_transport_status() -> dict:
     """Counts of which transport pik's tree all-reduce ran on in THIS process.
 
-    ``{"state": "p2p"|"nccl"|"p2p_fallback"|"p2p_and_nccl"|"none", "p2p_calls": .., "nccl_calls":
-    .., "p2p_fallbacks": .., "first_fallback": {...}|None}``. ``state == "none"`` means no
-    all-reduce has run yet (TP=1, or before the first forward) -- not that P2P is off.
+    ``state == "none"`` means no all-reduce has run yet (TP=1, or pre-forward), not that P2P is off.
     """
     try:
         ensure_pik()
@@ -131,7 +111,7 @@ def _record_transport_fingerprint(side: str, state: str, impl_fn) -> None:
         elif side == "TRAINER":
             record_installs("collectives.tree_all_reduce", TRAINER_SITES, "pik_tree", impl_fn)
         else:
-            return  # a harness ("TEST"/"?") has no site vocabulary; the banner is the record
+            return  # a harness ("TEST"/"?") has no site vocabulary
         log_fingerprint_once(cached_contract_view(), tag=f"{side.lower()}_first_collective")
     except Exception as e:  # pragma: no cover - never fatal
         logger.warning(f"[ISOEXEC-FINGERPRINT] transport record skipped: {e}")
@@ -169,10 +149,7 @@ def get_plan():
 def _assert_plan_matches_manifest(side: str, plan) -> None:
     """Refuse the install when the plan the env built is not the composition the contract names.
 
-    ``leaves`` and ``leaf_dtype`` are stated by the env vars this module reads and pinned into the hash the
-    weight-sync handshake compares. Without this check, flipping an env var on both sides would run a
-    different reduction tree under an unchanged contract hash and the handshake would still match. With no
-    built contract (benches, unit harnesses) there is nothing to check against and this is skipped.
+    Skipped with no built contract (benches, unit harnesses).
     """
     try:
         from ...core.process_contract import cached_contract_view
@@ -197,7 +174,7 @@ def _assert_plan_matches_manifest(side: str, plan) -> None:
         problems.append(f"leaves: manifest pins {want_leaves}, env built G={plan.num_leaves}")
     if want_dtype is not None and str(want_dtype) != have_dtype:
         problems.append(f"leaf_dtype: manifest pins {want_dtype!r}, env built {have_dtype!r}")
-    # Reporter: the one refusing pin check the audit found reachable. Fail-safe, verdict unchanged.
+    # Report the pin check per site; fail-safe, verdict unchanged.
     try:
         from ...core import enforce
         from ...core.fingerprint import ENGINE_SITES, TRAINER_SITES
@@ -221,8 +198,7 @@ def _assert_plan_matches_manifest(side: str, plan) -> None:
         "the model profile's pik_leaves / pik_leaf_dtype so the manifest names what you run "
         "(a different composition: new hash, new gate signature, new proof obligation)."
     )
-    # Through the one demotion helper, like every other enforcement refusal: a debug run must
-    # reach its trace.
+    # Go through the demotion helper so a debug run still reaches its trace.
     from ...core.enforce import refuse
 
     refuse(msg)
@@ -231,8 +207,7 @@ def _assert_plan_matches_manifest(side: str, plan) -> None:
 class _PikRowParallel(torch.autograd.Function):
     """Forward is pik's leaf-tree GEMM plus tree all-reduce; backward reduces over N and M, never K.
 
-    Backward therefore carries no invariance requirement and runs stock cuBLAS, accumulating the weight
-    gradient into Megatron's ``main_grad`` when grad-accum fusion is on.
+    Backward therefore carries no invariance requirement and runs stock cuBLAS.
     """
 
     @staticmethod
@@ -248,8 +223,8 @@ class _PikRowParallel(torch.autograd.Function):
         ctx.group = group
         with torch.no_grad():
             if sequence_parallel:
-                # Sequence-parallel: same leaf-tree GEMM, tree_reduce_scatter combine, so the output is this
-                # rank's sequence slice. Bias is None by contract; the caller adds it on the slice.
+                # Same leaf-tree GEMM, tree_reduce_scatter combine -> this rank's sequence slice.
+                # Bias is None by contract; the caller adds it on the slice.
                 assert bias is None, "sequence-parallel pik row-parallel adds bias outside the op"
                 y = _row_fwd_rs(
                     x,
@@ -280,9 +255,8 @@ class _PikRowParallel(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         dy = dy.contiguous()
         if ctx.sequence_parallel:
-            # dy arrives as this rank's sequence slice. The backward of a reduce-scatter is an all-gather
-            # along the same dim -- transport only, and rank order reassembles the sequence exactly -- so a
-            # plain NCCL all-gather is fine: backward owes correctness, not invariance.
+            # Backward of a reduce-scatter is an all-gather along the same dim: transport only, so a
+            # plain NCCL all-gather suffices (backward owes correctness, not invariance).
             import torch.distributed as dist
 
             world = dist.get_world_size(ctx.group)
@@ -294,26 +268,21 @@ class _PikRowParallel(torch.autograd.Function):
         dy2 = dy.reshape(-1, n)
         x2 = x.reshape(-1, x.shape[-1])
 
-        # dY is already the full output gradient on every rank (row-parallel does not shard N), so
-        # dX_local = dY @ W_local needs no cross-rank comm and no K-reduction.
+        # Row-parallel does not shard N, so dY is already full on every rank: no comm, no K-reduction.
         dx = (dy2 @ weight).reshape(x.shape).to(x.dtype)
         dw = (dy2.t() @ x2).to(weight.dtype)
         db = dy2.sum(0).to(weight.dtype) if ctx.has_bias else None
 
         wgrad = dw
         if ctx.accum_main_grad and hasattr(weight, "main_grad") and weight.main_grad is not None:
-            # With gradient_accumulation_fusion the distributed optimizer reads weight.main_grad, not
-            # weight.grad, so accumulate there and hand autograd None.
+            # Under grad-accum fusion the optimizer reads main_grad, not .grad: accumulate there.
             weight.main_grad.add_(dw.to(weight.main_grad.dtype))
             wgrad = None
         return dx, wgrad, db, None, None, None, None, None, None, None
 
 
 def _pik_supported(self, k_full: int, tp_size: int) -> bool:
-    """Whether this (layer, K, TP) is expressible under the plan; an inexpressible one warns once.
-
-    A silent fallback would reintroduce exactly the TP mismatch this module exists to remove.
-    """
+    """Whether this (layer, K, TP) is expressible under the plan; an inexpressible one warns once."""
     plan = get_plan()
     g = plan.num_leaves
     reason = None
@@ -339,11 +308,7 @@ def _pik_supported(self, k_full: int, tp_size: int) -> bool:
 
 
 def _pik_row_forward(self, input_: torch.Tensor):
-    """Drop-in for Megatron ``RowParallelLinear.forward`` using pik's TP-invariant reduction tree.
-
-    Mirrors the native control flow but replaces ``F.linear`` plus
-    ``reduce_from_tensor_model_parallel_region`` with the pik leaf-tree GEMM plus tree all-reduce.
-    """
+    """Drop-in for Megatron ``RowParallelLinear.forward`` using pik's TP-invariant reduction tree."""
     group = getattr(self, "tp_group", None)
     try:
         tp_size = torch.distributed.get_world_size(group) if group is not None else 1
@@ -351,16 +316,13 @@ def _pik_row_forward(self, input_: torch.Tensor):
         tp_size = 1
     tp_rank = torch.distributed.get_rank(group) if (group is not None and tp_size > 1) else 0
 
-    # Cases routed to the native path: sequence_parallel without SKYRL_ISOEXEC_TRAINER_SP=1, and
-    # explicit_expert_comm, where the dispatcher owns the reduce.
     k_full = int(getattr(self, "input_size"))
     is_expert = getattr(self, "is_expert", False)
-    # Expert fc2 needs pik only when K is sharded, i.e. ETP>1. At ETP=1 an expert is a whole non-split-K
-    # GEMM, already trainer/engine-identical, and routing it through pik would also crash on the 0-token
-    # experts the sequential MoE loop produces (cuBLASLt rejects M=0).
+    # Expert fc2 needs pik only at ETP>1; at ETP=1 it is already a whole non-split-K GEMM, and pik
+    # would crash on the 0-token experts the sequential MoE loop produces (cuBLASLt rejects M=0).
     sp = bool(getattr(self, "sequence_parallel", False)) and tp_size > 1
     if sp and not trainer_sp_enabled():
-        # SP layers go native unless the trainer-SP flag is set; the worker normally forces SP off here.
+        # SP layers go native unless the trainer-SP flag is set.
         return _ORIG_ROW_FORWARD(self, input_)
     if (
         (is_expert and tp_size == 1)
@@ -369,9 +331,8 @@ def _pik_row_forward(self, input_: torch.Tensor):
         or not _pik_supported(self, k_full, tp_size)
     ):
         if sp and not getattr(self, "explicit_expert_comm", False):
-            # Falling back to native under SP swaps the pik tree for an NCCL reduce-scatter, which is
-            # neither TP-invariant nor bitwise against the SP-off forward. explicit_expert_comm is exempt:
-            # that path performs no reduce.
+            # Native under SP swaps the pik tree for an NCCL reduce-scatter: neither TP-invariant nor
+            # bitwise vs SP-off. explicit_expert_comm is exempt (that path performs no reduce).
             key = ("sp_native_fallback", k_full, tp_size)
             if key not in _FELL_BACK:
                 _FELL_BACK.add(key)
@@ -398,8 +359,7 @@ def _pik_row_forward(self, input_: torch.Tensor):
     accum_main_grad = bool(getattr(self, "gradient_accumulation_fusion", False))
 
     if sp:
-        # Native SP adds the bias on the scattered slice, after the reduce-scatter. Mirror that: the bias
-        # stays outside the op and Megatron's finalize_model_grads sums its grad across TP.
+        # Mirror native SP: bias is added on the scattered slice, outside the op.
         output = _PikRowParallel.apply(
             x, self.weight, None, tp_size, tp_rank, k_full, group, out_dtype, accum_main_grad, True
         )
@@ -420,8 +380,7 @@ def _pik_row_forward(self, input_: torch.Tensor):
 def apply_pik_tp_invariant(side: str = "?", selfcheck: bool = False) -> bool:
     """Patch Megatron's RowParallelLinear onto the pik TP-invariant reduction tree. Idempotent.
 
-    ``side`` is only for the banner ("TRAINER" / "ENGINE"). Returns True if the patch is active.
-    No-op unless ``SKYRL_ISOEXEC_PIK=1``.
+    ``side`` is only for the banner. Returns True if active; no-op unless ``SKYRL_ISOEXEC_PIK=1``.
     """
     global _PATCHED, _ORIG_ROW_FORWARD
     if not pik_enabled():
@@ -430,10 +389,8 @@ def apply_pik_tp_invariant(side: str = "?", selfcheck: bool = False) -> bool:
         return True
 
     ensure_pik()
-    # P2P symmetric memory is disabled on the TRAINER, where colocated trainer+engine share physical GPUs
-    # and symm_mem.rendezvous aborts on overlapping devices. The ENGINE's TP group is one rank per GPU, so
-    # the overlap cannot arise and P2P is kept; both transports evaluate the same tree, so this is bitwise
-    # neutral. SKYRL_ISOEXEC_PIK_P2P=0 forces the trainer behaviour on both sides.
+    # P2P symm-mem is disabled on the TRAINER (colocated ranks share GPUs, rendezvous aborts) and kept
+    # on the ENGINE (1 rank/GPU). Bitwise neutral; SKYRL_ISOEXEC_PIK_P2P=0 disables it on both sides.
     _p2p_engine_ok = side == "ENGINE" and os.environ.get("SKYRL_ISOEXEC_PIK_P2P", "1") == "1"
     if not _p2p_engine_ok:
         _disable_pik_p2p()
@@ -444,7 +401,7 @@ def apply_pik_tp_invariant(side: str = "?", selfcheck: bool = False) -> bool:
             "This states an INTENTION -- wait for the TRANSPORT RESOLVED line for what actually ran.",
             flush=True,
         )
-    # The banners above state an intention; this records what actually ran, at the first all-reduce.
+    # The banners state an intention; this records what actually ran, at the first all-reduce.
     _install_transport_hook(side)
     if selfcheck or os.environ.get("SKYRL_ISOEXEC_PIK_SELFCHECK") == "1":
         from .pik_bootstrap import pik_arch_selfcheck
@@ -492,7 +449,7 @@ def pik_status() -> dict:
         # Which transport the tree all-reduce actually ran on.
         "transport": pik_transport_status() if _PATCHED else {"state": "none"},
     }
-    # Launch-structure decisions, so a caller can report what ran rather than what was exported.
+    # Launch-structure decisions: what ran, not what was exported.
     try:
         from .pik_bootstrap import ensure_pik
 
@@ -505,7 +462,7 @@ def pik_status() -> dict:
         out["ar_crossover"] = _abr.status()
     except Exception as e:  # noqa: BLE001 -- status must never break a caller
         out["launch_structure"] = f"unavailable: {type(e).__name__}: {e}"
-    # The MoE owner combine stages, pushes and rendezvouses itself, so its counters live outside pik.
+    # The MoE owner combine rendezvouses itself, so its counters live outside pik.
     try:
         from ..moe.moe_pik_combine_owner import fused_owner_counts
 

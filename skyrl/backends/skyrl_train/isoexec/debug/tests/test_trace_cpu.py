@@ -1,13 +1,7 @@
-"""CPU guarantees for the debug-mode capture layer (``debug/trace.py`` + ``debug/install.py``).
+"""CPU tests for the debug-mode capture layer (``debug/trace.py`` + ``debug/install.py``).
 
-Covers: zero-overhead-off (identity passthrough, zero installs), record content and JSONL
-round-trip, sampling, re-entrancy collapse, ladder capture, case inference, the moe.router
-installer against a faked megatron namespace triple, the gdn.core installer against the real
-``gdn_ops`` module, layer-indexed engine GDN hooks, rank stamping, the per-side manifest,
-unrecordable outputs and segment digests.
-
-Run (CPU only):
-    python skyrl/backends/skyrl_train/isoexec/debug/tests/test_trace_cpu.py
+Covers zero-overhead-off, record/JSONL round-trip, sampling, re-entrancy, ladder capture, case
+inference, the moe.router and gdn.core installers, layer context, rank stamping and the manifest.
 """
 
 from __future__ import annotations
@@ -317,7 +311,7 @@ def test_engine_case_from_forward_context():
             ):
                 with _fake_forward_context(md):
                     assert install._case((), {}, None) == want
-                    # A cu_seqlens that the old heuristic would have mislabelled loses to it.
+                    # forward_context wins over the structural cu_seqlens fallback
                     assert install._case((), {"cu_seqlens": torch.tensor([0, 1, 2, 3])}, None) == want
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -337,7 +331,7 @@ def test_engine_case_structural_fallback_without_forward_context():
 
 
 def test_layer_context_hooks_label_the_kernel_door():
-    """The layer index reaches the SAME door on both sides instead of a second tensor."""
+    """Layer-context hooks stamp the layer index onto the kernel door's own record."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):
@@ -359,7 +353,6 @@ def test_layer_context_hooks_label_the_kernel_door():
             assert [r["layer"] for r in recs] == [0, 1]
             assert [r["layer_src"] for r in recs] == ["module", "module"]
             assert all(r["region"] == "gdn.core" for r in recs)
-            # the door itself was recorded, not a post-out_proj tensor
             assert all(r["shape"] == [7, 16] for r in recs)
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -408,7 +401,7 @@ def _manifest(d):
 
 
 def test_rank_is_stamped_and_sourced():
-    """Without a rank in the record, traces from many processes align by pid luck."""
+    """Records and the manifest carry the rank and its source, falling back to pid."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine", "RANK": "3"}):
@@ -428,7 +421,8 @@ def test_rank_is_stamped_and_sourced():
 
 
 def test_manifest_records_sampling_coverage():
-    """The report cannot tell 'clean' from 'not observed' without this."""
+    """The manifest records which steps were seen and recorded, so 'clean' and 'not observed'
+    stay distinguishable."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer", trace.ENV_SAMPLE: "2"}):
@@ -494,7 +488,7 @@ def test_unsupported_dtype_becomes_unrecordable_record():
 
 
 def test_segment_digests_wired_behind_env():
-    """``segment_digests`` is reachable from debug mode."""
+    """Segment digests are emitted only when the SEGMENTS env var is set."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SEGMENTS: "4"}):
@@ -539,7 +533,7 @@ def test_capture_safety_skips_and_counts():
 
 
 def test_nested_different_regions_both_record():
-    """With 20 regions hooked, a single global guard would let the outer door eat the inner."""
+    """Nested wraps of different regions both record; only same-region re-entry collapses."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d}):

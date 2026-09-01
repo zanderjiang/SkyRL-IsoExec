@@ -1,78 +1,18 @@
 """Debug-mode capture layer: record per-region output digests to a JSONL trace.
 
-Gated entirely on ``SKYRL_ISOEXEC_DEBUG_TRACE`` (the trace output directory). Unset -> nothing
-installs, :func:`wrap_region` returns its argument unchanged, zero overhead. NOTE: this env (and
-the companions below) currently reaches only the launching shell's process; to reach the Ray
-trainer/engine actors it must be registered as a Flag in ``core/flags.py`` and forwarded by the
-TRAIN and ENGINE channels -- see ``INTEGRATION.md``. Not done here: ``core/flags.py`` is owned by
-a concurrent change.
+Gated entirely on ``SKYRL_ISOEXEC_DEBUG_TRACE``; unset means nothing installs and
+:func:`wrap_region` returns its argument unchanged. Records land in
+``{dir}/{side}-r{rank}-{host}-{pid}.jsonl`` with a ``manifest-*.json`` sidecar per process.
 
 Env knobs (all read once, at first use):
   SKYRL_ISOEXEC_DEBUG_TRACE     trace directory (master switch)
-  SKYRL_ISOEXEC_DEBUG_SIDE      "trainer" | "engine" (labels records; also the file name)
-  SKYRL_ISOEXEC_DEBUG_SAMPLE    N: record every Nth forward (via set_step) or, absent a step
-                                signal, every Nth region call. Default 1. MUST be driven by
-                                ``set_step`` on BOTH sides or the two sides select disjoint
-                                record sets; the manifest records which, and the comparator
-                                refuses to call a disjoint comparison clean.
-  SKYRL_ISOEXEC_DEBUG_LADDER    "1": also record the mantissa-truncation ladder (k-ladder). One
-                                fused pass since the triton digest backend landed, so this is
-                                ~2-3x a plain digest, not one pass per rung.
-  SKYRL_ISOEXEC_DEBUG_SEGMENTS  R: also record one digest per R rows of the tensor's first
-                                non-unit dim, so the comparator can say WHICH rows diverge and
-                                can tell a localized fault from a whole-tensor round-off
-                                difference. Off (0) by default; one extra kernel per record.
-  SKYRL_ISOEXEC_DEBUG_REGIONS   comma-separated allow list of regions to hook. Default: every
-                                region except the ones in :data:`HIGH_VOLUME_REGIONS` (``mm``
-                                fires on every projection of every layer and dwarfs the rest by
-                                two orders of magnitude). ``all`` opts back in; a leading ``+``
-                                adds to the default set (``+mm``).
+  SKYRL_ISOEXEC_DEBUG_SIDE      "trainer" | "engine" -- labels records and names the file
+  SKYRL_ISOEXEC_DEBUG_SAMPLE    N: record every Nth step (via set_step) or Nth call. Default 1
+  SKYRL_ISOEXEC_DEBUG_LADDER    "1": also record the mantissa-truncation ladder
+  SKYRL_ISOEXEC_DEBUG_SEGMENTS  R: also record one digest per R rows of the first non-unit dim
+  SKYRL_ISOEXEC_DEBUG_REGIONS   region allow list; default is all but :data:`HIGH_VOLUME_REGIONS`
   SKYRL_ISOEXEC_DEBUG_RING      in-memory buffer size before a flush (default 4096 records)
-  SKYRL_ISOEXEC_DEBUG_DIGEST    "auto" (default) | "eager" | "triton" -- digest backend, see
-                                ``thash``. Both sides must agree; the manifest records it.
-
-Records are buffered in memory and appended to ``{dir}/{side}-r{rank}-{host}-{pid}.jsonl`` when
-the buffer fills, on :func:`flush`, and at interpreter exit. Alongside them each process writes
-``{dir}/manifest-{side}-r{rank}-{host}-{pid}.json``: the sampling parameters, the rank and how it
-was determined, and which steps were seen versus actually recorded. The comparator needs the
-manifest to distinguish "verified clean" from "not observed".
-
-Causal order: every record carries ``ts`` (microsecond wall clock) and ``seq`` (a per-process
-counter). The comparator orders divergences by ``(ts, seq)`` so the FIRST DIVERGENCE it reports is
-the one that executed first, exactly within a process and approximately across them.
-
-Rank: every record carries one, so traces from many processes in one directory align per rank
-instead of by pid sort order. It is the torch.distributed rank when a process group is
-initialized, else ``RANK``/``LOCAL_RANK`` from the environment, else the pid as a last resort;
-``rank_src`` says which. Resolution happens once, when the tracer is built -- at the documented
-call sites (after model build / after ``swap_gdn_core``) the process group is already up.
-
-Layer: the comparator groups by ``(region, layer, out, rank)``, so a layer index that means
-different things on the two sides is worse than none. It is resolved in one order on BOTH sides
-and ``layer_src`` records which rung answered: ``"module"`` -- a module-level hook published the
-index of the layer whose forward is running (:func:`layer_context`, installed from the decoder
-walk, and the megatron ``layer_number - 1`` it reads is global, pipeline offset included);
-``"call_order"`` -- for the per-layer regions in :data:`CALL_ORDER_LAYER_REGIONS`, the region's
-call ordinal within the current step, which equals the layer index for a single-microbatch
-forward and drifts by a whole multiple of the layer count otherwise; ``null`` -- unknown.
-
-Record format version is :data:`FORMAT_VERSION`; the comparator refuses anything else rather
-than silently mis-reading an older schema.
-
-Capture nests per REGION: while a ``gdn.core`` call is recording, a nested ``gdn.core`` binding
-(the same op reached through a second namespace, or a composite that calls its own kernel) passes
-straight through, but a nested ``norms.rms`` still records. That is what makes a 20-region hook
-table useful; a single global guard would let the outermost door swallow every inner one.
-
-CUDA graphs: a hook reached *during capture* must not record -- the digest ends in a ``.item()``
-D2H copy, which poisons the capture. :func:`wrap_region` checks
-``torch.cuda.is_current_stream_capturing()`` before recording and counts the skips into
-``capture_skipped`` in the manifest, so tracing can never break a run that captures graphs. It is
-still a misconfiguration: a replayed graph runs no Python at all, so decode steps served from a
-captured graph produce no records either way. ``ContractAdapter._install_debug_trace`` refuses at
-init when the engine arms tracing with ``SKYRL_ISOEXEC_ENABLE_CUDAGRAPH=1``; this check is the
-defensive backstop for capture reached by any other route. The comparator reports a resulting
-hole as an ``absent`` divergence and names this cause when the absent side is the engine.
+  SKYRL_ISOEXEC_DEBUG_DIGEST    "auto" (default) | "eager" | "triton"; both sides must agree
 """
 
 from __future__ import annotations
@@ -83,7 +23,7 @@ import os
 import socket
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 import torch
 
@@ -105,8 +45,7 @@ _WRAP_ATTR = "_isoexec_debug_region"
 HIGH_VOLUME_REGIONS = frozenset({"mm"})
 
 # Regions that run once per transformer layer, so a per-step call ordinal is a meaningful layer
-# index when no module context published one. Everything else records layer=null instead of a
-# number that would mean different things on the two sides.
+# index when no module context published one. Everything else records layer=null.
 CALL_ORDER_LAYER_REGIONS = frozenset(
     {
         "attention.varlen",
@@ -243,7 +182,7 @@ class Tracer:
         return "unknown"
 
     def resolve_layer(self, region: str, hooked: Optional[int]) -> Tuple[Optional[int], Optional[str]]:
-        """(layer, layer_src) -- the same ladder on both sides, see the module docstring."""
+        """(layer, layer_src): module hook, else per-step call ordinal, else unknown."""
         if hooked is not None:
             return hooked, "module"
         ctx = self.current_layer()
@@ -366,12 +305,10 @@ def get_tracer() -> Optional[Tracer]:
 
 
 def set_step(step: int) -> None:
-    """Advance the forward/step key; wired by integration (see INTEGRATION.md).
+    """Advance the forward/step key; also restarts the per-step call counters.
 
-    Optional only in the sense that it can be left unwired on BOTH sides. With
-    ``SKYRL_ISOEXEC_DEBUG_SAMPLE > 1`` it must be wired on both, or the two sides sample by
-    different keys (step vs call ordinal) and select disjoint records. It also restarts the
-    per-step call counters that back ``layer_src="call_order"``.
+    With ``SKYRL_ISOEXEC_DEBUG_SAMPLE > 1`` it must be wired on BOTH sides, or they sample by
+    different keys (step vs call ordinal) and select disjoint records.
     """
     t = get_tracer()
     if t is not None:
@@ -395,9 +332,7 @@ def _reset_for_tests() -> None:
 class layer_context:
     """Publish the layer index of the module whose forward is running, for the doors inside it.
 
-    Reentrant and thread-local: an inner hook restores whatever the outer one had. Used by
-    ``install.install_layer_context_hooks`` so the same kernel door reports a real layer index on
-    the trainer and on the engine.
+    Reentrant and thread-local: an inner hook restores whatever the outer one had.
     """
 
     __slots__ = ("_layer", "_prev", "_tr")
@@ -429,15 +364,12 @@ def wrap_region(
 ) -> Callable:
     """Wrap an installed region impl so each (sampled, outermost-per-region) call records digests.
 
-    Identity passthrough when tracing is disabled (``wrap_region(r, f) is f``). Wrapping a
-    wrapper is a no-op. ``case_fn(args, kwargs, out) -> str``, ``layer_fn(args, kwargs) ->
-    int|None`` and ``out_fn(args, kwargs, out) -> object`` are only invoked for calls that
-    actually record; ``out_fn`` exists for doors that write into a caller-supplied buffer and
-    return ``None``, so the digest can be taken from the buffer they filled.
-
-    Every ``_isoexec_*`` attribute of ``fn`` is copied onto the wrapper: several installers probe
-    the live binding for capability markers (``_isoexec_accepts_out_dtype``, ``_isoexec_tiled``)
-    and a wrapper that hid them would silently change what the run executes.
+    Identity passthrough when tracing is disabled; wrapping a wrapper is a no-op. ``case_fn``,
+    ``layer_fn`` and ``out_fn`` run only for calls that record (``out_fn`` covers doors that write
+    into a caller-supplied buffer and return ``None``). Recording is skipped while a CUDA graph is
+    capturing -- the digest's ``.item()`` D2H would poison the capture -- and counted into
+    ``capture_skipped``. Every ``_isoexec_*`` attribute of ``fn`` is copied onto the wrapper
+    because installers probe the live binding for capability markers.
     """
     if not enabled():
         return fn

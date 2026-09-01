@@ -1,26 +1,8 @@
 """CPU+GPU tests for the fused q/k/v(+alpha/beta) split (``gdn_fused_split``).
 
-WHAT THIS GATES. Five ATen copies per GDN layer -- ``alpha[0].contiguous()`` /
-``beta[0].contiguous()`` at ``gdn_gptmodel:477`` and the three column slices of
-``_split_qkv_raw`` -- measured positionally at 11.37 us/layer, 341.2 us of every decode step at
-30 GDN layers, to move 2.1 MB. ``fused_split_qkvab`` writes all five contiguous outputs in one
-launch. The copies themselves are irremovable (vLLM's fused_sigmoid_gating core takes no strides);
-only the launch count moves.
-
-The change is therefore allowed to be a LAUNCH-STRUCTURE change and NOTHING else, and the proof
-obligation is correspondingly strict: the outputs must be BYTE-IDENTICAL to the eager chain, which
-for a pure permutation of bytes means ``torch.equal`` on a ``uint8`` view -- not an ``allclose``,
-and not a comparison on values that a NaN or a subnormal could paper over.
-
-TRITON IS GPU-ONLY, SO THIS FILE HAS TWO HALVES. On CPU it proves (a) the seam declines to the
-ATen chain and returns exactly the legacy answer, (b) every decline predicate fires on the shapes
-the kernel refuses, (c) the deferral predicate ``defer_ab`` selects exactly the native-core
-composition. On a CUDA box the same file additionally runs the REAL kernel against the eager chain
-on adversarial byte populations and asserts uint8 equality, and captures/replays it in a CUDA
-graph -- those are the assertions that matter, and they are skipped, never faked, without a device.
-
-Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_fused_split_cpu.py -q
+The fused kernel is a launch-structure change only, so outputs must be byte-identical to the eager
+chain -- ``torch.equal`` on a uint8 view, not ``allclose``. Triton is GPU-only: CPU covers the seam,
+the decline predicates and ``defer_ab``; the kernel and graph-capture assertions need a device.
 """
 
 import pytest
@@ -43,9 +25,7 @@ from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_recurrent_state import (  # 
 
 CUDA = torch.cuda.is_available()
 
-# The production geometry, at TP=8 on Qwen3.5-35B-A3B: kd = num_k_heads*head_k_dim = 256,
-# vd = num_v_heads*head_v_dim = 512, ha = num_value_heads/tp = 4. These are the grids the
-# positional attribution named (g=256, g=256, g=512, g=4, g=4).
+# The production geometry, at TP=8 on Qwen3.5-35B-A3B: kd = 256, vd = 512, ha = 4.
 NUM_K_HEADS, HEAD_K_DIM = 2, 128
 NUM_V_HEADS, HEAD_V_DIM = 4, 128
 KD = NUM_K_HEADS * HEAD_K_DIM
@@ -53,9 +33,7 @@ VD = NUM_V_HEADS * HEAD_V_DIM
 HA = NUM_V_HEADS
 
 
-# ================================================================================================
-# the oracle: a VERBATIM copy of the pre-change chain, kept as the reference rather than as history
-# ================================================================================================
+# the oracle: a verbatim copy of the pre-change chain
 def _eager_split(y, kd, a=None, b=None):
     """``_split_qkv_raw``'s three slices + ``gdn_gptmodel``'s two ``.contiguous()`` calls."""
     q = y[:, :kd].contiguous()
@@ -67,7 +45,7 @@ def _eager_split(y, kd, a=None, b=None):
 
 
 def _bytes(t):
-    """The only comparison that is honest for a byte permutation."""
+    """Byte view: the only comparison that is honest for a byte permutation."""
     return t.contiguous().view(torch.uint8) if t.dtype != torch.uint8 else t.contiguous()
 
 
@@ -80,20 +58,13 @@ def _pool(device="cpu"):
 
 
 def _adversarial(T, D, device, seed=0):
-    """A bf16 row whose BYTES span the populations a value comparison would hide.
-
-    Built by drawing uint16 bit patterns uniformly and viewing them as bf16, so NaNs (both
-    payloads), signalling NaNs, +-inf, subnormals and negative zero all appear. A copy is a copy;
-    if the fused kernel ever touched a value instead of moving it, this is what catches it.
-    """
+    """A bf16 row of uniform uint16 bit patterns, so NaNs, +-inf, subnormals and -0 all appear."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     bits = torch.randint(0, 1 << 16, (T, D), generator=g, dtype=torch.int32).to(torch.uint16)
     return bits.view(torch.bfloat16).to(device)
 
 
-# ================================================================================================
 # CPU half -- the seam, the decline predicates, and the deferral rule
-# ================================================================================================
 def test_cpu_seam_declines_and_matches_the_legacy_chain():
     """No CUDA -> ``_split_qkv_raw`` takes the ATen chain and returns exactly what it always did."""
     rg = _pool()
@@ -178,9 +149,7 @@ def test_decline_predicates_fire(make, why):
     assert _split_stats()[1] == before + 1
 
 
-# ================================================================================================
-# GPU half -- the assertion that actually matters
-# ================================================================================================
+# GPU half -- the real kernel against the eager chain
 @pytest.mark.skipif(not CUDA, reason="the fused split is a Triton kernel")
 @pytest.mark.parametrize("T", [1, 2, 7, 63, 64, 129, 512])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -225,12 +194,8 @@ def test_gpu_seam_matches_the_legacy_chain_both_flag_arms(monkeypatch):
 
 @pytest.mark.skipif(not CUDA, reason="the fused split is a Triton kernel")
 def test_gpu_captures_and_replays_in_a_cuda_graph():
-    """Decode is graph-replayed, so the kernel has to capture: no host reads, static shapes.
-
-    The replay must also RECOMPUTE -- a graph that baked in the first launch's outputs would pass a
-    single-input test and serve stale q/k/v forever. Two different inputs, written into the same
-    captured buffers, must give the two different eager answers.
-    """
+    """The kernel captures into a decode graph, and a replay recomputes rather than serving
+    the first launch's outputs."""
     T = 128
     y = torch.empty(T, 2 * KD + VD, dtype=torch.bfloat16, device="cuda")
     a_src = torch.empty(T, 3 * HA, dtype=torch.bfloat16, device="cuda")

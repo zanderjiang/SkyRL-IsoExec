@@ -1,11 +1,8 @@
 """vLLM monkey-patches for bitwise-matched rollouts.
 
-Covers the batch-invariance env pins, flash-attention ``num_splits=1``, the two logprob sites --
-the V1 ``Sampler.compute_logprobs`` hook (the one that executes today; see
-``patch_vllm_sampler_logprobs_rowinv``) and the V2-runner ``compute_token_logprobs`` rebind (inert
-on the V1 runner; kept for a future V2 flip) -- and skipping the sampler's temperature divide at
-temperature 1.0. Every patch is idempotent and fails to stock: if the vLLM surface it targets is
-missing it logs and leaves vLLM unchanged.
+Covers the batch-invariance env pins, flash-attention ``num_splits=1``, the two logprob sites and
+the temperature-divide skip. Every patch is idempotent and leaves vLLM unchanged when it cannot
+install.
 """
 
 from __future__ import annotations
@@ -43,8 +40,7 @@ def apply_vllm_isoexec_env(env: dict | None = None) -> dict:
 def neutralize_vllm_nccl_channel_pin() -> bool:
     """Wrap vLLM's ``override_envs_for_invariance`` so its NCCL channel pin is relaxed afterwards.
 
-    Must be installed before ``init_batch_invariance`` runs in the worker, i.e. from the general
-    plugin rather than from the engine actor. Gated on ``SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN=1``.
+    Must be installed from the general plugin, before ``init_batch_invariance`` runs in the worker.
     """
     if os.environ.get("SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN", "0") != "1":
         return False
@@ -117,19 +113,9 @@ def isoexec_engine_arg_overrides() -> dict:
 def patch_vllm_logprobs_batch_invariant() -> bool:
     """Rebind the **Model Runner V2** token-logprob kernel to the trainer's aten formulation.
 
-    .. warning:: **INERT ON THE V1 RUNNER -- i.e. on every production composition today.** This
-       patches ``vllm.v1.worker.gpu.sample.logprob.compute_token_logprobs``, which only the
-       experimental Model Runner V2 (``VllmConfig.use_v2_model_runner``) ever calls.
-       ``MegatronGPTModelHybridForCausalLM`` is not in ``DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES``
-       and MoE models are excluded besides, so production resolves the V1 ``GPUModelRunner``,
-       whose logprobs (sampled AND prompt) come from
-       ``vllm.v1.sample.sampler.Sampler.compute_logprobs`` (``logits.log_softmax``) instead --
-       measured on a real generation as ``patched_v2_compute_token_logprobs_calls=0`` against
-       ``v1_sampler_compute_logprobs_calls=8``. The V1 site is hooked
-       by :func:`patch_vllm_sampler_logprobs_rowinv` below; this patch is kept ONLY so a future
-       flip to the V2 runner does not silently reopen the divergence. Never attest an engine
-       logprob impl off this function's return value.
-
+    INERT on the V1 runner, which every production composition resolves; kept only so a future flip
+    to V2 does not silently reopen the divergence. The live V1 site is
+    :func:`patch_vllm_sampler_logprobs_rowinv`; never attest an engine logprob impl off this return.
     """
     try:
         import torch
@@ -140,9 +126,7 @@ def patch_vllm_logprobs_batch_invariant() -> bool:
     if getattr(_lp, "_isoexec_logprob_patched", False):
         return True
 
-    # The row-count- and TP-invariant leaf-tree sampled logprob -- the composed default, no flag.
-    # Lazy import, fail-to-incumbent: a missing module leaves today's aten-order path in charge,
-    # exactly as the trainer-side shim in megatron/model_utils.py does.
+    # Lazy import, fail-to-incumbent: a missing rowinv module leaves the aten-order path in charge.
     try:
         from skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv import (
             rowinv_sampled_logprobs as _rowinv_sampled_logprobs,
@@ -171,14 +155,9 @@ def patch_vllm_logprobs_batch_invariant() -> bool:
         return logprobs.gather(-1, token_ids)
 
     def _batch_invariant_compute_token_logprobs(logits, token_ids):
-        # rowinv first, incumbent on DECLINE (None) -- the same hook shape as the
-        # trainer's two Functions in megatron/model_utils.py. NOTE the deliberate asymmetry of the
-        # ARGUMENTS, not of the function: the engine receives an ALREADY-GATHERED full [N, V] row
-        # (gptmodel_vllm sets parallel_output=False), so it passes group=None / world=1 and rowinv
-        # computes all G leaves locally, while the trainer hands in its TP shard. The leaf
-        # boundaries and combine tree are functions of G alone, so both compositions evaluate the
-        # SAME G-leaf expression and the bits agree -- do not "simplify" the engine onto a
-        # different schedule; one function everywhere is the design.
+        # rowinv first, incumbent on DECLINE (None). The engine receives an already-gathered full
+        # [N, V] row, so it passes group=None and computes all G leaves locally while the trainer
+        # hands in its TP shard; leaf boundaries depend only on G, so the bits agree.
         if _rowinv_available:
             got = _rowinv_sampled_logprobs(
                 logits,
@@ -186,8 +165,7 @@ def patch_vllm_logprobs_batch_invariant() -> bool:
                 vocab_start_index=0,
                 vocab_end_index=logits.shape[-1],
                 group=None,
-                # The dtype the row arrives in, BEFORE the incumbent's fp32 widening -- the same
-                # statement the trainer makes about its shard.
+                # The dtype the row arrives in, before the incumbent's fp32 widening.
                 src_dtype=logits.dtype,
                 reference=lambda: _reference_compute_token_logprobs(logits, token_ids),
             )
@@ -209,11 +187,8 @@ def patch_vllm_logprobs_batch_invariant() -> bool:
     return True
 
 
-#: Census of the V1 ``Sampler.compute_logprobs`` hook. ``calls`` counts entries into the hook
-#: (the proof the hook is on the executing path), ``rowinv_owned`` the calls whose returned tensor
-#: came out of the rowinv full-row entry, ``incumbent`` the calls served by vLLM's own
-#: ``log_softmax`` (flag declined / rowinv declined). Engagement truth stays with
-#: ``ops/logprobs/rowinv.py::stats()['served']`` -- this census only localizes WHERE the calls go.
+#: Census of the V1 ``Sampler.compute_logprobs`` hook: where calls go, not whether rowinv engaged.
+#: Engagement truth stays with ``ops/logprobs/rowinv.py::stats()['served']``.
 _CL_STATE = {"calls": 0, "rowinv_owned": 0, "incumbent": 0, "reported": 0}
 
 
@@ -234,11 +209,9 @@ def _cl_report() -> None:
 
 
 def sampler_logprobs_hook_state() -> dict:
-    """Live evidence for the engine attestation: what the V1 sampler site will actually run.
+    """Live evidence for the engine attestation, read off the ``Sampler`` class itself.
 
-    Read off the ``Sampler`` class itself -- the object the V1 runner calls through -- never off
-    "a patch function returned True" (the exact trap the V2 patch fell into: installed, attested,
-    never executed).
+    Never attest off "a patch function returned True": the V2 patch installs but never executes.
     """
     state = {"v1_hook_installed": False, "v1_hook_calls": 0, "rowinv_available": False, "error": ""}
     try:
@@ -261,23 +234,12 @@ def sampler_logprobs_hook_state() -> dict:
 
 
 def patch_vllm_sampler_logprobs_rowinv() -> bool:
-    """Hook the V1 runner's ACTUAL logprob producer: ``Sampler.compute_logprobs``.
+    """Hook the V1 runner's actual logprob producer: ``Sampler.compute_logprobs``.
 
-    This staticmethod is the single site that produces BOTH sampled-token logprobs
-    (``Sampler.forward``, ``raw_logprobs`` under ``logprobs_mode="raw_logprobs"``) and prompt
-    logprobs (``gpu_model_runner._get_prompt_logprobs_dict``) on the V1 ``GPUModelRunner`` --
-    proven by live call counters, not inferred (see ``patch_vllm_logprobs_batch_invariant``'s
-    warning for why the older V2-module patch never executed). Unlike the V2 site's gather-only
-    contract, this one takes ``[N, V]`` logits and must return the FULL fp32 logprob row --
-    ``gather_logprobs`` consumes it for top-k and ranks -- so it routes through
-    ``rowinv.rowinv_full_logprobs``, whose row shares the sampled entry's leaf-tree denominator
-    bit for bit.
-
-    Installed unconditionally: rowinv is the composed logprob at every site, so there is no
-    flag-off state in which the engine may keep vLLM's ``log_softmax`` while the trainer scores on
-    the leaf tree. The only remaining "off" is a failed import, which returns False here and
-    leaves the incumbent in charge -- visible as served=0, which the engagement boundary refuses.
-    Every rowinv DECLINE falls back to the original ``compute_logprobs``, bits unchanged.
+    This single site produces both sampled-token and prompt logprobs. Unlike the V2 site's
+    gather-only contract it must return the FULL fp32 row (``gather_logprobs`` needs it for top-k
+    and ranks), so it routes through ``rowinv.rowinv_full_logprobs``. Installed unconditionally; a
+    failed import or a rowinv DECLINE falls back to the incumbent with bits unchanged.
     """
     try:
         from vllm.v1.sample.sampler import Sampler
@@ -312,8 +274,7 @@ def patch_vllm_sampler_logprobs_rowinv() -> bool:
         _CL_STATE["calls"] += 1
         got = _rowinv_full_logprobs(
             logits,
-            # The dtype the row arrives in, BEFORE any fp32 widening -- the same statement the
-            # trainer makes about its shard.
+            # The dtype the row arrives in, before any fp32 widening.
             src_dtype=logits.dtype,
             reference=lambda: _orig(logits),
         )

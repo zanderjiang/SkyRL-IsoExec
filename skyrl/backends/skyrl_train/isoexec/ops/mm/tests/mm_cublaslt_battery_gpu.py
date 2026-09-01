@@ -1,20 +1,7 @@
-"""Offline certification battery for the pinned-cuBLASLt dense-GEMM provider (wave-5).
+"""Offline certification battery for the pinned-cuBLASLt dense-GEMM provider.
 
-Runs against the ACTUAL landed-shape code (imports mm_cublaslt from this scratchpad, and the repo's
-mm_tiles for the composition test).  Every gate prints PASS/FAIL; a final count gates the landing.
-
-GATES (per shape x per bucket unless noted):
-  1. M-invariance + cross-bucket : row r of a decode-M (<1024) call == the same row embedded in an
-     M=8192 (trainer-bucket) call, bit-for-bit, at M in {1,2,17,64,320,512,1023}, over 3 input
-     populations INCLUDING a live signed-zero population (proves the int16 bit-compare is non-vacuous).
-  2. determinism : two identical calls are bit-equal (decode + trainer bucket).
-  3. graph capture+replay == eager, bit-for-bit (decode M=320 + trainer M=8192).
-  4. bias != None routed to the Triton fallthrough (installed wrapper == stock bit-for-bit).
-  5. non-contiguous / non-production layout routed to the fallthrough (== stock bit-for-bit).
-  6. install-order composition with mm_tiles (BOTH orders): idempotent, and every shape UNLISTED by
-     cuBLASLt is bit-equal to stock Triton; report which order lets cuBLASLt win (load-bearing order).
-
-Usage:  CUDA_VISIBLE_DEVICES=4 uv run --isolated --extra isoexec python battery.py
+Gates M-invariance across buckets, determinism, graph capture == eager, routing of bias and odd
+layouts to the Triton fallthrough, and install-order composition with mm_tiles in both orders.
 """
 
 import os
@@ -55,13 +42,12 @@ def bitcmp(a, b):
 
 
 def neg_zeros(t):
-    """Count -0.0 bit patterns (0x8000 in bf16) -- proves a population is signed-zero-live."""
+    """Count -0.0 bit patterns (0x8000 in bf16): proves a population is signed-zero-live."""
     return int((t.view(torch.int16) == torch.tensor(-32768, dtype=torch.int16, device=t.device)).sum().item())
 
 
 def populations(M, K):
-    """Two magnitude populations (the third, signed-zero-live, is built with its own tiny W in the
-    invariance gate because underflow to -0.0 requires BOTH operands tiny).  Returns {name: x}."""
+    """Two magnitude populations; the signed-zero-live third needs its own tiny W (see signz_x)."""
     torch.manual_seed(1234 + M + K)
     return {
         "normal": torch.randn(M, K, device=DEV, dtype=torch.bfloat16) * 0.05,
@@ -70,8 +56,7 @@ def populations(M, K):
 
 
 def signz_x(M, K):
-    """Tiny mixed-sign activations that, against a matching tiny W, underflow products so ~half the
-    output dot-products round to +/-0.0 with random sign -> a LIVE signed-zero population."""
+    """Tiny mixed-sign activations that, against a matching tiny W, underflow to +/-0.0 outputs."""
     torch.manual_seed(4321 + M + K)
     return torch.randn(M, K, device=DEV, dtype=torch.bfloat16) * (2.0**-72)
 
@@ -91,11 +76,10 @@ def raw_mm(e, x, W):
     return out
 
 
-# ------------------------------------------------------------------------------------------------
 def gate_invariance_crossbucket(e):
     print("\n[1] M-invariance + cross-bucket (decode-M rows == same rows in M=8192 trainer batch)")
-    # comparator sanity: the int16-view bit-compare MUST distinguish +0.0 from -0.0 (else the whole
-    # battery is vacuous on signed zero -- mm_tiles hazard 6).
+    # Comparator sanity: the int16-view compare must distinguish +0.0 from -0.0, or the
+    # signed-zero half of the battery is vacuous.
     pz = torch.zeros(1, dtype=torch.bfloat16, device=DEV)
     nz = torch.tensor([-0.0], dtype=torch.bfloat16, device=DEV)
     _check("bit-comparator distinguishes +0.0 from -0.0", bitcmp(pz, nz) == 1)
@@ -184,7 +168,7 @@ def gate_graph(e):
         _check(f"graph==eager K={K} N={N}", bad == 0, note if bad else "ok")
 
 
-# ---- installed-wrapper routing/composition gates -----------------------------------------------
+# installed-wrapper routing/composition gates
 def _snapshot(bi):
     return (bi.matmul_persistent, getattr(bi, "_isoexec_stock_matmul_persistent", None))
 
@@ -218,10 +202,8 @@ def gate_routing():
         W = torch.randn(N, K, device=DEV, dtype=torch.bfloat16) * 0.05
         b = W.t()  # production layout [K,N] stride (1,K)
 
-        # sanity: production call is ROUTED to cuBLASLt (wrapper output == raw ext.mm output).
-        # (It need NOT differ from Triton -- cuBLASLt and Triton coincide bit-for-bit on some
-        # well-conditioned shapes; the signature move shows up on other shapes/data.  Routing, not
-        # divergence, is the property.)
+        # Sanity: the production call is routed to cuBLASLt. Routing, not divergence from Triton,
+        # is the property -- the two coincide bit-for-bit on some well-conditioned shapes.
         o_wrap = wrapped(x, b)
         o_raw = raw_mm(e, x, W)
         _check("production shape ROUTED to cuBLASLt (wrapper == raw ext.mm)", bitcmp(o_wrap, o_raw) == 0)
@@ -239,7 +221,7 @@ def gate_routing():
             f"b.stride={tuple(b_odd.stride())}",
         )
 
-        # (5b) non-contiguous a rows -> still correct (wrapper contiguous()-es or falls through == cuBLASLt/stock consistent)
+        # (5b) non-contiguous a rows -> still correct
         x_odd = torch.randn(M, K * 2, device=DEV, dtype=torch.bfloat16)[:, ::2]  # stride (2K,2)
         _check(
             "non-contiguous a handled (wrapper == stock on odd a-stride)",
@@ -262,9 +244,8 @@ def gate_routing():
 
 
 class _CountingExt:
-    """Proxy over the real ext that counts mm() calls -- so the composition test can tell whether
-    cuBLASLt actually RAN for a shape, independent of any numeric coincidence with Triton (on H100
-    the two are bit-identical for these shapes, so 'who won' cannot be read off the output)."""
+    """Proxy over the real ext that counts mm() calls: on H100 cuBLASLt and Triton are bit-identical
+    for these shapes, so 'who won' cannot be read off the output."""
 
     def __init__(self, real):
         self._real = real
@@ -335,7 +316,7 @@ def gate_composition():
             counting.mm_calls = 0
             got = w(xc, Wc.t())
             ran_cublaslt = counting.mm_calls == 1
-            # correctness regardless of who ran: bit-equal to at least stock (Triton==cuBLASLt here)
+            # correctness regardless of who ran: bit-equal to stock
             _check(
                 f"[{'>'.join(order)}] shared shape correct (== stock Triton)",
                 bitcmp(got, stock(xc, Wc.t())) == 0,
@@ -348,7 +329,7 @@ def gate_composition():
                     "this is the engine install order (mm_tiles L90, cublaslt after)",
                 )
             else:
-                # documents WHY order matters: cublaslt-then-mm_tiles shadows cuBLASLt.
+                # cublaslt-then-mm_tiles shadows cuBLASLt
                 _check(
                     "[reverse order] cublaslt-then-mm_tiles shadows cuBLASLt (documented hazard)",
                     not ran_cublaslt,

@@ -29,9 +29,7 @@ def _discharge(d: EquivalenceProof | None):
 
 def _project_entry(e: CompositionEntry) -> dict:
     # Bit-relevant fields only; cases sorted so entry-internal order never matters. Coverage enters
-    # as its KIND: the kind is what class of scope the entry's bit-equality claim has, while the
-    # description is documentary prose (like RoundingSchedule.documentary, whose changes reach the
-    # hash through an impl version bump), so widening the text alone rotates nothing.
+    # as its kind, not its description, so editing the prose alone rotates nothing.
     return {
         "region": list(e.region),
         "cases": sorted(e.cases),
@@ -46,9 +44,8 @@ def _project_entry(e: CompositionEntry) -> dict:
 
 
 def _project_case(c: ExecutionCase) -> dict:
-    # Every declared condition of the case, not just its name: grad mode, runtime role, state mode
-    # and constraints each say what the composition must hold under, so deleting one is a change to
-    # what was claimed. Constraints sorted: they are a set, and declaration order is not a fact.
+    # Every declared condition of the case, not just its name: dropping one changes what was
+    # claimed. Constraints are a set, so they sort.
     return {
         "id": c.id,
         "runtime_role": c.runtime_role,

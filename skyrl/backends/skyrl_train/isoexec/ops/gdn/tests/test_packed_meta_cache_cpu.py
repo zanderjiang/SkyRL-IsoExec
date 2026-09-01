@@ -1,38 +1,8 @@
 """CPU tests for the packed-sequence host-read memo (``packed_meta_cache``).
 
-WHAT THIS GATES. The host-sync census (Qwen3.5-0.8B, 18 GDN + 6 attention, one packed thd forward
- + backward) named every host-blocking CUDA sync of the trainer forward. All of
-them are reads of the SAME ``cu_seqlens`` object, repeated once per layer:
-
-    gated_delta_net.py:601   cu_seqlens[-1].cpu().item()      2 per GDN layer
-    gated_delta_net.py:610   (lens % cp_size != 0).any()      2 per GDN layer
-    gated_delta_net.py:718   cu_seqlens.tolist()              2 per GDN layer
-    gdn_fla_shim.py:342      cu_seqlens.tolist()              1 per GDN layer
-    fla/ops/index.py:27,30,36 via gdn_ops.py:343-344          3 per GDN layer
-    rope_utils.py:222,:229   (lens // cp).tolist()            2 per attention layer
-
-Each lands in PAGEABLE host memory, so the copy is SYNCHRONOUS and drains the compute queue.
-
-The memo is only allowed to be a HOST-WORK change, so what needs testing is that it is nothing
-else. Four obligations:
-
-  1. **Exactness.** Every memoized read must return exactly what the expression it replaces
-     returns, for ragged, degenerate and single-sequence batches, and for both int32 and int64
-     offsets. ``seq_lens`` in particular is computed on the HOST and must agree with the device
-     expression elementwise, including under floor division.
-  2. **Key soundness.** The key is ``id(cu) + cu._version`` held with a strong reference. An
-     in-place write through the tensor or any alias must invalidate; a different tensor with equal
-     values must not be served the first one's entry; a declined tensor must still get a correct
-     answer.
-  3. **Engagement, not installation.** ``served`` must rise only on a real hit. A lever can ship
-     structurally inert; an install banner is not evidence.
-  4. **The patched megatron bodies are the upstream bodies.** ``_unpack_sequence_memo`` must return
-     the same slices as the code it replaces, and ``_resolve_cu_seqlens_memo`` must return an
-     ``is``-identical tensor and raise on exactly the inputs upstream raises on -- with and without
-     ``SKYRL_ISOEXEC_GDN_VALIDATE_ONCE``.
-
-Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_packed_meta_cache_cpu.py -q
+The memo must be a host-work change only: every memoized read returns exactly what the expression
+it replaces returns, the key (``id(cu) + cu._version``, pinned by a strong reference) invalidates on
+any in-place write, and the patched megatron bodies stay equivalent to the upstream ones.
 """
 
 import sys
@@ -42,7 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import (
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import (  # noqa: E402
     packed_meta_cache as pmc,  # noqa: E402
 )
 
@@ -120,7 +90,7 @@ def test_fla_stable_clone_is_a_real_equal_clone(lens):
 # 2. the point of the thing: one read per forward, not one per layer
 # ---------------------------------------------------------------------------------------------
 def test_thirty_layers_pay_one_read_each_and_get_identical_objects():
-    """The 30-GDN-layer forward, simulated: 1 build + 29 hits per derived key, same object every time."""
+    """A 30-layer forward: 1 build + 29 hits per derived key, the same object every time."""
     cu = _cu([96, 64, 137, 201])
     firsts = (pmc.cu_list(cu), pmc.cu_last(cu), pmc.seq_lens(cu), pmc.fla_stable_clone(cu))
     for _ in range(29):
@@ -129,16 +99,15 @@ def test_thirty_layers_pay_one_read_each_and_get_identical_objects():
         assert pmc.seq_lens(cu) is firsts[2]
         assert pmc.fla_stable_clone(cu) is firsts[3]
     c = pmc.packed_meta_census()
-    # 4 derived keys, built once each. The +2 served on the first round is `cu_last` and `seq_lens`
-    # each consuming the already-built "list" rather than taking a second read -- which is the
-    # point: ONE device read backs all four derived values.
+    # The +2 on the first round is `cu_last` and `seq_lens` consuming the already-built "list":
+    # one device read backs all four derived values.
     assert c["built"] == 4, c
     assert c["served"] == 29 * 4 + 2, c
     assert c["declined"] == 0, c
 
 
 def test_causal_conv_metadata_is_built_once_per_packed_forward(monkeypatch):
-    """The trainer must match native vLLM's one metadata build, not rebuild it in all 30 layers."""
+    """The conv metadata is built once per packed forward, not once per layer."""
     module_name = "vllm.v1.attention.backends.utils"
     fake_module = ModuleType(module_name)
     builds = []
@@ -194,10 +163,10 @@ def test_causal_conv_metadata_cache_off_restores_vllm_internal_build(monkeypatch
 
 
 def test_the_stable_clone_is_what_makes_an_identity_keyed_cache_hit():
-    """The defect the clone fixes: a FRESH clone per layer is a guaranteed miss in FLA's cache."""
+    """A fresh clone per layer is a guaranteed miss in FLA's identity-keyed cache."""
     cu = _cu([96, 64, 137, 201])
-    # hold the references: CPython recycles the id of a clone dropped on the same line, which would
-    # make the control look like a hit.
+    # hold the references: CPython recycles the id of a clone dropped on the same line, which
+    # would make the control look like a hit.
     fresh = [cu.clone() for _ in range(8)]
     stable = [pmc.fla_stable_clone(cu) for _ in range(8)]
     assert len({id(t) for t in stable}) == 1, "the memo must hand every layer the SAME object"
@@ -217,7 +186,7 @@ def test_in_place_write_invalidates():
 
 
 def test_in_place_write_through_a_VIEW_invalidates():
-    """torch's version counter is shared across views and bases -- that is why the key is sound."""
+    """torch's version counter is shared across views and bases, so a view write invalidates."""
     cu = _cu([64, 64, 64])
     view = cu[:]
     before = pmc.cu_list(cu)
@@ -482,7 +451,7 @@ def test_validate_once_default_is_OFF():
 
 
 # ---------------------------------------------------------------------------------------------
-# 6. the rope thd half -- the 604 us signature. Bitwise, not tolerant: it is the same arithmetic.
+# 6. the rope thd half -- bitwise, not tolerant: it is the same arithmetic
 # ---------------------------------------------------------------------------------------------
 class _CPGroup:
     def __init__(self, size=1, rank=0):
@@ -530,7 +499,7 @@ def test_rope_thd_memo_is_bitwise_equal_to_upstream(monkeypatch, lens, memo):
 
 
 # ---------------------------------------------------------------------------------------------
-# 7. the divided-cu hoist: `_unpack_sequence(x, cu // cp_size)` -- proven, not assumed
+# 7. the divided-cu hoist: `_unpack_sequence(x, cu // cp_size)`
 # ---------------------------------------------------------------------------------------------
 @pytest.fixture
 def shim():
@@ -552,7 +521,7 @@ def _resolve(shim, cu, cp=1):
 
 @pytest.mark.parametrize("lens", [[96, 64, 137, 201], [64], [7, 129, 3]])
 def test_divided_cu_is_proven_once_then_served(shim, lens):
-    """30 layers, 30 fresh `cu // 1` tensors: ONE real read, 29 served off the proof."""
+    """30 fresh `cu // 1` tensors cost one real read; the other 29 are served off the proof."""
     cu = _cu(lens)
     _resolve(shim, cu, cp=1)
     want = cu.tolist()
@@ -574,7 +543,7 @@ def test_divided_cu_is_correct_for_every_cp_size(shim, cp):
 
 
 def test_a_LIE_is_caught_and_the_site_is_never_fast_pathed_again(shim):
-    """The proof must refuse a tensor that is not `cu // cp` -- and stay refusing it."""
+    """A tensor that is not `cu // cp` is refused, and stays refused on every later call."""
     cu = _cu([64, 64, 64])
     _resolve(shim, cu, cp=1)
     liar = cu * 2  # same shape/dtype/device, freshly derived (so not refused), different values
@@ -587,12 +556,11 @@ def test_a_LIE_is_caught_and_the_site_is_never_fast_pathed_again(shim):
 
 
 def test_reverification_catches_a_caller_that_diverges_midway(shim):
-    """Serve the proof, then change the values under it: the periodic re-proof must notice."""
+    """Changing the values under a served proof is caught by the periodic re-verification."""
     cu = _cu([64, 64, 64])
     _resolve(shim, cu, cp=1)
     good = cu // 1
-    # call 1 buys the proof; the serve counter reaches _DIV_REVERIFY on call _DIV_REVERIFY+1, so
-    # drive exactly _DIV_REVERIFY calls and let the NEXT one be the re-verification.
+    # drive exactly _DIV_REVERIFY calls so the NEXT one is the re-verification
     for _ in range(shim._DIV_REVERIFY):
         assert shim._divided_cu_list(good, 0) == cu.tolist()
     assert shim.divided_cu_census()["disproved"] == 0
@@ -638,7 +606,7 @@ def test_a_new_forward_reproves_rather_than_reusing_the_old_proof(shim):
 
 
 def test_unpack_sequence_still_matches_upstream_through_the_divided_path(shim):
-    """The whole point: identical slices, whichever path served the boundaries."""
+    """Identical slices, whichever path served the boundaries."""
     cu = _cu([96, 64, 137, 201])
     _resolve(shim, cu, cp=1)
     x = torch.randn(int(cu[-1]), 3)
@@ -651,7 +619,7 @@ def test_unpack_sequence_still_matches_upstream_through_the_divided_path(shim):
 
 
 def test_the_divided_probe_does_not_evict_the_real_entry(shim):
-    """A peek that inserted would push cu out of a bounded LRU and undo the whole memo."""
+    """A probe that inserted would push cu out of the bounded LRU and undo the memo."""
     cu = _cu([96, 64, 137])
     _resolve(shim, cu, cp=1)
     pmc.cu_list(cu)
@@ -683,23 +651,8 @@ def test_rope_thd_memo_splits_exactly_as_upstream_would(monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------
-# 8. the ledger must not be keyed on an ADDRESS -- the regression for the step-2 abort
-#
-# WHAT BROKE. `_divided_cu_list` first shipped keyed on `(id(cu), cu._version, ...)` while holding
-# NO reference to `cu`. `packed_meta_cache` gets away with `id()` only because every entry keeps a
-# STRONG reference -- that is what makes an id match imply object identity. Without one, CPython
-# recycles the address: the loop below produces ~40 distinct `id(cu)` values for 500 cu_seqlens
-# tensors, and reuses most of them for a tensor holding DIFFERENT offsets.
-#
-# The production consequence, Qwen3.5-35B-A3B production DAPO run (pinfix_v7) step 2: token-based
-# packing appends all-padding microbatches to equalise the DP ranks' microbatch counts, and
-# `_pad_microbatch_to_size` gives every microbatch the same row count -- so an all-padding microbatch
-# (13 rows x 1 valid token, each padded to align_size=tp_size=4 -> cu = [0, 4, ..., 52]) and a real
-# 19,308-token microbatch have cu_seqlens tensors of the SAME shape and dtype, differing only in
-# values and in an address that gets reused. The real microbatch was served the padding microbatch's
-# list on all 30 GDN layers, `_unpack_sequence` sliced 52 rows out of 19,308, and
-# `gated_delta_net.py:401` raised `shape '[1, 19308, -1, 128]' is invalid for input of size 53248`
-# (53,248 = 52 x v_dim_local_tp = 52 x 4096/4).
+# 8. the ledger must not be keyed on a recycled address: without a strong reference CPython reuses
+#    `id(cu)`, and a padding microbatch's offsets can be served to a real one of the same shape.
 # ---------------------------------------------------------------------------------------------
 _PADDING_MB = [4] * 13  # 13 dummy rows, one valid token each, padded to align_size = tp_size = 4
 _REAL_MB = [1484] * 12 + [19308 - 1484 * 12]  # same segment COUNT, 19,308 tokens
@@ -721,7 +674,7 @@ def _microbatch(shim, seglens, nlayers=30):
 
 
 def test_the_ledger_never_serves_another_microbatchs_cu(shim):
-    """500 alternating microbatches, exactly the production pattern. Zero wrong slicings."""
+    """500 alternating padding/real microbatches produce zero wrong slicings."""
     seen, wrong_microbatches = {}, 0
     for step in range(500):
         seglens = _PADDING_MB if step % 7 == 3 else _REAL_MB
@@ -742,7 +695,7 @@ def test_the_ledger_never_serves_another_microbatchs_cu(shim):
 
 
 def test_generations_are_unique_so_ledger_keys_cannot_alias(shim):
-    """The structural invariant: distinct microbatches must never share a proof key."""
+    """Distinct microbatches never share a proof key."""
     keys = []
     for step in range(200):
         shim._DIV_PROOF.clear()
@@ -761,7 +714,7 @@ def test_div_hoist_kill_switch_restores_the_plain_read(shim, monkeypatch):
 
 
 def test_packed_meta_cache_off_restores_the_plain_read(shim, monkeypatch):
-    """The lever the production workaround turns off: with it 0, nothing here can fire at all."""
+    """With the cache flag off, nothing in the ledger can fire at all."""
     monkeypatch.setenv("SKYRL_ISOEXEC_PACKED_META_CACHE", "0")
     for step in range(60):
         wrong, _, _ = _microbatch(shim, _PADDING_MB if step % 5 == 0 else _REAL_MB, nlayers=4)
@@ -771,9 +724,8 @@ def test_packed_meta_cache_off_restores_the_plain_read(shim, monkeypatch):
 
 
 def test_an_argument_that_is_not_a_freshly_derived_divisor_is_refused(shim):
-    """The GDN's `recompute_norm_out` hook re-runs `_unpack_sequence(y, cu_seqlens_q)` during the
-    BACKWARD, by which time `_LAST_RESOLVED` may already hold a LATER microbatch's cu. Only a fresh
-    (version-0, not-`cu`) tensor may enter the ledger; everything else pays the read."""
+    """Only a freshly derived (version-0, not-`cu`) tensor may enter the ledger, because the
+    backward's `recompute_norm_out` can arrive after `_LAST_RESOLVED` moved on."""
     cu_now = _cu([64, 64, 64])
     _resolve(shim, cu_now, cp=1)
     for _ in range(3):

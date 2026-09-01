@@ -1,8 +1,7 @@
 """Plumbing gate for mm_tiles: does the flag actually reach the kernel, and is it bitwise-neutral?
 
-§0: seven flags in this program were silently unforwarded, producing A/Bs that compared a baseline
-against itself. An offline unit test of the flag passes happily while the live run ignores it.
-So this asserts the OVERRIDE TOOK, by counting kernel launches through the tiled launcher.
+Asserts the override took by counting launches through the tiled launcher -- an offline unit test
+of the flag passes happily while the live run ignores it.
 """
 
 import os

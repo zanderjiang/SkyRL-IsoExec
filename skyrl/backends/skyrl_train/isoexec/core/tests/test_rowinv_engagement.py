@@ -1,29 +1,8 @@
 """Rowinv ENGAGEMENT enforcement: a one-sided serve refuses instead of running silently.
 
-The failure this file pins: rowinv composed on both sides -- contract hashes MATCHED, the
-handshake passed -- with every trainer process serving rowinv (4096/4096) and ZERO engine workers
-doing so, producing a one-sided composition. The manifest proves selection; only ``ops/logprobs/rowinv.py::stats()['served'] > 0`` proves
-engagement, so that census is now wired into the obligation ledger and escalated to REFUSE for
-exactly this impl (SERVED_REFUSE_IMPLS: it replaces BOTH runtimes at once and carries no
-bitwise_equal_to twin -- see the rationale beside the table in core/enforce.py).
-
-Asserted here, all CPU:
-
-  * a side whose census says served=0 REFUSES -- at the engagement boundary, and at a
-    ``close_phase(STEP1)`` whose served record is missing (a check that never ran is as loud as
-    one that failed);
-  * both sides serving passes clean;
-  * a process with NO contract derives no rowinv obligation, records nothing, and cannot refuse --
-    rowinv is composed unconditionally now, so "not selected" no longer means "flag off", it means
-    no contract was built here. No OTHER served obligation may gain refuse severity either;
-  * the demotion path holds: SKYRL_ISOEXEC_MANIFEST_STRICT=0 and SKYRL_ISOEXEC_DEBUG_TRACE both
-    turn the refusal into a logged verdict with the violation still recorded (refuse() is the
-    funnel, never bypassed);
-  * the init-sync grace: the FIRST boundary call with a completely silent census (calls=0)
-    defers -- the init weight sync legitimately precedes any forward -- and the SECOND refuses.
-
-Run (CPU only):
-    uv run --extra dev pytest skyrl/backends/skyrl_train/isoexec/core/tests/test_rowinv_engagement.py -q
+Guards against rowinv composed on both sides with matching hashes while only one side actually
+serves it. The manifest proves selection; only the rowinv census proves engagement, so it is
+wired into the obligation ledger and escalated to REFUSE for exactly this impl.
 """
 
 import os
@@ -198,8 +177,8 @@ def test_both_sides_serving_pass_and_step1_closes_green(monkeypatch):
             for oid in SERVED_IDS[side]:
                 recs = enforce.ledger().records[oid]
                 assert recs[-1].result == enforce.OK and "served=64" in recs[-1].evidence
-        # STEP1 then closes green: the rowinv records exist and are ok; counterless/unreported
-        # LOG-severity served obligations log, never refuse (unchanged behavior).
+        # STEP1 then closes green: counterless/unreported LOG-severity served obligations log,
+        # never refuse.
         for side in ("trainer", "engine"):
             plan = enforce.derive_obligation_plan(_CONTRACT, _REG, side)
             enforce.ledger().plans[side] = plan
@@ -224,11 +203,7 @@ def test_boundary_is_latched_after_ok(monkeypatch):
 
 
 def test_boundary_is_inert_without_a_contract(monkeypatch):
-    """Rowinv is composed unconditionally, so the only "not selected" left is "no contract".
-
-    A CPU driver or a process that never built one must not be refused for a census it was never
-    in a position to move.
-    """
+    """A process that built no contract must not be refused for a census it could never move."""
     saved = (pc._CONTRACT, pc._VIEW)
     enforce._reset_for_tests()
     pc._CONTRACT, pc._VIEW = None, None

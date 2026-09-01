@@ -1,32 +1,10 @@
 """Debug-mode hook installation: wrap installed region impls with digest capture.
 
-Reaches the regions the way the adapters do -- by rebinding the module attribute or class
-attribute that holds the *currently installed* impl -- so whatever kernel each side actually runs
-(IsoExec's or native) is what gets traced. Nothing here edits adapter or worker files; the call
-sites named in ``INTEGRATION.md`` invoke :func:`install_debug_hooks` after their normal isoexec
-install, which is why every door below is the post-install binding.
-
-Everything is a no-op unless ``SKYRL_ISOEXEC_DEBUG_TRACE`` is set. Idempotent; safe to call more
-than once and safe to call when megatron / vLLM / the GDN ops are not importable in this process
--- a door whose module is absent is skipped and reported, never raised.
-
-:data:`DOORS` is the table: one row per (region, door), where a door is the exact attribute that
-gets rebound. :data:`NOT_HOOKED` records, for every registry region with no door, WHY. Between
-them the two cover all 22 registry regions; :func:`coverage` returns that as data and
-:func:`install_debug_hooks` prints it.
-
-Two rules make a multi-region table safe to install:
-
-  * The door must be the SAME mathematical point on both sides, or the comparator is comparing
-    different quantities and calls a clean run divergent. ``gdn.core`` is the cautionary case:
-    the engine used to be hooked at ``GatedDeltaNet.forward`` (post-``out_proj``, ``[T,1,2048]``)
-    while the trainer was hooked at the kernel door (``[1,T,H,D]``) -- never comparable. Both
-    sides now hook the kernel door, and the layer index comes from
-    :func:`install_layer_context_hooks`, which publishes the running layer's index around the
-    whole decoder-layer forward instead of recording a second, different tensor.
-  * The wrapper must be transparent. ``trace.wrap_region`` copies ``_isoexec_*`` capability
-    markers and sets ``__wrapped__``; doors whose installer asserts on the *identity* of the live
-    binding (``rope.rope``) are listed in :data:`NOT_HOOKED` rather than wrapped.
+Rebinds the module or class attribute holding the currently installed impl, so whatever kernel each
+side actually runs is what gets traced. No-op unless ``SKYRL_ISOEXEC_DEBUG_TRACE`` is set; a door
+whose module is absent is skipped, never raised. A door must be the SAME mathematical point on both
+sides or the comparator compares different quantities; doors whose installer asserts on the identity
+of the live binding are listed in :data:`NOT_HOOKED` instead of wrapped.
 """
 
 from __future__ import annotations
@@ -62,10 +40,7 @@ def _shared_wrap(region: str, fn: Callable, **kw) -> Callable:
 def _engine_batch_case() -> Optional[str]:
     """decode / prefill / mixed from vLLM's forward context -- the batch composition itself.
 
-    ``attn_metadata`` is a dict keyed by layer prefix; every entry describes the same batch, so
-    any one of them answers the question. This is the only honest signal at the kernel door: the
-    door's own arguments cannot tell "no ``cu_seqlens`` because this is decode" from "no
-    ``cu_seqlens`` because this caller does not pass it".
+    ``attn_metadata`` is a dict keyed by layer prefix; every entry describes the same batch.
     """
     try:
         from vllm.forward_context import get_forward_context
@@ -97,9 +72,8 @@ def _case(args, kwargs, out) -> str:
     ctx = _engine_batch_case()
     if ctx is not None:
         return ctx
-    # Structural fallback: the varlen kernels take a real cu_seqlens, the state kernels are
-    # called with an explicit cu_seqlens=None alongside ssm_state. Weaker than the forward
-    # context (it reads the call site, not the batch), so it never overrides it.
+    # Structural fallback: varlen kernels take a real cu_seqlens, state kernels take cu_seqlens=None
+    # alongside ssm_state. Reads the call site rather than the batch, so it never overrides the above.
     cu = kwargs.get("cu_seqlens")
     if isinstance(cu, torch.Tensor) and cu.numel() >= 2:
         return "engine_prefill"
@@ -108,7 +82,7 @@ def _case(args, kwargs, out) -> str:
     return "engine"
 
 
-_gdn_case = _case  # kept: the historical name for the gdn.core case function
+_gdn_case = _case  # historical name for the gdn.core case function
 
 
 def _out_kwarg(name: str) -> Callable:
@@ -127,9 +101,9 @@ def _first(args, kwargs, out):
 
 # -- the door table ---------------------------------------------------------------------------
 #
-# (region, module path, attribute, import_ok, kwargs for wrap_region)
-# ``attribute`` may be "Class.method"; ``import_ok`` False means "wrap it only if the module is
-# already imported" -- used for vLLM, which must never be imported into a trainer process.
+# (region, module path, attribute, import_ok, kwargs for wrap_region). ``attribute`` may be
+# "Class.method"; ``import_ok`` False means "wrap only if already imported" (vLLM, which must never
+# be imported into a trainer process).
 
 DOORS: Tuple[Tuple[str, str, str, bool, dict], ...] = (
     # -- attention -------------------------------------------------------------------------
@@ -265,11 +239,9 @@ def _resolve(module_path: str, attr: str, import_ok: bool):
         if holder is None:
             return None
     if isinstance(holder, type):
-        # THROUGH __dict__, not getattr: getattr runs the descriptor protocol, so a staticmethod
-        # comes back as a plain function and _install_door re-binds it as an ordinary method --
-        # vLLM's `Sampler.compute_logprobs` then gets `self` as its first positional argument and
-        # the engine dies at the first sample. The MRO walk keeps inherited doors
-        # resolvable; setattr still lands on `holder`.
+        # Through __dict__, not getattr: getattr runs the descriptor protocol and a staticmethod
+        # would come back as a plain function, then be rebound as an ordinary method. The MRO walk
+        # keeps inherited doors resolvable; setattr still lands on `holder`.
         cur = next((k.__dict__[name] for k in holder.__mro__ if name in k.__dict__), None)
     else:
         cur = getattr(holder, name, None)
@@ -312,10 +284,8 @@ def coverage() -> Dict[str, dict]:
 def _decoder_layers(obj) -> List:
     """Every decoder layer reachable from ``obj``: a module, or an iterable of them.
 
-    The megatron worker's ``model_fn`` returns a LIST of GPTModel chunks (virtual pipeline), which
-    has no ``.decoder`` -- the trainer got zero layer-context hooks and fell back to
-    ``layer_src="call_order"``, which does not align with the engine's module indices. Each
-    chunk's layers carry megatron's global ``layer_number``, so a flat walk is correct.
+    Megatron's virtual pipeline gives a list of GPTModel chunks with no ``.decoder``; each chunk's
+    layers carry the global ``layer_number``, so a flat walk is correct.
     """
     if obj is None:
         return []
@@ -342,15 +312,8 @@ def _decoder_layers(obj) -> List:
 def install_layer_context_hooks(gpt_modules) -> int:
     """Publish the running decoder layer's index to every region door inside its forward.
 
-    ``gpt_modules`` may be one GPTModel or the list of virtual-pipeline chunks the megatron worker
-    holds; see :func:`_decoder_layers`.
-
-    Call site: right after the isoexec install on each side -- the engine's ``swap_gdn_core(...)``
-    and, once the trainer passes its model to :func:`install_debug_hooks`, the trainer's model
-    build. This wraps ``layer.forward`` with a thread-local ``layer_context`` only; it records
-    nothing itself, which is the point: the layer index reaches the kernel door instead of a
-    second, differently shaped tensor being recorded next to it.
-
+    ``gpt_modules`` may be one GPTModel or the list of virtual-pipeline chunks. Wraps
+    ``layer.forward`` with a thread-local ``layer_context`` only; it records nothing itself.
     ``layer_number`` is megatron's 1-based index INCLUDING the pipeline offset, so ``- 1`` is a
     global layer id and trainer (PP>1) and engine (PP=1) records align.
     """
@@ -379,8 +342,7 @@ def install_layer_context_hooks(gpt_modules) -> int:
     return n
 
 
-# Historical name; the engine call site in runtimes/vllm/gptmodel_vllm.py still calls this. It no
-# longer records post-out_proj tensors -- that door was not comparable with the trainer's.
+# Historical name; the engine call site in runtimes/vllm/gptmodel_vllm.py still uses it.
 install_gdn_layer_hooks = install_layer_context_hooks
 
 

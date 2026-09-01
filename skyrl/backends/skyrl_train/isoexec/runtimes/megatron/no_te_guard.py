@@ -1,12 +1,7 @@
-"""In-process guard that keeps megatron-bridge importable when TransformerEngine is absent.
+"""Guard that keeps megatron-bridge importable when TransformerEngine is absent.
 
-Three megatron-bridge modules (peft/lora_layers, peft/lora, diffusion/models/wan/utils) hard-import
-TransformerEngine at module load with no try/except, so ``from megatron.bridge import AutoBridge``
-crashes when TE is not installed. This guard rewrites those three imports in place, atomically and
-idempotently, and deliberately does NOT register a stub ``transformer_engine`` module -- a stub would
-flip megatron-core/-bridge HAVE_TE checks to True and trigger deeper TE imports that then fail. Call
-``install_no_te_guard()`` before the first ``import megatron.bridge``; it is a no-op when TE is
-importable.
+Rewrites three hard TE imports in place. It must NOT register a stub ``transformer_engine`` module:
+that would flip HAVE_TE checks to True and trigger deeper TE imports that then fail.
 """
 
 import importlib.util
@@ -41,9 +36,8 @@ _PATCHES = (
 
 
 def _bridge_root():
-    # Resolve the path WITHOUT importing megatron.bridge (its __init__ is what crashes).
-    # find_spec RAISES rather than returning None when the parent package is absent, which is the
-    # normal state on the CPU-only machines the trace comparator runs on -- nothing to patch there.
+    # Resolve the path WITHOUT importing megatron.bridge (its __init__ is what crashes). find_spec
+    # raises rather than returning None when the parent package is absent.
     try:
         spec = importlib.util.find_spec("megatron.bridge")
     except (ImportError, AttributeError, ValueError):
@@ -57,9 +51,8 @@ def install_no_te_guard() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return True
-    # Gate on the real precondition -- TE genuinely absent -- not on SKYRL_ISOEXEC_LOCAL_SPEC, which
-    # is not reliably forwarded to Ray actors: the actor builds its own uv env and imports
-    # megatron.bridge at worker module load, before the config-driven env is applied.
+    # Gate on the real precondition (TE genuinely absent), not on SKYRL_ISOEXEC_LOCAL_SPEC, which is
+    # not reliably forwarded to Ray actors before they import megatron.bridge.
     try:
         import transformer_engine  # noqa: F401  -- real TE present, nothing to do
 
@@ -67,13 +60,8 @@ def install_no_te_guard() -> bool:
     except ImportError:
         pass
     except OSError as e:
-        # OSError too: a partial TE install (the .so is there, libcublas is not) raises
-        # `OSError: libcublas.so.13: cannot open shared object file` rather than ImportError, and
-        # a TE that cannot load IS TE absent as far as the guard is concerned. Without this the
-        # probe propagates and importing the package at all fails on a CPU-only machine -- which
-        # is exactly where the stdlib-only trace comparator is meant to run. It is loud because
-        # the two cases are not the same fact: on a trainer this is a BROKEN TE, and running
-        # without it silently would change the composition.
+        # A partial TE install raises OSError (missing .so) rather than ImportError; a TE that
+        # cannot load counts as absent, but log loudly since on a trainer it means a broken install.
         logger.error(
             "[isoexec] TransformerEngine is installed but fails to load (%s: %s); treating it as "
             "absent and installing the no-TE guard. Expected on a CPU-only comparator box; on a "

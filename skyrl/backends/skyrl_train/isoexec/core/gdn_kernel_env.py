@@ -1,13 +1,7 @@
 """The GDN delta-rule kernel selector: one vocabulary, one default, one parser.
 
-``SKYRL_ISOEXEC_GDN_KERNEL`` is read at two places that must agree -- the DECLARATION site
-(``models/qwen3_5.build``, which picks the profile variant the contract hashes) and the READ sites
-(``ops/gdn/gdn_ops``, which pick the kernel that executes). They used to parse it differently:
-case-sensitive against one literal on one side, ``.lower()`` against three on the other, different
-defaults, and an unrecognized value silently falling back on one side while raising on the other.
-The consequence was the worst kind: with ``SKYRL_ISOEXEC_GDN_KERNEL=CPR`` both runtimes derived
-the same WRONG contract, so the weight-sync handshake MATCHED. Parsing lives here so there is
-exactly one answer to what the variable says.
+Both the declaration site (``models/qwen3_5.build``) and the read sites (``ops/gdn/gdn_ops``)
+must parse ``SKYRL_ISOEXEC_GDN_KERNEL`` identically, so parsing lives here.
 """
 
 from __future__ import annotations
@@ -15,18 +9,13 @@ from __future__ import annotations
 import os
 
 KERNEL_ENV = "SKYRL_ISOEXEC_GDN_KERNEL"
-# Trainer-only ablation override (ops/gdn/gdn_ops.gdn_core). Documented there as "not a IsoExec
-# configuration": the contract pins ONE gdn.core kernel for all four sites and cannot express a
-# trainer/engine split, so a contract build refuses when this asks for one.
+# Trainer-only ablation override: the contract pins ONE gdn.core kernel for all four sites, so a
+# contract build refuses when this asks for a trainer/engine split.
 TRAINER_KERNEL_ENV = "SKYRL_ISOEXEC_GDN_TRAINER_KERNEL"
 
-# "cpr" is the chunkwise-parallel-recurrent kernel: parallel within a chunk, recurrent across
-# chunk boundaries.
+# "cpr": chunkwise-parallel-recurrent (parallel within a chunk, recurrent across chunk boundaries).
 KERNELS = ("chunk", "cpr", "recurrent")
-# The DECLARATION site owns the default: models/qwen3_5 declares a recurrent variant and a cpr one,
-# and no model declares a chunk composition, so "chunk" by default meant the contract named a
-# function the process did not run. Unset therefore resolves to the variant that is actually
-# declarable.
+# No model declares a chunk composition, so the default must be a declarable variant.
 DEFAULT_KERNEL = "recurrent"
 
 # Retired spellings, refused by name so an old launch script fails loudly instead of falling back.

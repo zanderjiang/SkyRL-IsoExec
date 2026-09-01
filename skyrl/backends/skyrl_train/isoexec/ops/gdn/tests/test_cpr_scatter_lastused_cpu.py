@@ -1,19 +1,7 @@
 """The LRU stamp folded into the fused buffer scatter (``cpr_buffer_scatter(last_used=, clock=)``).
 
-WHAT CHANGED AND WHY. ``CprGDN.decode`` ended with two ATen ops that exist only for the
-prefill-time LRU: ``self._clock += 1`` and ``self.last_used[rows] = self._clock``. The second is an
-``index_put_`` -- a single-block kernel writing 512 int64s, positionally measured at 2.90 us per GDN
-layer = 87 us of every decode step at 30 layers, inside the captured graph. The scatter kernel
-already holds ``row`` in a register and already does a scalar per-row store (``pos``), so the stamp
-rides along for no launch. The clock bump moves ABOVE the scatter so every program reads a value
-nobody writes -- that ordering is the whole correctness argument and is what these tests pin.
-
-Triton is GPU-only, so the CPU half tests the argument CONTRACT (the two arguments are passed
-together or not at all; the dtypes are the ones the kernel assumes) and the value equivalence is
-asserted on a device when there is one.
-
-Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_cpr_scatter_lastused_cpu.py -q
+The clock bump must happen above the scatter so every program reads a value nobody writes.
+Triton is GPU-only, so the CPU half pins the argument contract and value equivalence needs a device.
 """
 
 import pytest

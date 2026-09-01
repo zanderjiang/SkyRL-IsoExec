@@ -1,26 +1,8 @@
 """CPU tests for the fused slot->row resolution (``gdn_cpr_rows`` + ``RecurrentGDN._rows_pair``).
 
-WHAT THIS GATES. ``_rows`` was three ATen ops (``slots.long()``, ``clamp_``, ``slot2row[safe]``)
-and each of its two decode consumers cast the result to int32 on its own -- five single-block
-kernels per GDN layer, inside the captured decode graph, measured positionally at 11.9 us/layer =
-358 us of every decode step at 30 layers. ``cpr_resolve_rows`` does the whole chain in one Triton
-program and emits both widths.
-
-The change is only allowed to be a LAUNCH-STRUCTURE change, so what needs testing is that it is
-nothing else: the same rows, for the same slot vectors, including every adversarial one the graph
-can present -- NULL_BLOCK_ID negatives, ids past the end of the map, duplicates, and the padding
-lanes a replay fills with whatever was in the buffer. ``_rows_legacy`` below is a VERBATIM copy of
-the pre-change ``_rows`` body, kept as the oracle rather than as history.
-
-TRITON IS GPU-ONLY, SO THIS FILE HAS TWO HALVES. On CPU it proves (a) the seam declines to the
-ATen chain and returns exactly the legacy answer, (b) the decline predicates fire on the shapes the
-kernel refuses, (c) the arithmetic the kernel transcribes (clamp-then-gather-then-cast) equals the
-ATen chain elementwise. On a CUDA box the same file additionally runs the REAL kernel against the
-ATen chain and asserts bitwise equality -- that assertion is the one that matters, and it is
-skipped, never faked, when there is no device.
-
-Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_cpr_rows_cpu.py -q
+The fused kernel must be a launch-structure change only, so ``_rows_legacy`` (a verbatim copy of
+the pre-change body) is the oracle. Triton is GPU-only: CPU covers the seam, the decline predicates
+and the transcribed arithmetic; the bitwise kernel comparison is skipped without a device.
 """
 
 import pytest
@@ -34,21 +16,16 @@ from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_recurrent_state import (  # 
 CUDA = torch.cuda.is_available()
 
 
-# ================================================================================================
 # the oracle and a pool carrying only the slot map
-# ================================================================================================
 def _rows_legacy(slot2row: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-    """VERBATIM ``RecurrentGDN._rows``'s non-native body as it stood before 2026-08-13."""
+    """Verbatim copy of ``RecurrentGDN._rows``'s pre-change non-native body."""
     safe = slots.long().clamp_(0, slot2row.numel() - 1)
     return slot2row[safe]
 
 
 def make_pool(map_size: int = 4096, rows: int = 64, device: str = "cpu") -> RecurrentGDN:
-    """A ``RecurrentGDN`` carrying ONLY the fields ``_rows_pair`` touches.
-
-    Deliberately not a constructed layer (``__init__`` allocates the state arena and needs a live
-    parallel state); the same trick ``test_assign_many_cpu.make_pool`` uses.
-    """
+    """A ``RecurrentGDN`` carrying only the fields ``_rows_pair`` touches (``__init__`` would need
+    a live parallel state)."""
     rg = RecurrentGDN.__new__(RecurrentGDN)
     rg._native = False
     g = torch.Generator().manual_seed(1234)
@@ -70,9 +47,7 @@ def adversarial_slots(map_size: int, device: str = "cpu") -> list[torch.Tensor]:
     ]
 
 
-# ================================================================================================
 # the seam: _rows_pair must equal (legacy rows, its int32 cast) whatever path it takes
-# ================================================================================================
 def test_rows_pair_matches_legacy_on_cpu():
     """No CUDA -> the fused path is not even attempted, and the answer is the legacy one."""
     rg = make_pool()
@@ -103,8 +78,7 @@ def test_rows_pair_honours_the_kill_switch(monkeypatch):
 
 
 def test_native_state_keeps_the_aten_form():
-    """The ``_native`` clamp is a DIFFERENT function (a where against ssm rows, no map gather);
-    the fused kernel must not be reached for it."""
+    """The ``_native`` clamp is a different function, so the fused kernel must not be reached."""
     rg = make_pool()
     rg._native = True
     rg.ssm_state = torch.zeros(16, 1)
@@ -116,9 +90,7 @@ def test_native_state_keeps_the_aten_form():
     assert torch.equal(rows32, want.to(torch.int32))
 
 
-# ================================================================================================
-# the decline predicates: anything that is not the production shape falls back, it does not guess
-# ================================================================================================
+# the decline predicates: anything that is not the production shape falls back
 @pytest.mark.parametrize(
     "slots, smap, why",
     [
@@ -146,16 +118,9 @@ def test_decline_is_counted_and_reported(capsys):
     assert "expected 1-D slots" in _rows_stats()[2]
 
 
-# ================================================================================================
 # the arithmetic the kernel transcribes, checked without a device
-# ================================================================================================
 def test_transcribed_arithmetic_equals_the_aten_chain():
-    """``min(max(s, 0), map_n - 1)`` -- what the Triton body computes -- is ``clamp_(0, map_n-1)``.
-
-    Torch's two-bound ``clamp_`` is documented as ``max(min(x, hi), lo)``; for ``lo <= hi`` (always,
-    since a map has at least one entry) the two orders agree, and this pins that they do on the
-    exact ids a replay presents rather than on the general claim.
-    """
+    """The Triton body's ``min(max(s, 0), map_n - 1)`` equals ATen's ``clamp_(0, map_n - 1)``."""
     smap = torch.arange(97, dtype=torch.int64) * 3
     for slots in adversarial_slots(smap.numel()):
         s = slots.long()
@@ -163,9 +128,7 @@ def test_transcribed_arithmetic_equals_the_aten_chain():
         assert torch.equal(kernel_form, _rows_legacy(smap, slots))
 
 
-# ================================================================================================
 # the real kernel, when there is a device to run it on
-# ================================================================================================
 @pytest.mark.skipif(not CUDA, reason="the fused rows kernel is Triton; needs a CUDA device")
 def test_fused_kernel_is_bitwise_the_aten_chain():
     from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_rows import cpr_resolve_rows

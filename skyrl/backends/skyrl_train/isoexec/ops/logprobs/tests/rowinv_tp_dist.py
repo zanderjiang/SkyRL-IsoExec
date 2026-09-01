@@ -1,17 +1,8 @@
-"""THE key gate for ``ops/logprobs/rowinv.py``: bitwise TP-invariance of the sampled logprob.
+"""Bitwise TP-invariance gate for ``ops/logprobs/rowinv.py``.
 
-The trainer scores at TP=4 and the engine decodes at TP=8 (and the engine's already-gathered full
-row is world=1 from the kernel's view), so the candidate must produce IDENTICAL BITS at every TP
-degree dividing G on identical full-vocabulary inputs. This harness builds one seeded full
-``[rows, V]`` logit tensor on every rank, evaluates the candidate at TP degrees {1, 2, 4, 8} (each
-degree over a subgroup of the first C ranks, each rank feeding its contiguous ``V/C`` shard), and
-asserts ``torch.equal`` on the fp32 words across degrees AND across ranks within each degree.
-
-Negative control, so the gate has teeth: the rank-partial anti-pattern -- each rank reduces its
-whole shard into ONE partial and the C partials are summed -- rounds at rank boundaries that move
-with C, and is asserted to DIFFER between the two largest degrees on the same data. If the control
-comes out equal the data is too tame and the test fails loudly (the pik probe convention:
-impossibility controls must be live, not assumed).
+Evaluates the candidate at TP degrees {1, 2, 4, 8} over one seeded full ``[rows, V]`` tensor and
+asserts bit equality across degrees and across ranks, with the rank-partial anti-pattern as a live
+negative control.
 
 CI: torchrun --standalone --nproc-per-node=8 <thisfile>   (>= 2 ranks; degrees are capped at world)
 """
@@ -61,15 +52,14 @@ def make_reference(shard, target, group, world):
 
 
 def rank_partial_antipattern(shard, group, world) -> torch.Tensor:
-    """The refuted scheme: one exp-sum partial per rank, partials summed in rank order.
+    """The refuted scheme (negative control only): one exp-sum partial per rank, summed in order.
 
-    The rounding points sit at rank boundaries, which move with the TP degree, so C=4 and C=8
-    evaluate different fp32 expressions. Kept only as the negative control.
+    Its rounding points sit at rank boundaries, which move with the TP degree.
     """
     row_max = torch.amax(shard, dim=-1)
     if world > 1:
         dist.all_reduce(row_max, op=dist.ReduceOp.MAX, group=group)
-    partial = torch.exp(shard - row_max.unsqueeze(1)).sum(dim=-1)  # ONE partial per whole shard
+    partial = torch.exp(shard - row_max.unsqueeze(1)).sum(dim=-1)  # one partial per whole shard
     if world > 1:
         parts = [torch.empty_like(partial) for _ in range(world)]
         dist.all_gather(parts, partial, group=group)
@@ -137,9 +127,7 @@ def main() -> None:
 
     # ---- bf16 shards (the trainer's native dtype) reproduce the fp32-widened bits exactly ----
     # Deliberately the SAME subgroup the fp32 shards were admitted on: the payload dtype is
-    # per-call eligibility, not group structure, so an fp32-admitted group must serve a bf16 call
-    # too -- scoring bf16 alternating with the fp32 training forward on one process/group,
-    # exercised here at the largest TP degree.
+    # per-call eligibility, not group structure, so it must serve a bf16 call too.
     bf16_degree = degrees[-1]
     bf16_group = groups[bf16_degree]
     bf16_bits = None

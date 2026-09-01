@@ -1,28 +1,8 @@
 """Single-GPU gates for the row-invariant sampled logprob (``ops/logprobs/rowinv.py``).
 
-What is checked:
-
-  1. ROW-COUNT INVARIANCE (bitwise). The defect this module exists for: ATen's fp32 vocab sum
-     changes bits with the launch geometry, so trainer chunks (1024 rows) and engine decode
-     batches (1..N rows) disagree. The candidate must be ``torch.equal`` on the int32 words for
-     N in {1,2,4,8,16,17,64,128,256,512} against the 1024-row reference, at the production
-     V=248320. The incumbent ATen path is run on the same data as a POSITIVE CONTROL: it must
-     actually differ across row counts here, or this gate is measuring nothing.
-  2. ACCURACY vs an fp64 ground truth. Kahan compensation must make the candidate at least as
-     accurate as ATen's fp32 schedule -- asserted on both mean and max |error|, not assumed.
-  3. BACKWARD vs torch autograd (allclose, NOT bitwise: grad reaches only the optimizer). Also
-     asserts an out-of-vocabulary target row produces logprob 0 and zero gradient.
-  4. 3D vs 2D layout: [B, T, V] and the flattened [B*T, V] produce identical bits.
-  5. DECLINES: V % G != 0 declines (no silent padding); SKYRL_ISOEXEC=0 declines with served == 0
-     (rowinv has no flag of its own -- it is the composed default -- so the master switch is the
-     only env state that can still turn it off).
-  6. Perf at 1024 rows and 8 rows vs the ATen incumbent (reported, not asserted).
-  7. DTYPE-ALTERNATION REGRESSION: alternating bf16 (scoring under
-     SKYRL_ISOEXEC_SCORING_LOGITS_BF16) and fp32 (the Float16Module-upcast training forward) on
-     the SAME process/group must both SERVE, never raise, and agree bitwise -- the payload dtype
-     is per-call eligibility, not an immutable structural fact.
-  8. Genuine structural drift (a changed vocabulary partition) must STILL raise, so the dtype fix
-     cannot silently disable the safety gate.
+Covers bitwise row-count invariance (with ATen as a live positive control), accuracy against an
+fp64 truth, backward, layout, declines, dtype alternation, structural drift, and the full-row
+entry. Each numbered section below says what it gates.
 
 Run: CUDA_VISIBLE_DEVICES=<gpu> PYTHONPATH=. python skyrl/backends/skyrl_train/isoexec/ops/logprobs/tests/rowinv_gpu.py
 Exit 0 iff every check passes.
@@ -68,10 +48,7 @@ def bits(t: torch.Tensor) -> torch.Tensor:
 
 
 def aten_incumbent(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """The incumbent formulation: amax / sub / exp / ATen fp32 vocab sum / log / gather.
-
-    Invalid (out-of-vocabulary padding) targets are masked to 0 the way the incumbent does.
-    """
+    """The incumbent: amax / sub / exp / ATen fp32 vocab sum / log / gather, padding masked to 0."""
     valid = (t >= 0) & (t < x.shape[-1])
     safe = t.masked_fill(~valid, 0)
     m = torch.amax(x, dim=-1, keepdim=True)
@@ -185,7 +162,7 @@ print(f"     hot_hits={rowinv.stats()['hot_hits']} (steady-state admissions took
 
 # ================================================================================== 4) backward
 print("4) backward vs torch autograd reference (allclose; no bitwise contract):")
-rowinv._reset_for_test()  # group=None cache pins shard width; the next phase changes V
+rowinv._reset_for_test()  # the group=None cache pins shard width; the next phase changes V
 V2 = 8192
 x = (torch.randn(64, V2, device=DEV, dtype=torch.float32, generator=gen) * 3).to(torch.bfloat16).float()
 x.requires_grad_()
@@ -225,13 +202,13 @@ check(
 
 # ============================================================================ 5) bf16 input path
 print("5) low-precision input: transient in-module widen == pre-widened fp32, bit for bit:")
-rowinv._reset_for_test()  # section 4 pinned shard width V2 in the group=None cache; V returns here
+rowinv._reset_for_test()  # section 4 pinned shard width V2 in the cache; V returns here
 n5 = 256
 x32 = logits[:n5].contiguous()  # fp32, itself an exactly-widened bf16
 t5 = target[:n5].contiguous()
 ref32 = call(x32, t5)
-# Deliberately NO reset between the fp32 and bf16 calls: the payload dtype is per-call
-# eligibility, not group structure, so both dtypes must serve on the SAME admission cache.
+# Deliberately no reset between the fp32 and bf16 calls: the payload dtype is per-call
+# eligibility, so both dtypes must serve on the same admission cache.
 x16 = x32.to(torch.bfloat16)  # exact narrowing: x32 was built by widening bf16
 out16 = call(x16, t5)
 check(
@@ -239,7 +216,7 @@ check(
     out16 is not None and ref32 is not None and torch.equal(bits(out16), bits(ref32)),
 )
 
-# bf16 backward: the ORIGINAL bf16 tensor is what is saved; grad comes back in bf16
+# bf16 backward: the original bf16 tensor is what is saved; grad comes back in bf16
 rowinv._reset_for_test()
 xg = x.detach().to(torch.bfloat16).requires_grad_()
 outg = call(xg, t2)
@@ -295,10 +272,8 @@ os.environ["SKYRL_ISOEXEC"] = "1"
 
 # ============================================================ 7) dtype alternation regression
 print("7) alternating bf16/fp32 on ONE process/group: both serve, no raise, identical bits:")
-# The same trainer process scores with bf16 logits (the scoring forward under
-# SKYRL_ISOEXEC_SCORING_LOGITS_BF16) and trains with fp32 logits (Float16Module upcasts the
-# training forward), so a dtype flip after admission must not read as STRUCTURAL DRIFT. The dtype
-# is per-call eligibility: both calls MUST serve and MUST agree bitwise.
+# One trainer process scores in bf16 and trains in fp32, so a dtype flip after admission must not
+# read as STRUCTURAL DRIFT: both calls must serve and agree bitwise.
 rowinv._reset_for_test()
 n7 = 64
 x32_7 = logits[:n7].contiguous()  # fp32 that is an exactly-widened bf16 (the training forward)
@@ -344,7 +319,7 @@ check(
 # =================================================== 8) genuine structural drift must STILL raise
 print("8) genuine structural drift still raises (the dtype fix must not weaken the gate):")
 # Same group key, changed vocabulary partition (shard width V/2 after admission at V): candidate
-# and incumbent issue different collectives, so this rank-local divergence is unsafe and raises.
+# and incumbent issue different collectives, so this divergence is unsafe and must raise.
 half = V // 2
 xh = logits[:4, :half].contiguous()
 th = torch.randint(0, half, (4,), device=DEV, generator=tgen)
@@ -365,11 +340,8 @@ check("changed vocab partition (shard width) still raises STRUCTURAL DRIFT", dri
 
 # ============================================================= 9) full-row entry (engine V1 site)
 print("9) full-row entry (rowinv_full_logprobs -- the engine's V1 Sampler.compute_logprobs hook):")
-# The V1 sampler needs the FULL [N, V] fp32 row (gather_logprobs consumes it for top-k/ranks), so
-# the engine serves rowinv through the full-row entry. The claims: (a) gathering the sampled
-# column from the full row is bitwise identical to the sampled entry -- i.e. to what the TRAINER's
-# rowinv path produces for the same logits; (b) the full row is row-count invariant bitwise;
-# (c) bf16 input == pre-widened fp32 input bitwise; (d) SKYRL_ISOEXEC=0 declines before any work.
+# The V1 sampler needs the full [N, V] fp32 row, so the engine serves rowinv through this entry.
+# Gated: gather == the sampled entry, row-count invariance, bf16 == fp32, and the env decline.
 rowinv._reset_for_test()
 
 

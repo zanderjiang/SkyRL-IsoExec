@@ -25,7 +25,7 @@ def _combine_backward_stats():
 
 
 def _torch_epilogue_reference(inter, probs):
-    # inlined verbatim from the private module: the production 5-op chain, the bitwise reference
+    # the production epilogue chain, as the bitwise reference
     T = inter.shape[0]
     gate, up = inter.reshape(T, -1).chunk(2, dim=-1)
     h = torch.nn.functional.silu(gate) * up
@@ -39,8 +39,7 @@ def test_fused_combine_counts_only_after_forward_and_backward_are_served(monkeyp
     permuted = torch.randn(tokens * topk, hidden, requires_grad=True)
 
     def fake_forward(permuted_tokens, sorted_indices, restore_shape, *, permuted_probs=None, rows=None, out_dtype=None):
-        # `out_dtype` is the round fold (SKYRL_ISOEXEC_MOE_COMBINE_FOLD_ROUND); this stand-in only has
-        # to accept it, since the counter under test is engagement and not arithmetic.
+        # the stand-in only has to accept `out_dtype`; the counter under test is engagement
         del sorted_indices, restore_shape, permuted_probs, out_dtype
         return permuted_tokens.index_select(0, rows.reshape(-1)).view(tokens, topk, hidden).sum(dim=1)
 

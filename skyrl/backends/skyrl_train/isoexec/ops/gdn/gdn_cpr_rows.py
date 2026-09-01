@@ -1,8 +1,7 @@
 """One-launch slot->row resolution for the captured decode graph.
 
-Replaces the ``slots.long()`` / ``clamp_`` / ``slot2row[...]`` / int32-cast ATen chain with a single
-Triton program emitting both the int64 and int32 row vectors. Host-free and shape-static so it captures
-into a CUDA graph; ``SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS=0`` (or any unexpected shape/dtype) uses the ATen chain.
+Host-free and shape-static so it captures into a CUDA graph.
+``SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS=0`` (or an unexpected shape/dtype) falls back to the ATen chain.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ def _cpr_rows_kernel(
     offs = tl.program_id(0) * BLK + tl.arange(0, BLK)
     m = offs < n
     s = tl.load(slots_ptr + offs, mask=m, other=0).to(tl.int64)
-    # Matches ``slots.long().clamp_(0, map_n - 1)``; for lo <= hi the min/max order is irrelevant.
+    # Matches ``slots.long().clamp_(0, map_n - 1)``.
     s = tl.minimum(tl.maximum(s, 0), map_n - 1)
     r = tl.load(map_ptr + s, mask=m, other=0)
     tl.store(rows_ptr + offs, r, mask=m)
@@ -48,11 +47,7 @@ def _cpr_rows_kernel(
 
 
 def cpr_resolve_rows(slots: torch.Tensor, slot2row: torch.Tensor):
-    """``(rows_int64, rows_int32)`` for a decode batch's engine slot ids, in one launch.
-
-    Equivalent to ``slot2row[slots.long().clamp_(0, slot2row.numel() - 1)]`` plus its int32 cast.
-    Returns ``None`` for unexpected shapes/dtypes so the caller falls back to the ATen chain.
-    """
+    """``(rows_int64, rows_int32)`` for a decode batch's engine slot ids; ``None`` to request fallback."""
     global _served, _declined, _reported, _decline_reason
     if slots.dim() != 1 or slot2row.dim() != 1 or slot2row.dtype != torch.int64:
         _declined += 1

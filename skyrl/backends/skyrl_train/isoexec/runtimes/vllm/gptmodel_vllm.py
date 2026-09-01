@@ -1,14 +1,9 @@
 """Run Megatron's GPTModel inside vLLM (unified-model IsoExec route).
 
 vLLM becomes pure runtime (scheduler, paged KV cache, sampling) while the compute is the same
-bridge-built Megatron GPTModel the trainer runs, so per-op inputs are bitwise-identical.
-``MegatronCoreAttnToVLLM`` replaces ``SelfAttention.core_attention`` with vLLM's paged Attention,
-``GPTModelVLLMWrapper`` implements vLLM's model interface over the swapped model, and
-``register_gptmodel_to_vllm`` registers it under our custom architecture name.
-
-Scope: matched TP (Megatron TP == vLLM TP), single-node TP only (the worker world must be the TP
-group), enforce_eager, and the column-parallel output layer gathering logits for vLLM's sampler.
-Weights arrive via native sync rather than HF, so ``load_weights`` is effectively a no-op.
+bridge-built Megatron GPTModel the trainer runs. Scope: the vLLM worker world must be exactly the
+engine TP group (no DP/PP inside the engine), and a column-parallel output layer gathering logits
+for the sampler.
 """
 
 from __future__ import annotations
@@ -26,11 +21,9 @@ _DENSE_MODEL_NAME = "MegatronGPTModelForCausalLM"
 _HYBRID_MODEL_NAME = "MegatronGPTModelHybridForCausalLM"
 
 
-# Each capability tuple needs its own class under its own registered name: vLLM caches a model's
-# `_ModelInfo` (which carries `is_hybrid`, `supports_mrope`, ...) by module+class name, so one class
-# cannot answer differently on different runs -- the first run's answer sticks. `model_classes` maps
-# the tuple to a class; the names above are the canonical names for the shipped tuples and must not
-# change.
+# Each capability tuple needs its own class under its own registered name: vLLM caches `_ModelInfo`
+# by module+class name, so one class cannot answer differently across runs. The names above are the
+# canonical names for the shipped tuples and must not change.
 def _vllm_model_name() -> str:
     from .model_classes import resolve_model_name
 
@@ -41,13 +34,10 @@ VLLM_MODEL_NAME = _vllm_model_name()
 TORCHTITAN_LIKE_CONFIG_FORMAT = "megatron_gptmodel"
 
 
-# Register the engine-side bitwise kernels in the WORKER process at import time. Each rank is its
-# own Ray worker actor and does not inherit the backend/logprob patches applied in the engine actor,
-# and the worker lazily imports this module to build the model -- so registering here, before vLLM
-# resolves the attention backend and before sampling, is what makes the worker use CUSTOM varlen
-# (num_splits=1, hence bitwise decode==prefill at all lengths) and the aten-logprob path. Without it
-# the worker silently falls back to vLLM's flash backend, whose split-K heuristic breaks
-# decode==prefill on long sequences. Idempotent; no-op off the local-spec path.
+# Register the engine-side bitwise kernels in the WORKER process at import time: a worker does not
+# inherit the engine actor's patches, and this must run before vLLM resolves the attention backend.
+# Otherwise the worker falls back to vLLM's flash backend, whose split-K heuristic breaks
+# decode==prefill on long sequences.
 if os.environ.get("SKYRL_ISOEXEC_LOCAL_SPEC") == "1":
     try:
         from skyrl.backends.skyrl_train.isoexec.ops.attention import (
@@ -71,11 +61,8 @@ if os.environ.get("SKYRL_ISOEXEC_LOCAL_SPEC") == "1":
 class MegatronCoreAttnToVLLM(nn.Module):
     """Replacement for ``SelfAttention.core_attention`` that uses vLLM's paged Attention.
 
-    Megatron calls ``core_attention(query, key, value, attention_mask, attn_mask_type=...,
-    attention_bias=..., packed_seq_params=...)`` with q/k/v in ``[sq, b, np, hn]`` (sbhd) and
-    expects ``[sq, b, np*hn]`` back. Under vLLM, b==1 and vLLM owns the KV cache + causal mask,
-    so we drop the batch dim, hand ``[tokens, heads, hn]`` to ``vllm.Attention``, and reshape
-    back. q/k-norm and RoPE were already applied upstream by SelfAttention.
+    Megatron passes q/k/v as sbhd ``[sq, b, np, hn]`` and expects ``[sq, b, np*hn]`` back; under
+    vLLM b==1 and vLLM owns the KV cache and causal mask. q/k-norm and RoPE are applied upstream.
     """
 
     _layer_counter = itertools.count()
@@ -114,10 +101,8 @@ class MegatronCoreAttnToVLLM(nn.Module):
         packed_seq_params=None,
         **extra_kwargs,
     ):
-        # `**extra_kwargs`: MLA's `_run_core_attention` forwards its caller's kwargs through. See
-        # the same note in ops/attention/megatron_varlen_attn.TorchVarlenCoreAttn.forward.
-        # Megatron sbhd: [sq, b, np, hn]. vLLM's Attention wants FLATTENED 2D
-        # [num_tokens, np*hn] (matches native Qwen3: self.attn(q,k,v) with q [T, q_size]).
+        # `**extra_kwargs`: MLA's `_run_core_attention` forwards its caller's kwargs through.
+        # Megatron sbhd [sq, b, np, hn] -> vLLM's flattened 2D [num_tokens, np*hn].
         sq, b = query.shape[0], query.shape[1]
         q = query.reshape(sq * b, self.num_heads * self.head_dim).contiguous()
         k = key.reshape(sq * b, self.num_kv_heads * self.head_dim).contiguous()
@@ -129,17 +114,9 @@ class MegatronCoreAttnToVLLM(nn.Module):
 def swap_core_attention(gpt_modules, *, num_heads, num_kv_heads, head_dim, scale):
     """Replace every decoder layer's ``self_attention.core_attention`` with the vLLM adapter.
 
-    ``SKYRL_ISOEXEC_ENGINE_ATTN_SKIP_GDN`` (default on) skips the linear-attention layers. On a
-    hybrid model they occupy the ``self_attention`` slot without a ``core_attention``, so the
-    assignment would create a full paged ``Attention`` that registers itself in
-    ``static_forward_context`` and is never called. The cost is not the unused modules but their
-    KV-cache specs: vLLM sets ``group_size`` to the largest layer type and divides available memory
-    by it, so phantom attention layers cut maximum concurrency proportionally.
-
-    Skipping moves no bits -- the modules are never invoked, hold no parameters, and ``layer_id`` is
-    still advanced for every layer carrying a ``self_attention``, so each surviving layer keeps the
-    exact prefix (its vLLM KV-cache layer name) it had before. On a model with nothing to skip the
-    predicate is false for every Megatron attention class, so dense models take the identical path.
+    ``SKYRL_ISOEXEC_ENGINE_ATTN_SKIP_GDN`` (default on) skips linear-attention layers: their phantom
+    KV-cache specs would inflate vLLM's group_size and cut maximum concurrency. Skipping moves no
+    bits -- ``layer_id`` still advances per layer, so surviving layers keep their exact prefixes.
     """
     skip_gdn = os.environ.get("SKYRL_ISOEXEC_ENGINE_ATTN_SKIP_GDN", "1").lower() not in ("", "0", "false", "no")
     modules = gpt_modules if isinstance(gpt_modules, (list, tuple)) else [gpt_modules]
@@ -151,8 +128,8 @@ def swap_core_attention(gpt_modules, *, num_heads, num_kv_heads, head_dim, scale
             sa = getattr(layer, "self_attention", None)
             if sa is None:
                 continue
-            # Advanced for EVERY layer that reaches here, skipped or not, so the surviving layers'
-            # prefixes are exactly the ones the OFF path assigns them.
+            # Advanced for EVERY layer, skipped or not, so surviving layers keep the prefixes the
+            # OFF path assigns them.
             layer_id = next(MegatronCoreAttnToVLLM._layer_counter)
             if skip_gdn and not hasattr(sa, "core_attention"):
                 n_skipped += 1  # linear-attention layer: it never calls core_attention
@@ -178,8 +155,8 @@ def swap_core_attention(gpt_modules, *, num_heads, num_kv_heads, head_dim, scale
             )
         except Exception:  # pragma: no cover - fd 1 closed
             pass
-    # Fingerprint the engine's `attention.varlen` install from the layer COUNT, not the flag:
-    # "zero layers were swapped" is a real failure mode and must not read as a successful install.
+    # Fingerprint from the layer COUNT, not the flag: "zero layers swapped" is a real failure mode
+    # and must not read as a successful install.
     from ...core.fingerprint import ENGINE_SITES, NOT_INSTALLED, record_installs
 
     record_installs(
@@ -192,9 +169,8 @@ def swap_core_attention(gpt_modules, *, num_heads, num_kv_heads, head_dim, scale
 
 
 class _PositionIndexedRoPE(nn.Module):
-    """Wraps Megatron's RotaryEmbedding so the returned RoPE is indexed by vLLM's ABSOLUTE
-    positions instead of sequence-index 0..L-1. Required for paged decode (1-token inputs whose
-    true position is N). For prefill (positions==0..L-1) it reproduces the original exactly."""
+    """Wraps Megatron's RotaryEmbedding so RoPE is indexed by vLLM's ABSOLUTE positions rather than
+    sequence-index 0..L-1. Required for paged decode; identical to the original at prefill."""
 
     def __init__(self, orig, max_pos, per_forward_cache: bool = False):
         super().__init__()
@@ -202,12 +178,8 @@ class _PositionIndexedRoPE(nn.Module):
         with torch.no_grad():
             self._emb_full = orig(max_pos)  # [max_pos, 1, 1, dim]
         self._positions = None
-        # Per-forward cache, for models whose layers each call RoPE themselves rather than taking a
-        # model-level freqs object: without it every layer allocates a distinct freqs tensor and the
-        # fused kernel's cos/sin hoist, which caches on that tensor, never amortizes. Correct because
-        # `positions` is fixed for the forward (set_positions runs once, before any layer) and the
-        # cache is replaced by the next set_positions, so there is no staleness window. Off by
-        # default so the dense path keeps the object identity its own hoist keys on.
+        # Per-forward cache for models whose layers each call RoPE themselves; without it the fused
+        # kernel's cos/sin hoist never amortizes. Safe because `positions` is fixed for the forward.
         self._per_forward_cache = per_forward_cache
         self._cached = None
 
@@ -216,10 +188,9 @@ class _PositionIndexedRoPE(nn.Module):
         self._cached = None
 
     def forward(self, max_seq_len, *args, **kwargs):
-        # Stamp the engine mark on the freqs tensor. This module is only ever constructed inside a
-        # vLLM worker, so the mark exists only in the engine process -- that is what keeps the fused
-        # RoPE off the trainer even though its install point is a module global. The mark also
-        # carries the hoisted cos/sin cache, which dies with the tensor. See rope_fused.py.
+        # Stamp the engine mark on the freqs tensor. This module only ever exists inside a vLLM
+        # worker, so the mark is what keeps the fused RoPE off the trainer despite its global
+        # install point. It also carries the hoisted cos/sin cache, which dies with the tensor.
         from skyrl.backends.skyrl_train.isoexec.ops.rope.rope_fused import (
             mark_engine_rope,
         )
@@ -227,11 +198,9 @@ class _PositionIndexedRoPE(nn.Module):
         if self._positions is not None:
             if self._cached is not None:
                 return self._cached
-            # Advanced indexing allocates, so this is the fresh per-forward base the hoist keys on
-            # and the tensor `mark_engine_rope` records as the live marked freqs. A consumer that
-            # slices it cannot be matched by walking `_base`: this runs under
-            # `torch.inference_mode()`, and torch skips view tracking for inference tensors -- the
-            # detector matches on shared storage instead (ops/rope/rope_fused.engine_marked_host).
+            # Advanced indexing allocates, so this is the fresh per-forward base the hoist keys on.
+            # Views of it cannot be matched by walking `_base` (inference tensors skip view
+            # tracking), so the detector matches on shared storage instead.
             out = mark_engine_rope(self._emb_full.to(self._positions.device)[self._positions])  # [T,1,1,dim]
             if self._per_forward_cache:
                 self._cached = out
@@ -252,28 +221,24 @@ class GPTModelVLLMWrapper(nn.Module):
     via native sync, so ``load_weights`` only reports param names for vLLM's safety check.
     """
 
-    # A config declaring `rope_parameters.mrope_section` makes vLLM require SupportsMRoPE before it
-    # will build positions at all, while the Megatron text bridge uses plain 1-D RoPE. For a
-    # text-only request all three M-RoPE sections are the absolute position, so satisfying the
-    # protocol is cheaper than rewriting the HF config; `forward` collapses [3, T] back to one row.
+    # A config declaring `rope_parameters.mrope_section` makes vLLM require SupportsMRoPE, while the
+    # Megatron text bridge uses plain 1-D RoPE. For text-only requests all three sections are the
+    # absolute position, so satisfying the protocol is cheaper than rewriting the HF config.
     supports_mrope = True
 
     # `is_hybrid` is deliberately NOT set here: vLLM caches `_ModelInfo` by module+class name, so an
-    # env-dependent answer on this class would be baked in by one run and poison the next. The
-    # hybrid flag lives on the subclass below, which has its own cache entry.
+    # env-dependent answer would be baked in by one run. It lives on the subclass below instead.
 
-    # vLLM reconciles the attention page size with the mamba page size by reading the state geometry
-    # from these two classmethods on the model CLASS, before any layer exists. Without them the page
-    # sizes never unify and the KV cache manager refuses the config.
+    # vLLM reads the state geometry from these two classmethods on the CLASS, before any layer
+    # exists; without them the attention and mamba page sizes never unify.
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config):
         from vllm.model_executor.layers.mamba.mamba_utils import (
             MambaStateShapeCalculator,
         )
 
-        # Under cpr the GDN state lives in CprGDN's private pools and these pages
-        # are only a slot-id source, so a bytes-sized state is reported here and the hybrid config
-        # pass stops inflating every page to cover state nothing reads. MUST agree with
+        # Under cpr these pages are only a slot-id source, so report a bytes-sized state and stop
+        # the hybrid config pass inflating every page. MUST agree with
         # gdn_gptmodel.IsoExecGDNStateLayer.get_state_shape, the runtime spec.
         from ...ops.gdn.gdn_ops import GDN_CPR_MIN_STATE_SHAPES, gdn_cpr_min_pages
 
@@ -325,21 +290,18 @@ class GPTModelVLLMWrapper(nn.Module):
         # model path from the engine config in that case.
         if model_path is None:
             model_path = vllm_config.model_config.model
-        # load_weights: bridge loads real HF weights at init (standalone). Under SkyRL the trainer
-        # overwrites them via native sync, but loading at init is harmless (env override available).
+        # The bridge loads real HF weights at init; the trainer overwrites them via native sync.
         if load_weights is None:
             load_weights = os.environ.get("SKYRL_ISOEXEC_ENGINE_LOAD_WEIGHTS", "1") == "1"
         # Same `fla` facade the trainer installs: the engine builds the SAME GPTModel, so its GDN
-        # layers must run the same ops. Idempotent -- normally already done by the isoexec package
-        # __init__, which runs before this module's body.
+        # layers must run the same ops. Idempotent.
         if os.environ.get("SKYRL_ISOEXEC_GDN") == "1":
             from skyrl.backends.skyrl_train.isoexec import install_fla_shim
 
             install_fla_shim()
         b = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
-        # Qwen3.5 registers as a VL architecture; the VL bridge does not build a plain GPTModel (and
-        # cannot pack sequences). Force the text bridge, exactly as megatron_worker.init_configs does,
-        # so the engine and the trainer construct the SAME GPTModel.
+        # Qwen3.5 registers as a VL architecture, whose bridge builds no plain GPTModel. Force the
+        # text bridge as megatron_worker.init_configs does, so both sides build the SAME GPTModel.
         if os.environ.get("SKYRL_ISOEXEC_GDN") == "1":
             from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.gdn_hybrid_spec import (
                 checkpoint_is_vl_named,
@@ -349,27 +311,22 @@ class GPTModelVLLMWrapper(nn.Module):
                 maybe_force_qwen35_text_bridge,
             )
 
-            # Read VL-ness BEFORE the sentinel rewrite: the released Qwen3.5 checkpoints are
-            # VL-architected and store the LM under `model.language_model.`, but the text bridge we
-            # are about to select builds HF names as `model.`.
+            # Read VL-ness BEFORE the sentinel rewrite: VL checkpoints store the LM under
+            # `model.language_model.`, but the text bridge builds HF names as `model.`.
             vl = checkpoint_is_vl_named(b.hf_pretrained.config)
             patch_qwen35_bridge_for_local_spec(hf_lm_prefix="model.language_model." if vl else None)
             if maybe_force_qwen35_text_bridge(b, b.hf_pretrained.config):
                 print("[ISOEXEC-WRAP] forced Qwen3.5 TEXT bridge (GPTModel + GDN, not the VL model)", flush=True)
         mp = b.to_megatron_provider(load_weights=load_weights)
-        # IsoExec needs the engine's GPTModel sharded exactly as the trainer's, so Megatron TP must
-        # equal vLLM TP. Megatron's model-parallel state does not exist in a vLLM worker, so it is
-        # built over the group vLLM already made: for single-node TP the worker world IS the TP group.
+        # Megatron's mpu is built over the group vLLM already made: the worker world IS the TP group.
         tp = int(vllm_config.parallel_config.tensor_parallel_size)
         self._tp_size = tp
         from megatron.core import parallel_state as mpu
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-        # Megatron's parallel layers read the GLOBAL mpu, so an already-initialized Megatron TP that
-        # differs from the engine's tp (mismatched-TP IsoExec) would silently shard the engine model
-        # at the trainer's width -- reset it. This is safe only because the engine is a distinct
-        # process; sharing one process and one global mpu with the trainer would need mpu swapped
-        # around the sleep/wake boundary instead.
+        # Megatron's parallel layers read the GLOBAL mpu, so an already-initialized TP differing
+        # from the engine's would silently shard the engine model at the trainer's width -- reset
+        # it. Safe only because the engine is a distinct process.
         _cur = mpu.get_tensor_model_parallel_world_size() if mpu.model_parallel_is_initialized() else None
         if _cur is not None and _cur != tp:
             print(
@@ -391,8 +348,8 @@ class GPTModelVLLMWrapper(nn.Module):
                 )
         if _cur is None:
             if not torch.distributed.is_initialized():
-                # tp==1 single-GPU engine with no vLLM-created world: a trivial 1-rank group so
-                # Megatron's mpu (and its ColumnParallel/RowParallel world=1) can initialize.
+                # tp==1 with no vLLM-created world: a trivial 1-rank group so Megatron's mpu can
+                # initialize.
                 torch.distributed.init_process_group(
                     backend="nccl", world_size=1, rank=0, store=torch.distributed.HashStore()
                 )
@@ -409,24 +366,20 @@ class GPTModelVLLMWrapper(nn.Module):
         mp.expert_model_parallel_size = 1  # EP>1 makes the expert combine a nondeterministic collective
         mp.expert_tensor_parallel_size = tp  # experts sharded over the TP group (ETP == TP at EP=1)
         mp.sequence_parallel = False
-        # GPTModel's output layer is column-parallel: with parallel_output=True each rank returns its
-        # vocab shard. vLLM's sampler wants the full row. Gather inside Megatron.
+        # The column-parallel output layer must gather: vLLM's sampler wants the full vocab row.
         mp.parallel_output = False
         mp.pipeline_dtype = torch.bfloat16
         mp.apply_rope_fusion = False
         mp.attention_backend = AttnBackend.flash
         mp.gradient_accumulation_fusion = False
         # Force Megatron's LOCAL layer spec so the engine GPTModel runs the same plain-torch ops as
-        # the local-spec trainer. Bitwise IsoExec comes from batch invariance plus num_splits=1
-        # attention over that forward, not from the TE-targeted megatron patches.
+        # the local-spec trainer.
         self._local_spec = os.environ.get("SKYRL_ISOEXEC_LOCAL_SPEC") == "1"
         if self._local_spec:
-            # MoE providers resolve to get_gpt_layer_local_spec(num_experts=..., grouped_gemm=False)
-            # -> MoELayer(TopKRouter, SequentialMLP); dense providers to bridge's local_layer_spec.
             mp.transformer_layer_spec = make_isoexec_local_layer_spec(mp)
             print("[ISOEXEC-WRAP] forced Megatron LOCAL layer spec (no TransformerEngine)", flush=True)
-        # Disable MTP to match the trainer, which drops it for training: if the engine keeps MTP
-        # layers and the trainer does not, the two GPTModels are different models.
+        # Disable MTP to match the trainer, which drops it for training; otherwise the two sides
+        # build different models.
         if getattr(mp, "mtp_num_layers", None):
             print(
                 f"[ISOEXEC-WRAP] disabling MTP (mtp_num_layers={mp.mtp_num_layers} -> None) to match trainer",
@@ -434,8 +387,7 @@ class GPTModelVLLMWrapper(nn.Module):
             )
             mp.mtp_num_layers = None
         # Mirror the trainer's RoPE-base workaround: transformers v5 moves rope_theta into
-        # rope_parameters, so megatron-bridge reads the now-missing config.rope_theta and silently
-        # falls back to rotary_base=10000. Both sides must apply it or the two RoPE bases differ.
+        # rope_parameters, so megatron-bridge silently falls back to rotary_base=10000.
         _hf = vllm_config.model_config.hf_config
         _rp = getattr(_hf, "rope_parameters", None) or getattr(_hf, "rope_scaling", None)
         if isinstance(_rp, dict) and _rp.get("rope_theta"):
@@ -447,8 +399,7 @@ class GPTModelVLLMWrapper(nn.Module):
             f"{getattr(_hf, 'rope_theta', None)}, rope_parameters={_rp})",
             flush=True,
         )
-        # Pin the identical MoE recipe the trainer pins and install the deterministic combine /
-        # sorted router top-k. Both sides must apply it. No-op on dense providers.
+        # Pin the identical MoE recipe the trainer pins. No-op on dense providers.
         if self._local_spec:
             prepare_isoexec_moe(mp, side="ENGINE")
         mp.finalize()
@@ -456,9 +407,8 @@ class GPTModelVLLMWrapper(nn.Module):
         self._gpt_list = gpt
         self.gpt = gpt[0].module if hasattr(gpt[0], "module") else gpt[0]
 
-        # Engine-only no-gather MoE dispatch: with SP off the allgather dispatcher's token gather
-        # makes TP identical copies of the batch, and under pik-fc2 the tree already leaves the
-        # bit-identical reduced output on every rank. Trainer models are never marked.
+        # Engine-only no-gather MoE dispatch: with SP off the allgather dispatcher just makes TP
+        # copies of the batch, and pik-fc2 already leaves the identical reduced output on each rank.
         if os.environ.get("SKYRL_ISOEXEC_MOE_PIK_FC2") == "1" and self._local_spec:
             from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_batch_invariant import (
                 mark_engine_dispatchers_nogather,
@@ -467,9 +417,7 @@ class GPTModelVLLMWrapper(nn.Module):
             mark_engine_dispatchers_nogather(self.gpt)
 
         # Engine-only fused router + permute sort. The class patches fire only on MARKED instances,
-        # so the trainer -- which can share this process and needs the autograd graph megatron's
-        # eager ops build -- keeps the native path. Marking is unconditional so the [ISOEXEC-MOE] line
-        # below reports the flag's value as seen at engine build.
+        # so a trainer sharing this process keeps the native (autograd-capable) path.
         if self._local_spec:
             from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_router_o2_kernel import (
                 mark_engine_router_o2,
@@ -477,9 +425,8 @@ class GPTModelVLLMWrapper(nn.Module):
 
             mark_engine_router_o2(self.gpt)
 
-        # The dense-scatter and router-chain kernels fire only on marked engine instances, by the
-        # same mechanism and for the same reason. Marking is unconditional; each kernel stays gated
-        # on its own flag.
+        # The dense-scatter and router-chain kernels use the same instance mark; each stays gated on
+        # its own flag.
         if self._local_spec:
             from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_dense_scatter_kernel import (
                 mark_engine_routing_mechanics,
@@ -487,9 +434,8 @@ class GPTModelVLLMWrapper(nn.Module):
 
             mark_engine_routing_mechanics(self.gpt)
 
-        # Engine-only fused MoE top-k combine. Same instance-mark mechanism and the same reason:
-        # `unpermute` is a module-level function, so the binding is process-global. The raw Triton
-        # call has no grad_fn, so unmarked (trainer) dispatchers keep the eager fixed-order combine.
+        # Engine-only fused MoE top-k combine: `unpermute` is module-level, so the binding is
+        # process-global and unmarked (trainer) dispatchers keep the eager fixed-order combine.
         if self._local_spec:
             from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_combine_kernel import (
                 mark_engine_fused_combine,
@@ -497,10 +443,8 @@ class GPTModelVLLMWrapper(nn.Module):
 
             mark_engine_fused_combine(self.gpt)
 
-        # Engine-only MoE preamble + shared-expert fusions (shared-expert GLU, shared_expert_gate,
-        # and the router's fp32 casts folded into the gating GEMM). These are INSTANCE rebinds on
-        # this model's own modules -- the seam that keeps them off a trainer sharing this process.
-        # The post-attention residual add is deliberately not fused: it has no instance to mark.
+        # Engine-only MoE preamble + shared-expert fusions, as INSTANCE rebinds on this model's own
+        # modules -- the seam that keeps them off a trainer sharing this process.
         if self._local_spec:
             from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_preamble_o12 import (
                 install_engine_moe_preamble,
@@ -508,22 +452,17 @@ class GPTModelVLLMWrapper(nn.Module):
 
             install_engine_moe_preamble(self.gpt)
 
-            # After the preamble install, so each engine-local MoE component is marked before the
-            # router cache inspects it. The cache owns only the fp32 weight cast; the cast VALUE is
-            # contract and only its recomputation is waste, invalidated by the in-place re-cast at
-            # moe_fused_weights.bump_sync_epoch.
+            # After the preamble install, so each MoE component is marked before the router cache
+            # inspects it. The cache owns only the fp32 weight cast, not its value.
             from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_router_cast_cache import (
                 install_engine_router_cast_cache,
             )
 
             install_engine_router_cast_cache(self.gpt)
 
-        # SKYRL_ISOEXEC_SPLIT_LM_HEAD (default off): Megatron's post_process stage runs the output
-        # layer on every token and gathers the full vocab in fp32, but vLLM samples only the last
-        # token of each sequence. Flipping post_process after the build is safe -- TransformerBlock
-        # decides its final_layernorm at __init__ and then dispatches on `self.final_layernorm is not
-        # None`, never re-reading post_process -- so the decoder keeps its final layernorm and
-        # GPTModel._postprocess returns hidden states early.
+        # SKYRL_ISOEXEC_SPLIT_LM_HEAD (default off): Megatron's post_process runs the output layer on
+        # every token while vLLM samples only the last. Flipping post_process after the build is safe
+        # -- TransformerBlock fixes its final_layernorm at __init__ and never re-reads the flag.
         self._split_lm_head = os.environ.get("SKYRL_ISOEXEC_SPLIT_LM_HEAD") == "1"
         if self._split_lm_head:
             core = self.gpt
@@ -556,24 +495,18 @@ class GPTModelVLLMWrapper(nn.Module):
             self._gpt_core = None
             print("[ISOEXEC-WRAP] SPLIT_LM_HEAD=0: fused lm_head in forward (default)", flush=True)
 
-        # Numeric recipe. On the local-spec stack the model is already plain torch and batch
-        # invariance comes from VLLM_BATCH_INVARIANT=1, while apply_megatron_isoexec_patches targets
-        # TE kernels that do not exist there -- so it runs only on the TE stack.
+        # apply_megatron_isoexec_patches targets TE kernels, which the local-spec stack does not
+        # have; there, batch invariance comes from VLLM_BATCH_INVARIANT=1 instead.
         if not self._local_spec:
-            # vLLM already registered the aten ops under VLLM_BATCH_INVARIANT=1; add only the TE
-            # GEMM/RMSNorm + RoPE patches here.
+            # vLLM already registered the aten ops; add only the TE GEMM/RMSNorm + RoPE patches.
             apply_megatron_isoexec_patches(skip_aten_registration=True)
 
-        # The ContractAdapter owns this worker's enforcement sequence: build the contract BEFORE
-        # any install that asserts against it (idempotent, cached; ordering is load-bearing: pik's
-        # _assert_plan_matches_manifest reads cached_contract_view() and silently skips on None, so
-        # building after the pik install left the engine with zero reachable refusing pin checks),
-        # check EVERY contract claim against the deployed engine facts (runtimes/vllm/adapter.py),
-        # run the install sequence below, then close the INSTALL boundary.
+        # The ContractAdapter owns this worker's enforcement sequence. Ordering is load-bearing: the
+        # contract must be built BEFORE any install that asserts against it, since those checks read
+        # cached_contract_view() and silently skip on None.
         def _isoexec_install():
-            # Engine half of the TP/EP-invariant row-parallel (pik) pair; the trainer applies the
-            # identical patch. It makes the row-parallel K-reduction follow the same fixed leaf tree on
-            # both sides, so the engine may run a different TP than the trainer with KL still exactly 0.
+            # Engine half of the TP/EP-invariant row-parallel (pik) pair: both sides follow the same
+            # fixed leaf tree, so the engine may run a different TP with KL still exactly 0.
             if os.environ.get("SKYRL_ISOEXEC_PIK") == "1":
                 from skyrl.backends.skyrl_train.isoexec.ops.collectives.pik_tp_invariant import (
                     apply_pik_tp_invariant,
@@ -584,8 +517,8 @@ class GPTModelVLLMWrapper(nn.Module):
             # swap attention -> vLLM paged
             cfg = self.gpt.config
             head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // cfg.num_attention_heads)
-            # Megatron shards attention heads across TP, so core_attention sees per-rank head counts
-            # (including the kv-replication case num_query_groups < TP); vLLM expects local counts too.
+            # Megatron shards attention heads across TP, so core_attention sees per-rank head counts;
+            # vLLM expects local counts too.
             from skyrl.backends.skyrl_train.isoexec.ops.attention.megatron_varlen_attn import (
                 isoexec_local_head_counts,
             )
@@ -599,10 +532,9 @@ class GPTModelVLLMWrapper(nn.Module):
                 scale=head_dim**-0.5,
             )
 
-            # Hybrid models: the GatedDeltaNet layers swap_core_attention skips get a vLLM-registered
-            # mamba state layer and chunk-consistent decode. MUST happen during model construction:
-            # vLLM's KV cache manager enumerates static_forward_context after __init__ and before
-            # allocating state.
+            # Hybrid models: the GDN layers swap_core_attention skipped get a vLLM-registered mamba
+            # state layer. MUST happen during model construction, before the KV cache manager
+            # enumerates static_forward_context.
             if os.environ.get("SKYRL_ISOEXEC_GDN") == "1":
                 from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.gdn_gptmodel import (
                     swap_gdn_core,
@@ -610,38 +542,32 @@ class GPTModelVLLMWrapper(nn.Module):
 
                 n_gdn = swap_gdn_core(self.gpt, vllm_config=vllm_config)
                 if n_gdn == 0:
-                    # Zero GatedDeltaNet layers means every layer came out dense: a different model
-                    # from the one the checkpoint describes, which would build, run, and even be bitwise
-                    # decode==prefill while generating gibberish. Refuse.
+                    # Zero GDN layers means every layer came out dense: a different model from the
+                    # one the checkpoint describes, which would run happily and generate gibberish.
                     raise RuntimeError(
                         "[isoexec-gdn] SKYRL_ISOEXEC_GDN=1 but the Megatron GPTModel has no GatedDeltaNet "
                         "layers. The no-TE local layer spec built dense attention for every layer. A "
                         "hybrid no-TE spec (GDN on 3 of 4 layers) is required."
                     )
 
-            # Fuse `F.rms_norm(x) * (1.0 + weight)` into one kernel and hoist the add to the weight-sync
-            # boundary. Instance-level rebinds on THIS model, so the trainer's identical norm class is
-            # untouched -- hoisting gamma trainer-side would detach `weight`'s gradient path, which a
-            # forward-only IsoExec gate cannot see. Self-gates on SKYRL_ISOEXEC_GDN_FUSED_OUTNORM.
+            # Fuse `F.rms_norm(x) * (1.0 + weight)` and hoist the add to the weight-sync boundary.
+            # Instance-level rebinds only: hoisting gamma trainer-side would detach `weight`'s
+            # gradient path. Self-gates on SKYRL_ISOEXEC_GDN_FUSED_OUTNORM.
             from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (
                 install_engine_fused_norms,
             )
 
-            # The count distinguishes "the fused twin installed" from "the flag was on and it rebound
-            # nothing"; the install fingerprint below reports it.
+            # The count distinguishes an installed twin from a flag that rebound nothing.
             self._ix_fused_norms = install_engine_fused_norms(self.gpt)
 
-            # RoPE-by-absolute-position: GPTModel computes RoPE for sequence-index 0..L-1, but vLLM
-            # paged decode feeds 1-token inputs whose true position is N. Index a precomputed RoPE
-            # cache by vLLM's `positions` so decode rotates at the right angle (else decode != prefill).
+            # RoPE-by-absolute-position: GPTModel computes RoPE for sequence-index 0..L-1, but paged
+            # decode feeds 1-token inputs whose true position is N, so index by vLLM's `positions`.
             max_pos = int(getattr(vllm_config.model_config, "max_model_len", 8192))
             self._rope = _PositionIndexedRoPE(self.gpt.rotary_pos_emb, max_pos)
             self.gpt.rotary_pos_emb = self._rope
 
-            # Fuse the attention RoPE and hoist cos/sin out of the per-layer recompute. Installed here,
-            # in the vLLM worker process only: the patch point is a module global, so the trainer must
-            # never reach this line, and the fused path additionally requires the mark
-            # _PositionIndexedRoPE stamps above. Self-gates on SKYRL_ISOEXEC_FUSED_ROPE.
+            # Fuse the attention RoPE and hoist cos/sin out of the per-layer recompute. The patch
+            # point is a module global, so the trainer must never reach this line.
             from skyrl.backends.skyrl_train.isoexec.ops.rope.rope_fused import (
                 install_engine_fused_rope,
             )
@@ -649,32 +575,23 @@ class GPTModelVLLMWrapper(nn.Module):
                 is_rope_fp32_installed,
             )
 
-            # The op refuses to fuse over the megatron fp32-rope patch (different rounding chain). That
-            # guard state lives in the megatron runtime, so the adapter reads it and passes it down --
-            # ops must never import a runtime.
+            # The op refuses to fuse over the megatron fp32-rope patch (different rounding chain).
+            # The adapter reads that guard state and passes it down: ops must never import a runtime.
             install_engine_fused_rope(fp32_rope_installed=is_rope_fp32_installed())
 
-            # Replace megatron's fused-QKV gather over the full TP group with an all-gather over the
-            # subgroup whose shards are the only columns this rank keeps. When `num_query_groups <
-            # tp_world` megatron gathers every qkv column and then slices; contiguous rank-ordered
-            # ColumnParallelLinear sharding makes the subgroup gather byte-identical to
-            # gather-then-slice. Installed at model build because it creates and WARMS a sub-process
-            # group, and the gather it replaces runs inside the decode CUDA graphs -- a communicator
-            # built lazily under capture is fatal. Self-gates on the geometry it reads off the layers.
+            # Replace megatron's fused-QKV gather over the full TP group with a subgroup all-gather,
+            # byte-identical to gather-then-slice under contiguous rank-ordered sharding. Installed
+            # at model build because it WARMS a sub-process group, and a communicator built lazily
+            # under CUDA-graph capture is fatal.
             from skyrl.backends.skyrl_train.isoexec.ops.attention.qkv_subgroup_gather import (
                 install_engine_qkv_subgroup_ag,
             )
 
             install_engine_qkv_subgroup_ag(self.gpt, side="ENGINE")
 
-            # Sampler patches HERE, in the worker process where the sampler runs -- doing it in the
-            # engine actor does not reach the worker. TWO logprob sites, only one of which executes:
-            # patch_vllm_logprobs_batch_invariant rebinds the Model Runner V2 module (INERT on the
-            # V1 GPUModelRunner this composition resolves -- see its docstring for the live-counter
-            # proof), and patch_vllm_sampler_logprobs_rowinv hooks the V1 Sampler.compute_logprobs
-            # that actually produces sampled AND prompt logprobs (installed unconditionally --
-            # rowinv is the composed logprob at every site; only a failed import leaves the V1
-            # sampler untouched, and that shows up as served=0 at the engagement boundary).
+            # Sampler patches HERE, in the worker process where the sampler runs; the engine actor
+            # does not reach it. Two logprob sites are patched but only the V1
+            # Sampler.compute_logprobs hook executes -- the V2 rebind is inert on this runner.
             if self._local_spec:
                 try:
                     from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.vllm_patches import (
@@ -692,10 +609,9 @@ class GPTModelVLLMWrapper(nn.Module):
                     print(f"[ISOEXEC-WRAP] logprob patch failed: {type(_e).__name__}: {_e}", flush=True)
             else:
                 _logprob_patched = False
-            # The install sequence is finished: record what each family actually bound and compare it
-            # against this process's contract once. Always build the worker's contract (idempotent,
-            # cached) -- the handshake at create_receiver reads it, and a worker without one silently
-            # skips the check.
+            # Record what each family actually bound and compare against this process's contract.
+            # Always build the worker's contract: the create_receiver handshake reads it, and a
+            # worker without one silently skips the check.
             from ...core.process_contract import get_process_contract
 
             get_process_contract(model_path)
@@ -707,10 +623,8 @@ class GPTModelVLLMWrapper(nn.Module):
                 _assert_engine_nccl_manifest(model_path)
             _record_engine_install_fingerprint(self, cfg, logprob_patched=_logprob_patched)
 
-        # run_install: build_contract -> check_all_claims -> _isoexec_install() -> INSTALL
-        # boundary (every obligation the contract derives for the engine side must have a record;
-        # missing == violation; deliberate refusals propagate, internal ledger errors never do;
-        # gdn.state's install attestation is EXCEPTIONS-listed, recorded at first forward).
+        # run_install: build_contract -> check_all_claims -> _isoexec_install() -> INSTALL boundary.
+        # gdn.state is EXCEPTIONS-listed there; it is recorded at first forward instead.
         from ...core.adapter import set_process_adapter
         from .adapter import VLLMContractAdapter
 
@@ -733,14 +647,11 @@ class GPTModelVLLMWrapper(nn.Module):
         return self.embed_input_ids(input_ids)
 
     def forward(self, input_ids=None, positions=None, inputs_embeds=None, **kwargs):
-        # With `rope_parameters.mrope_section` in the HF config vLLM feeds MRoPE positions of shape
-        # [3, T], while the Megatron text bridge uses plain 1-D RoPE. For a text-only request all
-        # three rows are identical, so collapse to the temporal row and refuse anything else rather
-        # than silently rotating at the wrong angle.
+        # vLLM feeds MRoPE positions of shape [3, T] while the text bridge uses 1-D RoPE. For a
+        # text-only request all three rows are identical, so collapse and refuse anything else.
         if positions is not None and positions.ndim == 2 and positions.shape[0] == 3:
-            # `torch.equal` returns a python bool, so it is a D2H sync and is illegal under stream
-            # capture. Skipping it while capturing is safe: the guard is about the request TYPE,
-            # which is fixed for a text-only engine, and every real forward still checks.
+            # `torch.equal` is a D2H sync and illegal under stream capture. Skipping it there is
+            # safe: the guard is about the request TYPE, and every real forward still checks.
             if not torch.cuda.is_current_stream_capturing() and not (
                 torch.equal(positions[0], positions[1]) and torch.equal(positions[0], positions[2])
             ):
@@ -750,16 +661,14 @@ class GPTModelVLLMWrapper(nn.Module):
                 )
             positions = positions[0]
 
-        # vLLM varlen [total_tokens] -> Megatron [b=1, seq]. GPTModel applies RoPE internally;
-        # attention is the swapped vLLM paged layer (ignores attention_mask, uses vLLM metadata).
+        # vLLM varlen [total_tokens] -> Megatron [b=1, seq]. The swapped paged attention ignores
+        # attention_mask and uses vLLM's own metadata.
         tokens = input_ids.unsqueeze(0)
         pos = positions.unsqueeze(0)
         self._rope.set_positions(positions.reshape(-1))  # absolute positions for RoPE
         out = self.gpt(input_ids=tokens, position_ids=pos, attention_mask=None)
-        # post_process=True  -> logits, already transposed to [b, s, vocab] (gpt_model.py:765).
-        # post_process=False -> hidden states in Megatron layout [s, b, h], NOT transposed
-        #                       (_postprocess returns early). b == 1 here either way, so the same
-        #                       reshape yields token-major rows in both cases.
+        # post_process=True gives logits as [b, s, vocab]; False gives hidden states as [s, b, h].
+        # b == 1 either way, so the same reshape yields token-major rows.
         if out.dim() == 3:
             out = out.reshape(-1, out.shape[-1])
         return out
@@ -767,13 +676,11 @@ class GPTModelVLLMWrapper(nn.Module):
     def compute_logits(self, hidden_states, sampling_metadata=None):
         if not self._split_lm_head:
             return hidden_states  # forward already produced the logits
-        # Replicates GPTModel._postprocess on the sampled rows only. ColumnParallelLinear is generic
-        # over leading dims, so the 2-D row block is a valid input. Bitwise equality with the fused
+        # Replicates GPTModel._postprocess on the sampled rows only. Bitwise equality with the fused
         # path relies on the matmul being M-invariant, which batch invariance provides.
         core = self._gpt_core
         output_weight = core.shared_embedding_or_output_weight() if core.share_embeddings_and_output_weights else None
-        # If anything upstream upcast the decoder output, come back down: bf16 -> fp32 -> bf16 is
-        # exactly lossless, so this cannot perturb the bits.
+        # Come back down if anything upstream upcast: bf16 -> fp32 -> bf16 is exactly lossless.
         w_dtype = (output_weight if output_weight is not None else core.output_layer.weight).dtype
         if hidden_states.dtype != w_dtype:
             hidden_states = hidden_states.to(w_dtype)
@@ -781,10 +688,9 @@ class GPTModelVLLMWrapper(nn.Module):
         return core._scale_logits(logits)
 
     def load_weights(self, weights_iter):
-        # Native sync: copy any native-named incoming params straight into self.gpt. At vLLM build
-        # time the names are HF-checkpoint names and all miss, which is harmless because the bridge
-        # already populated self.gpt. Always return the full param-name set so vLLM's "all weights
-        # initialized" check passes.
+        # Native sync: copy native-named incoming params straight into self.gpt. At build time the
+        # names are HF-checkpoint names and all miss, which is harmless. Always return the full
+        # param-name set so vLLM's "all weights initialized" check passes.
         all_names = {"gpt." + n for n, _ in self.gpt.named_parameters()}
         dst = dict(self.gpt.named_parameters())
         dst.update(dict(self.gpt.named_buffers()))
@@ -817,18 +723,9 @@ class GPTModelVLLMWrapper(nn.Module):
     def _isoexec_debug_set_step(self) -> None:
         """Key this engine's trace records to the trainer's optim_step counter (debug mode only).
 
-        The engine has no step of its own, so the honest source is the weight-sync count: the
-        trainer bumps its counter in ``optim_step`` and syncs immediately after, and the rollout the
-        engine then generates is the one the trainer scores at that counter's value. The train loop
-        syncs ONCE before the first optim_step (trainer.py: ``sync_weights`` before the epoch loop),
-        so the Nth effective sync carries the weights of optim_step N-1 -- that inherent offset is
-        applied here rather than left for the comparator, which would otherwise pair each engine
-        step with the trainer step after it. The first sync is deliberately left unkeyed: the
-        trainer has not called ``set_step`` yet either, so both sides sample the first rollout by
-        call ordinal and switch to step keying at the same moment.
-
-        Counted on effective loads only: vLLM also calls ``load_weights`` at build time with
-        HF-checkpoint names, which all miss (the bridge already populated ``self.gpt``).
+        The engine has no step of its own, so the weight-sync count stands in. The train loop syncs
+        once before the first optim_step, so the Nth sync carries the weights of optim_step N-1;
+        that offset is applied here. The first sync stays unkeyed, matching the trainer.
         """
         try:
             from ...debug.trace import enabled
@@ -847,20 +744,16 @@ class GPTModelVLLMWrapper(nn.Module):
 class GPTModelVLLMHybridWrapper(GPTModelVLLMWrapper):
     """The wrapper for GatedDeltaNet hybrids (Qwen3.5). Identical compute; only the flag differs.
 
-    ``is_hybrid`` tells vLLM to reconcile the attention and mamba page sizes and to set
-    ``cache_config.mamba_block_size``. It is read off the CLASS before any instance exists, and the
-    answer is cached to disk per class name -- hence a separate class rather than an env-dependent
-    attribute on the dense one.
+    ``is_hybrid`` is read off the CLASS before any instance exists and cached to disk per class
+    name, hence a separate class rather than an env-dependent attribute on the dense one.
     """
 
     is_hybrid = True
 
     @classmethod
     def get_mamba_state_copy_func(cls):
-        """(conv, ssm) slice layout of one mamba block, used by the model runner's per-step state
-        copy. Our state layers use the same shape calculator as the native model, so the native GDN
-        copy specs are correct. Only consulted when ``cache_config.mamba_cache_mode == 'align'``.
-        """
+        """(conv, ssm) slice layout of one mamba block; only consulted under mamba_cache_mode
+        'align'. The native GDN specs apply since our state layers use the same shape calculator."""
         from vllm.model_executor.layers.mamba.mamba_utils import (
             MambaStateCopyFuncCalculator,
         )
@@ -891,9 +784,8 @@ def _engine_nccl_runtime_identity():
 def _assert_engine_nccl_manifest(model_path: str) -> None:
     """Build and validate the active engine process's cap-aware contract.
 
-    vLLM Ray workers are distinct processes, so a contract cached by the engine actor or EngineCore
-    is not visible here -- build it idempotently from the model path rather than relying on
-    ``cached_contract_view()``, which fails in every nested worker.
+    vLLM Ray workers are distinct processes, so a contract cached by the engine actor is not visible
+    here; build it from the model path rather than relying on ``cached_contract_view()``.
     """
     from ...core.process_contract import cached_contract_view, get_process_contract
     from ...ops.collectives.nccl_identity import assert_contract_matches
@@ -906,12 +798,9 @@ def _assert_engine_nccl_manifest(model_path: str) -> None:
 def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -> None:
     """Record what the ENGINE adapter just installed, per op family, then log the comparison.
 
-    Recorded here because the adapter is the one place that knows WHICH SIDE it is on: the trainer
-    can share this process, so an op module recording its own rebind would have to guess. Each
-    impl_id is read off the state the install actually reached -- a swap count, a post-install flag,
-    a live predicate -- never off the manifest or a launcher's intent, and a family that did not
-    install records ``NOT_INSTALLED`` rather than staying silent. Fail-soft: a fingerprint bug must
-    never break an engine build.
+    Recorded here because the adapter is the one place that knows which side it is on. Each impl_id
+    is read off the state the install actually reached, never off the manifest or a launcher's
+    intent; a family that did not install records ``NOT_INSTALLED``. Fail-soft.
     """
     try:
         from ...core.adapter import live_pins, log_unreported_pins
@@ -944,15 +833,9 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
                 "norms.gated_out", ENGINE_SITES, "fused" if (_fused_norms and fused_outnorm_enabled()) else "eager"
             )
 
-        # ENGINE logprobs: attest the site that EXECUTES on this runner, never a patch's intent.
-        # A patch's return value is not evidence: patch_vllm_logprobs_batch_invariant() rebinds a
-        # Model Runner V2 module, and this arch resolves the V1 GPUModelRunner, so attesting off it
-        # would declare an impl that is never called. The record below is read off the LIVE V1
-        # sampler class instead (sampler_logprobs_hook_state inspects Sampler.compute_logprobs):
-        # rowinv_leaftree only when the full-row hook is verifiably bound at the site the V1 runner
-        # calls for both sampled and prompt logprobs; run-time engagement is judged separately by
-        # the rowinv served census (rowinv_engagement_boundary). Anything else records
-        # NOT_INSTALLED, so the comparator sees the disagreement instead of an attested fiction.
+        # ENGINE logprobs: attest the site that EXECUTES on this runner, never a patch's intent. The
+        # record is read off the live V1 Sampler class; anything else records NOT_INSTALLED so the
+        # comparator sees the disagreement rather than an attested fiction.
         try:
             from .vllm_patches import sampler_logprobs_hook_state
 
@@ -964,8 +847,7 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
             "logprobs.log_softmax",
             ENGINE_SITES,
             "rowinv_leaftree" if _rowinv_live else NOT_INSTALLED,
-            # Pins read off the live install (rowinv.BLOCK, the kernel's own env read), not echoed
-            # from the contract; None when nothing IsoExec-owned is bound at the executing site.
+            # Pins read off the live install, not echoed from the contract.
             pinned=live_pins("logprobs.log_softmax") if _rowinv_live else None,
         )
         if not _rowinv_live:
@@ -985,8 +867,8 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
             from ...ops.collectives.pik_tp_invariant import pik_enabled
 
             _pik = "pik_tree" if pik_enabled() else NOT_INSTALLED
-            # Pins off the ReductionPlan the install actually built, not off the env vars that asked
-            # for it, so "the flag arrived and the plan was built differently" is visible.
+            # Pins off the ReductionPlan the install actually built, not the env vars that asked for
+            # it, so a plan built differently from the flag stays visible.
             record_installs(
                 "collectives.tree_all_reduce",
                 ENGINE_SITES,
@@ -994,8 +876,7 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
                 pinned=live_pins("collectives.tree_all_reduce") if pik_enabled() else None,
             )
             record_installs("collectives.row_parallel", ENGINE_SITES, _pik)
-            # "Did the unpin actually happen" is the fact a reader needs, and it is otherwise
-            # visible only as a print inside a worker.
+            # Whether the unpin actually happened is otherwise visible only as a worker print.
             _nccl_impl, _nccl_constants = _engine_nccl_runtime_identity()
             record_installs(
                 "collectives.nccl_pin",
@@ -1034,7 +915,7 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
             record_installs("moe.blockmap", ENGINE_SITES, "fused" if fused_blockmap_enabled() else NOT_INSTALLED)
 
         # gdn.* records itself where it binds: its state core is built at the first
-        # metadata-bearing forward, after this point, and that is when the pool becomes a fact.
+        # metadata-bearing forward, after this point.
         _view = cached_contract_view()
         log_fingerprint_once(_view, tag="engine_install")
         log_unreported_pins(_view)
@@ -1055,11 +936,8 @@ _WRAPPER_IMPORT_PATH = _wrapper_import_path()
 def register_gptmodel_to_vllm(model_path: str | None = None):
     """Register the GPTModel-backed wrapper with vLLM. Call before engine init.
 
-    Uses vLLM's STRING registration form (``module:ClassName``) so the registration survives
-    across vLLM's mp/async worker subprocesses (each worker lazily imports the class). The
-    wrapper derives the model path from ``vllm_config`` at build time, so no closure is needed.
-    Set the engine's ``hf_overrides={"architectures": [VLLM_MODEL_NAME]}`` so vLLM builds this
-    class instead of the model's native architecture.
+    Uses vLLM's STRING registration form so the registration survives across worker subprocesses.
+    Set ``hf_overrides={"architectures": [VLLM_MODEL_NAME]}`` so vLLM builds this class.
     """
     from vllm.model_executor.models.registry import ModelRegistry
 
@@ -1076,7 +954,7 @@ def register_gptmodel_to_vllm(model_path: str | None = None):
     }.get(VLLM_MODEL_NAME)
     if base is None:
         # A capability tuple with no shipped class: generate one. Only the class-level protocol
-        # answers vLLM reads before instantiation differ; the compute is the same.
+        # answers differ; the compute is the same.
         base = synthesize(caps)
     if model_path is not None:  # legacy closure form (single-process / standalone tests)
 
@@ -1091,10 +969,8 @@ def register_gptmodel_to_vllm(model_path: str | None = None):
         ModelRegistry.register_model(VLLM_MODEL_NAME, _WRAPPER_IMPORT_PATH)
     logger.info("[isoexec] registered %s into vLLM ModelRegistry", VLLM_MODEL_NAME)
 
-    # Hybrid (GDN) models need vLLM's hybrid config pass: it is what sets
-    # `cache_config.mamba_block_size` (without it `MambaBase.get_kv_cache_spec` asserts) and lets
-    # the platform reconcile the attention and mamba page sizes. vLLM selects that pass by
-    # ARCHITECTURE NAME, and `hf_overrides` has just replaced the architecture with ours.
+    # Hybrid (GDN) models need vLLM's hybrid config pass to set `cache_config.mamba_block_size` and
+    # reconcile page sizes. vLLM selects it by ARCHITECTURE NAME, which `hf_overrides` just changed.
     if needs_hybrid_config_pass(caps):
         from vllm.model_executor.models.config import (
             MODELS_CONFIG_MAP,
@@ -1107,8 +983,7 @@ def register_gptmodel_to_vllm(model_path: str | None = None):
 
 
 def find_inprocess_gptmodel(llm):
-    """Reach the in-process GPTModelVLLMWrapper inside a vLLM LLM (VLLM_ENABLE_V1_MULTIPROCESSING=0)
-    so the trainer can native-sync weights into the rollout model each step."""
+    """Reach the in-process GPTModelVLLMWrapper inside a vLLM LLM (VLLM_ENABLE_V1_MULTIPROCESSING=0)."""
     seen = set()
 
     def walk(o, d=0):

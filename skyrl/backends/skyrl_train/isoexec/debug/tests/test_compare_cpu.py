@@ -1,12 +1,7 @@
-"""CPU guarantees for the offline trace comparator (``debug/compare.py``).
+"""CPU tests for the offline trace comparator (``debug/compare.py``).
 
-Covers: correct first-divergence (region and layer) on synthetic traces built to diverge at a
-known point, magnitude extraction from the k-ladder, call->layer folding via --layers, case
-filtering, shape-mismatch reporting, exit codes, and an end-to-end run where traces are produced
-by the real capture layer on real tensors.
-
-Run (CPU only):
-    python skyrl/backends/skyrl_train/isoexec/debug/tests/test_compare_cpu.py
+Covers first-divergence location, k-ladder magnitude, call->layer folding, case filtering,
+shape mismatches, JSON caps, exit codes, and an end-to-end run through the real capture layer.
 """
 
 from __future__ import annotations
@@ -121,7 +116,6 @@ def test_case_filtering_and_unaligned():
         rep = compare.compare(compare.load_dir(a), compare.load_dir(b), case_a="trainer_score", case_b="engine_prefill")
         s = rep["regions"]["r"]
         assert (s["compared"], s["matched"], s["mismatched"], s["unaligned"]) == (1, 1, 0, 1)
-        # The record B has and A does not is a divergence, located, not a bare count
         fd = rep["first_divergence"]
         assert fd["kind"] == "absent" and fd["absent_in"] == "A" and fd["call"] == 2
         assert rep["status"] == "divergent"
@@ -182,7 +176,6 @@ def test_end_to_end_with_real_capture():
         layers = 4
         # values in [1, 1.4): the ~2**-6 relative bump below never crosses an exponent boundary
         outs = [(torch.rand(64, 32) * 0.4 + 1.0).bfloat16() for _ in range(layers)]
-        # engine reproduces trainer exactly except layer 2, off by ~2**-6 relative
         outs_b = [o.clone() for o in outs]
         outs_b[2] = (outs_b[2].float() * (1.0 + 2.0**-6)).bfloat16()
 
@@ -216,8 +209,7 @@ def test_end_to_end_with_real_capture():
         assert (s["compared"], s["matched"], s["mismatched"]) == (4, 3, 1)
         fd = rep["first_divergence"]
         assert fd["layer"] == 2
-        # ~2**-6 bump breaks the fine rungs; sign+exponent (k0) still agrees -> a bracket,
-        # not a saturated verdict
+        # the bump breaks the fine rungs but k0 (sign+exponent) agrees -> a bracket, not saturation
         assert fd["agree_k"] == 0 and fd["magnitude"].startswith("between ~2^-2 and 2^-0")
     finally:
         for k, v in saved.items():
@@ -238,7 +230,7 @@ def _fully_divergent(n_per_region=300, regions=("gdn.core", "moe.router")):
 
 
 def test_json_cap_trims_per_region_but_keeps_counts():
-    """P7: a fully divergent run serialized 66MB of near-identical mismatch records."""
+    """Capping trims per-region mismatch lists while leaving counts and the verdict intact."""
     rep = _fully_divergent()
     full = len(rep["divergences"])
     assert full == 600
@@ -277,7 +269,6 @@ def test_json_cap_shrinks_the_serialized_file(tmp_path=None):
         with open(small, "w") as f:
             json.dump(compare.cap_report(rep, 10), f, indent=2)
         assert os.path.getsize(small) < os.path.getsize(big) / 10
-        # and it is still valid, readable JSON with the verdict in it
         back = json.load(open(small))
         assert back["status"] == "divergent" and back["first_divergence"]["region"] == "gdn.core"
     finally:

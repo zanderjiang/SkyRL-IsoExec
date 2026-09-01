@@ -1,11 +1,9 @@
 """Multi-rank, no-model harness for the distributed sampled-logprob seam.
 
-Gates the ``logprobs.lm_head_slice:sampled_rows`` extract path and the
-``SKYRL_ISOEXEC_EXACT_SAMPLED_LOGPROBS`` source, bitwise via torch.equal on the fp32 words, over
-the live TP gather wire. Both sides of the source are exercised via separate processes
-(``--fixed-source-mode incumbent|candidate``): the admission vote pins the env per process, so an
-in-process flip refuses as structural drift. Promoted from the private repo's nightly
-logprob_extract_4rank.py.
+Gates the ``logprobs.lm_head_slice:sampled_rows`` extract path and the exact-sampled source
+bitwise over the live TP gather wire. Each source side needs its own process
+(``--fixed-source-mode``), since the admission vote pins the env per process.
+
 CI: SKYRL_ISOEXEC=1 torchrun --standalone --nproc-per-node=4 <thisfile>.
 """
 

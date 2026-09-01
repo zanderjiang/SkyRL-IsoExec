@@ -1,11 +1,7 @@
 """Adapt Megatron ``GatedDeltaNet`` layers for execution inside vLLM.
 
-``IsoExecGDNStateLayer`` registers each GDN layer with vLLM so the scheduler supplies Mamba metadata
-and slot identities, while ``swap_gdn_core`` keeps Megatron's projections, weights, normalization and
-output modules and routes only the stateful core through the IsoExec implementation. In CPR
-mode the vLLM Mamba tensors are minimal slot-name pages and the real state lives in
-``CprGDN``; native-state recurrent mode binds the vLLM tensors directly. Engine-only, enabled
-by ``SKYRL_ISOEXEC_GDN=1``.
+``IsoExecGDNStateLayer`` registers each layer with vLLM for Mamba metadata and slot ids;
+``swap_gdn_core`` routes only the stateful core through IsoExec. Enabled by ``SKYRL_ISOEXEC_GDN=1``.
 """
 
 from __future__ import annotations
@@ -27,12 +23,10 @@ _state_cls = None
 
 
 def state_layer_cls():
-    """Build ``IsoExecGDNStateLayer`` on first use.
+    """Build ``IsoExecGDNStateLayer`` on first use (lazily, so the trainer can import this module).
 
-    It must genuinely subclass ``MambaBase``: vLLM enumerates KV-cache layers with an ``isinstance``
-    filter, so a duck-typed layer is invisible and the engine runs with an empty
-    ``GDNAttentionMetadata``. Built lazily so this module stays importable in the trainer process,
-    which has no vLLM.
+    It must genuinely subclass ``MambaBase``: vLLM enumerates KV-cache layers with ``isinstance``,
+    so a duck-typed layer is invisible and the engine runs with empty ``GDNAttentionMetadata``.
     """
     global _state_cls
 
@@ -49,10 +43,8 @@ def state_layer_cls():
     class IsoExecGDNStateLayer(nn.Module, MambaBase):
         """vLLM-visible GDN state layer: owns the GDN core, borrows Megatron's weights.
 
-        In chunk mode the ``kv_cache`` tensors vLLM allocates are unused -- what is needed is the
-        bookkeeping the allocation buys: a per-request slot id and the prefill/decode split, delivered
-        as ``GDNAttentionMetadata``. Recurrent mode can use the blocks directly
-        (``SKYRL_ISOEXEC_GDN_NATIVE_STATE=1``); see ``gdn_recurrent_state.RecurrentGDN``.
+        In chunk mode the allocated ``kv_cache`` tensors are unused; only the bookkeeping they buy
+        (slot id, prefill/decode split) matters. Recurrent mode can use the blocks directly.
         """
 
         def __init__(self, *, vllm_config, prefix: str, gdn):
@@ -79,9 +71,8 @@ def state_layer_cls():
 
             self.kv_cache = (torch.tensor([]), torch.tensor([]))
             self._cc = None
-            # Build the CPR core EAGERLY at model-build time: a lazy first build would land
-            # on the CUDA-graph capture run, and the sleepable-pool allocation aborts the worker if it
-            # happens under stream capture. Weights are re-read every call anyway.
+            # Build the CPR core eagerly: a lazy first build would land on the CUDA-graph capture
+            # run, and the sleepable-pool allocation aborts the worker under stream capture.
             from ...ops.gdn.gdn_ops import cpr_mode as _cpr_mode
 
             if _cpr_mode():
@@ -115,9 +106,8 @@ def state_layer_cls():
                     prefix,
                     self.max_num_seqs,
                 )
-            # (data_ptr, shape) of the ssm tensor `_cc` was built against. vLLM binds kv_cache more
-            # than once on the CUDA-graph path -- a throwaway profiling cache, then the real one -- so
-            # `_state` compares this key per forward and rebuilds against the real tensors.
+            # (data_ptr, shape) of the ssm tensor `_cc` was built against. vLLM binds kv_cache twice
+            # on the CUDA-graph path, so `_state` compares this key per forward and rebuilds.
             self._native_kv_key = None
             self._min_profiling_blocks = vllm_config.compilation_config.max_cudagraph_capture_size or 1
 
@@ -131,11 +121,9 @@ def state_layer_cls():
             return MambaAttentionBackendEnum.GDN_ATTN
 
         def get_state_shape(self):
-            # Chunk mode keeps all state in CprGDN's private pools and uses the vLLM pages
-            # only as a slot-id source, so they shrink to bytes. MUST agree with
-            # GPTModelVLLMWrapper.get_mamba_state_shape_from_config: vLLM sizes and pads pages from
-            # that at config time and carves the runtime tensors from this spec, and a full-size spec
-            # over a minimally-padded page fails page unification.
+            # Chunk mode uses the vLLM pages only as a slot-id source, so they shrink to bytes. MUST
+            # agree with GPTModelVLLMWrapper.get_mamba_state_shape_from_config, which sizes and pads
+            # the pages at config time: a full-size spec over a minimal page fails page unification.
             from ...ops.gdn.gdn_ops import GDN_CPR_MIN_STATE_SHAPES, gdn_cpr_min_pages
 
             if gdn_cpr_min_pages():
@@ -160,9 +148,7 @@ def state_layer_cls():
         def _native_state_tensors(self):
             """vLLM's own mamba ``kv_cache`` (conv, ssm), oriented for RecurrentGDN.
 
-            ``kv_cache`` is bound as ``(conv_state, ssm_state)``. Conv is stored SD
-            ``(num_blocks, W-1, D)`` by default or DS ``(num_blocks, D, W-1)``; RecurrentGDN wants DS,
-            so transpose the last two dims under SD.
+            Conv is stored SD or DS; RecurrentGDN wants DS, so transpose the last two dims under SD.
             """
             from vllm.model_executor.layers.mamba.mamba_utils import (
                 is_conv_state_dim_first,
@@ -178,9 +164,8 @@ def state_layer_cls():
             dim_first = is_conv_state_dim_first()
             conv_state = kv[0] if dim_first else kv[0].transpose(-1, -2)
             cc = self.cache_config
-            # On the CUDA-graph path this build runs twice: once against the throwaway profiling
-            # cache, then against the real one. The profiling bind's tensors never see a real request,
-            # so it is flagged in the log and skipped by the adequacy warning below.
+            # The profiling bind's tensors never see a real request, so it is flagged in the log and
+            # skipped by the adequacy warning below.
             profiling_bind = (
                 ssm_state.shape[0] == self._min_profiling_blocks
                 and getattr(cc, "num_gpu_blocks", None) == self._min_profiling_blocks
@@ -206,10 +191,8 @@ def state_layer_cls():
                 self.max_num_seqs,
                 profiling_bind,
             )
-            # Mamba block ids stride by 2, so the id space reaches ~2*max_num_seqs. A state tensor
-            # with fewer rows can hand a real request an id past the end, and under CUDA graphs the
-            # per-step overflow check host-syncs and cannot run -- the state would corrupt silently.
-            # Build time is the only capture-safe place to catch it.
+            # Mamba block ids stride by 2, so the id space reaches ~2*max_num_seqs; a smaller state
+            # tensor overflows silently under CUDA graphs, and build time is the only safe check.
             need = 2 * self.max_num_seqs
             if not profiling_bind and ssm_state.shape[0] < need:
                 logger.warning(
@@ -243,12 +226,8 @@ def state_layer_cls():
             conv_weight = gdn.conv1d.weight.squeeze(1)  # [D, W]
             conv_bias = gdn.conv1d.bias if gdn.conv_bias else None
 
-            # Native state: re-check the kv_cache binding every call. vLLM binds kv_cache twice on
-            # the CUDA-graph path, and a core built against the discarded profiling cache walks off
-            # the end of the tensor once the scheduler issues ids from the real pool. Rebuilding is
-            # cheap and settles at the first forward after the real bind; warmup and capture both run
-            # after initialize_kv_cache, so captured graphs pin the real tensors. Host-only reads,
-            # safe under capture.
+            # Native state: re-check the kv_cache binding every call, since a core built against the
+            # discarded profiling cache walks off the end. Host-only reads, safe under capture.
             if self._cc is not None and getattr(self._cc, "_native", False):
                 kv = self.kv_cache
                 key = (kv[1].data_ptr(), tuple(kv[1].shape)) if len(kv) > 1 and kv[1].numel() else None
@@ -325,9 +304,7 @@ def state_layer_cls():
                 )
                 from ...core.process_contract import cached_contract_view
 
-                # Pins off the pool that was built, not off the profile that asked for it: the
-                # boundary dtype (and C) are the contract's only representation of the state the
-                # trainer's segmented scan has to match.
+                # Pin off the pool that was built, not the profile that asked for it.
                 _state_dtype = str(getattr(self._cc.ssm_state, "dtype", "")).split(".")[-1]
                 if isinstance(self._cc, CprGDN):
                     # Its own fp32 entry states + open-chunk buffers; vLLM's state pages are a
@@ -341,10 +318,8 @@ def state_layer_cls():
                 log_fingerprint_once(cached_contract_view(), tag="engine_first_forward")
             except Exception as _e:  # pragma: no cover - never fatal
                 logger.warning(f"[ISOEXEC-FINGERPRINT] gdn.state record skipped: {_e}")
-            # FIRST_FORWARD boundary, outside the fail-soft block above, via the process's
-            # ContractAdapter: fingerprint compare (once per tag), the delivered-composition
-            # backstop (validate_contract_against_installed), and the phase close refusing any
-            # contract-derived fingerprint obligation with no record. Deliberate refusals propagate.
+            # FIRST_FORWARD boundary, outside the fail-soft block above: deliberate refusals from
+            # the fingerprint compare and the phase close must propagate.
             from ...core.adapter import process_adapter
 
             _adapter = process_adapter()
@@ -375,10 +350,8 @@ def state_layer_cls():
 def _gdn_inference_forward(self, hidden_states, attention_mask=None, **kwargs):
     """Replacement ``GatedDeltaNet.forward`` for the in-vLLM GPTModel. Returns ``(out, bias)``.
 
-    Mirrors Megatron's own forward step for step (``in_proj`` -> split -> conv/chunk core ->
-    ``_apply_gated_norm`` -> ``out_proj``), with the conv+core step served by CprGDN
-    instead of one full-sequence chunk call. CP/SP are not supported here (the IsoExec recipe runs
-    CP=1), so the all-to-alls Megatron does around the core are skipped rather than faked.
+    Mirrors Megatron's forward step for step with the conv+core step served by CprGDN. CP/SP are
+    unsupported here (the recipe runs CP=1), so Megatron's all-to-alls are skipped, not faked.
     """
     if self.cp_size != 1 or self.sp_size != 1:
         raise NotImplementedError("[isoexec-gdn] in-vLLM GDN requires cp_size == sp_size == 1")
@@ -407,9 +380,8 @@ def _gdn_inference_forward(self, hidden_states, attention_mask=None, **kwargs):
     if core is None:  # profiling run: shape-correct zeros, no state touched
         core = qkv.new_zeros(s, self.num_value_heads // self.tp_size, self.value_head_dim)
 
-    # Fused gated output norm. This call site is engine-only (`swap_gdn_core` binds it, the trainer
-    # never does), so the kernel cannot reach the trainer the way rebinding `_apply_gated_norm` would;
-    # it sits above the chunk/recurrent split, so it serves both GDN modes.
+    # Fused gated output norm. Engine-only call site (the trainer never binds it), and above the
+    # chunk/recurrent split, so it serves both GDN modes.
     gate4 = gate.reshape(1, s, -1, self.value_head_dim)
     out_norm = getattr(self, "out_norm", None)
     if getattr(out_norm, "_ix_fused_norm", False) and getattr(self, "activation", None) == "silu":
@@ -424,11 +396,10 @@ def _gdn_inference_forward(self, hidden_states, attention_mask=None, **kwargs):
 
 
 def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
-    """Attach a vLLM state layer to every Megatron ``GatedDeltaNet`` and swap in the inference path.
+    """Attach a vLLM state layer to every Megatron ``GatedDeltaNet``; returns the number swapped.
 
-    Returns the number of GDN layers swapped. Must run BEFORE vLLM allocates the KV cache, i.e.
-    during model construction, so the state layers are in ``static_forward_context`` when the KV
-    cache manager enumerates them.
+    Must run during model construction, before vLLM allocates the KV cache, so the state layers are
+    in ``static_forward_context`` when the KV cache manager enumerates them.
     """
     if os.environ.get("SKYRL_ISOEXEC_GDN") != "1":
         return 0
@@ -446,8 +417,8 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
     pin_fla_autotune_configs()
     pin_gdn_rmsnorm_rows_per_block()
     if cpr_mode():
-        # cpr always runs the lazy resync driver on the engine: it removes the per-step
-        # host sync even eager, and is what makes decode capturable under CUDA graphs.
+        # The lazy resync driver removes the per-step host sync, which is what makes decode
+        # capturable under CUDA graphs.
         install_cpr_lazy_driver()
     # The GDN layers are batch-invariant under chunk-consistent decode, so let the rest of the model
     # (softmax attention, GEMMs, log_softmax) be made invariant too.
@@ -475,8 +446,8 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
             "(vLLM-registered mamba state)",
             flush=True,
         )
-    # Fingerprint the engine's gdn.core / gdn.conv install. The mode is read from the same call-time
-    # predicate the kernels use, so a manifest that disagrees with the exported flag is caught.
+    # Fingerprint the gdn.core / gdn.conv install. The mode is read from the same call-time
+    # predicate the kernels use, so a manifest disagreeing with the exported flag is caught.
     try:
         from ...core.fingerprint import (
             DECODE_ONLY,
@@ -503,9 +474,8 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
 
         if n:
             _core = "native_fused_sigmoid" if (_nk() and (_rec() or _cpr())) else _mode()
-            # The pin carries the kernel the native impl runs, as the trainer site does:
-            # `native_fused_sigmoid` alone cannot distinguish a recurrent build from a cpr
-            # one, and the contract pins exactly that.
+            # The pin carries the kernel the native impl runs: `native_fused_sigmoid` alone cannot
+            # distinguish a recurrent build from a cpr one, and the contract pins exactly that.
             record_installs("gdn.core", ENGINE_SITES, _core, _gdn_inference_forward, pinned={"kernel": _mode()})
             # Distinct kernels per site: the fn form at prefill, the update form at decode.
             _conv_native = _nconv() or _cpr()

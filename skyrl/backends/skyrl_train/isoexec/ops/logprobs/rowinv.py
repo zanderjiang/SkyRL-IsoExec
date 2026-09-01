@@ -1,87 +1,10 @@
 """Row-count- and TP-invariant sampled-token logprob via a fixed-leaf exp-sum tree.
 
-WHY. ATen's fp32 full-vocabulary ``sum`` is not row-count invariant at V=248320: the trainer
-reduces ``[B, chunk, V]`` while the engine reduces only the sampled rows ``[N, V]``, and the two
-launch geometries pick different fp32 reduction trees, so the lse differs by 1-2 ULP and ~72% of
-real Qwen3.5 tokens score non-bitwise even with bitwise-identical logits. The trainer additionally
-scores at TP=4 while the engine decodes at TP=8, so the same reduction is also split across ranks
-differently. Both defects are one defect -- an unpinned reduction expression -- and this module
-pins it pik-style (see ``ops/collectives/pik/plan.py``):
-
-  * the FULL vocabulary ``[0, V)`` is cut into ``G`` fixed contiguous leaves, ``G =
-    SKYRL_ISOEXEC_PIK_LEAVES`` (the same contract constant pik uses, default 8). ``V % G != 0``
-    DECLINES -- unequal or padded leaves would be a different function, never a silent one;
-  * each per-row leaf sum of ``exp(x - m)`` is computed by ONE Triton program per (row, leaf)
-    with a fixed ``BLOCK``, iterating the leaf's columns in fixed ascending order and accumulating
-    in Kahan-compensated fp32. Per-program work depends only on that row's leaf, so the result is
-    row-count invariant by construction, and the leaf-internal order is pinned by the kernel;
-  * the ``G`` per-row leaf sums (G floats per row -- tiny) are all-gathered in rank order and
-    EVERY rank folds all G with the same fixed balanced binary tree -- the expression of
-    ``pik.plan.combine_order(G)`` -- in fp32. Never sequentially: the tree is the contract.
-
-TP only moves leaf OWNERSHIP. A rank at TP=C owns a contiguous leaf range
-(``rank_leaf_range``-equivalent: ``[rank*G/C, (rank+1)*G/C)``) which is exactly a subtree of the
-combine tree, so every C dividing G evaluates the identical expression -- the derivation is
-machine-checked in ``ops/collectives/tests/test_bf16_leaf_scheme_cpu.py``. The refuted
-anti-pattern -- each rank reduces its whole shard into one partial and the C partials are combined
--- rounds at rank boundaries that move with C and is NOT invariant; ``tests/rowinv_tp_dist.py``
-keeps it as a live negative control.
-
-The remaining two cross-rank steps are exact, hence free: the row max (local ``amax`` +
-``all_reduce(MAX)``; max is order-independent) and distributing the sampled raw logit (mask +
-``all_reduce(SUM)`` with exactly one nonzero contribution per row). The engine passes an
-already-gathered full ``[N, V]`` row (world=1 from this module's view: it computes all G leaves
-locally); the trainer passes its ``[..., V/TP]`` shard; both walk the same leaves in the same
-order and fold the same tree, so both produce identical bits. This also ELIMINATES the
-``[rows, V]`` fp32 full-vocabulary gather -- the wire carries ``rows*G`` fp32 leaf sums.
-
-DECODE-PATH COST. The engine calls this once per decode step at a handful of rows, where kernel
-count -- not bytes -- is the price, so the steady state is exactly three launches: ``amax``, the
-leaf kernel, and ONE fused finalize kernel that folds the G leaf sums, takes the log, gathers the
-sampled logit (world=1) and applies the padding mask. Fusing moves WHERE the arithmetic runs, not
-the expression: the finalize kernel's pairwise ``tl.split`` fold is the identical IEEE add
-sequence to ``combine_order(G)`` (left operand = lower leaf indices at every node) and
-``libdevice.log`` is bit-identical to ``torch.log`` on fp32 -- and neither fact is trusted: every
-probe call re-runs an eager torch ``combine_order`` fold on the same leaf sums and bit-compares,
-latching off onto the incumbent on any mismatch. Steady-state admission is a latched per-group hot
-route (tuple compare + dict hit, no contract rebuild, no host syncs); any env or layout change
-falls off the hot route into the full admission, which still RAISES on structural drift.
-
-BACKWARD. ``grad_x_j = g * (delta_{j,target} - exp(x_j - lse))`` for local columns j: rank-local,
-no collective, and only the per-row scalars ``lse = m + log(S)`` are saved -- not the ``[rows, V]``
-fp32 softmax the incumbent saves. Logits are accepted in bf16/fp16 as well as fp32; the KERNEL
-INPUT dtype stays pinned fp32 (in-kernel widening is REFUSED with a measurement: Triton's
-intra-block ``tl.sum`` order follows the load element width, and a bf16 load moves ~30% of leaf
-sums by 1 ULP at num_warps=4), so a narrow input is widened transiently inside the forward -- an
-exact widen, bit-identical to a pre-widened caller -- and the backward retains only the ORIGINAL
-narrow tensor (half the held bytes of a widened fp32 copy, and a free view when the caller passes
-a slice of a live activation) plus the per-row scalars. The gradient reaches
-only the optimizer and owes no bitwise contract; it is gated by allclose, not bit-equality.
-
-PROBE. The candidate is deliberately a DIFFERENT fp32 function from the incumbent ATen tree, so
-the end-to-end probe against ``reference()`` is a tight tolerance gate (live divergence vs ATen is
-1-2 ULP of the lse; observed mean |d| ~ 7.7e-7 on real Qwen3.5 logits), not ``torch.equal``. The
-bitwise claims -- row-count invariance and TP-invariance of the candidate against ITSELF -- are
-gated by ``tests/rowinv_gpu.py`` and ``tests/rowinv_tp_dist.py``. Because this function's bits
-differ from the incumbent's, it is composed on BOTH runtimes or neither: it is now the unflagged
-default at all four sites, so the "one side only" state it used to be flag-reachable from no
-longer exists.
-
-Admission is purely structural (env, dtypes, shapes, world, vocab partition, arch, kernel
-availability) and NEVER reads a tensor value: candidate and incumbent issue different collectives,
-so ranks must reach the same verdict by construction, sealed by a unanimous ``all_reduce(MIN)``
-vote per admitted signature per TP group. The structural facts split in two, exactly the split
-``ops/collectives/logprob_gather_wire.py`` draws: facts that select the COLLECTIVE SEQUENCE (env,
-device, world, vocabulary partition, G, arch capability, kernel availability) are immutable for
-the process and drift there RAISES; per-call payload facts (shapes, strides, logits/src/target
-dtypes) are eligibility fields of the signature, each new signature re-voted unanimously. The
-dtypes MUST be per-call: every collective here runs on the transiently-widened fp32 tensors
-whatever the input dtype, and one trainer process legitimately alternates bf16 (the scoring
-forward under ``SKYRL_ISOEXEC_SCORING_LOGITS_BF16``) with fp32 (the training forward, which
-``Float16Module`` upcasts) -- same bits either way, per the exact-widen contract above. Judge
-engagement only by ``served > 0`` in the census: composed is not executed, and a structural
-decline (unsupported layout, wrong arch, missing kernel) silently leaves the incumbent in charge
-until ``enforce.rowinv_engagement_boundary`` refuses at the next weight sync.
+The full vocabulary is cut into ``G`` fixed contiguous leaves (``SKYRL_ISOEXEC_PIK_LEAVES``);
+each per-row leaf sum of ``exp(x - m)`` is a Kahan fp32 Triton reduction in fixed column order,
+and the G leaf sums are folded by ``pik.plan.combine_order(G)``. Per-program work depends only
+on the leaf, so the result is row-count invariant; TP only moves leaf ownership between ranks
+(a contiguous leaf range is a subtree of the combine tree), so it is TP-invariant too.
 """
 
 from __future__ import annotations
@@ -95,8 +18,7 @@ import torch.distributed as dist
 LEAVES_ENV = "SKYRL_ISOEXEC_PIK_LEAVES"  # the same contract constant pik reads
 BANNER = "[ISOEXEC-ROWINV-LOGPROB]"
 PROBE_EVERY = 512
-# The candidate's lse differs from ATen's by 1-2 ULP (mean |d| ~ 7.7e-7 on real logits); a real
-# structural bug (wrong leaf offset, wrong max, wrong tree) lands orders of magnitude above this.
+# The candidate's lse differs from ATen's by 1-2 ULP; structural bugs land far above this.
 PROBE_MAX_ABS = 1e-4
 BLOCK = 4096  # fixed leaf-internal step: part of the numerics contract, never autotuned
 NUM_WARPS = 4  # pinned: tl.sum lowering depends on (BLOCK, num_warps); autotuning would move bits
@@ -119,12 +41,8 @@ _S = {
     "reported": 0,
     "bannered": False,
 }
-#: Probe latch for the FULL-ROW entry (``rowinv_full_logprobs``), separate from the per-group
-#: sampled-path latch: the two entries share the admission contract but probe different claims.
-#: ``fused`` is the single-kernel fast path's own verdict: ``None`` until first probed, ``True``
-#: while every probe bit-matches the eager letter, ``False`` demotes THIS OPTIMIZATION ONLY -- the
-#: entry keeps serving the eager rowinv path, so the trainer==engine bits are unaffected by a
-#: fused-kernel regression. ``shapes`` drives an extra probe on every new row count.
+#: Probe latch for the full-row entry. ``fused=False`` demotes only the single-kernel fast path
+#: (the eager rowinv path keeps serving, so trainer==engine bits are unaffected).
 _FULL_ROW = {
     "agreed": None,
     "served": 0,
@@ -134,9 +52,7 @@ _FULL_ROW = {
     "fused_reason": "",
     "shapes": set(),
 }
-#: Synthesized admission targets for the full-row entry, cached per device: the forward never
-#: reads them, so one zeros tensor per (device) -- grown geometrically -- replaces a per-call
-#: ``torch.zeros`` allocation+launch on the hot path.
+#: Synthesized admission targets for the full-row entry, cached per device.
 _FULL_TARGET: dict = {}
 
 
@@ -219,15 +135,14 @@ def _load_kernel():
 
         @triton.jit
         def leaf_sum_exp(out_ptr, x_ptr, row_max_ptr, row_stride, out_stride, L: tl.constexpr, BLOCK: tl.constexpr):
-            # One program per (row, local leaf). The loop bounds, step, and masking depend only on
-            # the leaf geometry (L, BLOCK) -- never on the grid -- so the leaf sum is identical for
-            # any row count and for whichever rank owns the leaf.
+            # One program per (row, local leaf). Loop bounds, step and masking depend only on the
+            # leaf geometry (L, BLOCK), never on the grid, so the leaf sum is row-count invariant.
             row = tl.program_id(0)
             leaf = tl.program_id(1)
             base = row * row_stride + leaf * L
             row_max = tl.load(row_max_ptr + row)
             acc = 0.0
-            comp = 0.0  # Kahan compensation: costs nothing (memory-bound) and beats ATen's error
+            comp = 0.0  # Kahan compensation
             for off in range(0, L, BLOCK):
                 idx = off + tl.arange(0, BLOCK)
                 value = tl.load(x_ptr + base + idx, mask=idx < L, other=0.0).to(tl.float32)
@@ -253,11 +168,8 @@ def _load_kernel():
             LOG2G: tl.constexpr,
             LOCAL_GATHER: tl.constexpr,
         ):
-            # One program per row: fold the G leaf sums, log, gather/mask, done -- the whole
-            # post-gather tail in one launch, which is what keeps the 1-row decode step cheap.
-            # The pairwise tl.split fold IS combine_order(G): at every level the left operand
-            # carries the lower leaf indices, so the IEEE add sequence is identical (bit-compared
-            # against the eager torch combine_order fold on every probe call, never assumed).
+            # One program per row: fold the G leaf sums, log, gather/mask. The pairwise tl.split
+            # fold IS combine_order(G), bit-compared against the eager torch fold on every probe.
             row = tl.program_id(0)
             v = tl.load(leaf_ptr + row * G + tl.arange(0, G))
             for _ in tl.static_range(LOG2G):
@@ -272,7 +184,7 @@ def _load_kernel():
                 safe = tl.where(valid, target, 0)
                 sampled = tl.load(x_ptr + row * row_stride + safe).to(tl.float32)
             else:
-                # world>1: the sampled logit was distributed by the exact masked all_reduce(SUM).
+                # world>1: distributed by the exact masked all_reduce(SUM).
                 sampled = tl.load(sampled_ptr + row)
             log_s = libdevice.log(s)  # bit-identical to torch.log on fp32 (probe-checked)
             tl.store(out_ptr + row, tl.where(valid, (sampled - row_max) - log_s, 0.0))
@@ -289,22 +201,8 @@ def _load_kernel():
             LOG2G: tl.constexpr,
             BLOCK: tl.constexpr,
         ):
-            # The engine full-row steady state in ONE launch: one program per row computes the row
-            # max, the G leaf Kahan fp32 exp-sums, the combine_order(G) fold, and writes the full
-            # ``(x - m) - log(S)`` row -- 3 reads + 1 write of [N, V], the incumbent's traffic.
-            # Fusing moves WHERE the arithmetic runs, never the expression:
-            #   * the max is exact and order-free, so computing it in-program instead of via
-            #     ``torch.amax`` is the same fp32 value bit for bit;
-            #   * the leaf loop body is the LETTER of ``leaf_sum_exp``: same fp32 loads, same
-            #     ``BLOCK``, same masking, same ``tl.sum`` shape at the same pinned num_warps,
-            #     same Kahan y/t/comp sequence, leaves walked in ascending order;
-            #   * the fold is the same pairwise ``tl.split`` schedule as ``finalize_rows`` (left
-            #     operand = lower leaf indices at every level == ``combine_order(G)``);
-            #   * the tail is the two elementwise fp32 subtracts of the eager statement.
-            # None of this is trusted: the full [N, V] output is bit-compared against the eager
-            # letter (amax + leaf_sum_exp + eager fold + broadcast subtracts) on the first call,
-            # on every NEW row count, and every PROBE_EVERY serves; any mismatch demotes to the
-            # eager path (bits preserved), never to the incumbent.
+            # Engine full-row steady state in ONE launch: row max, G Kahan leaf sums,
+            # combine_order(G) fold, and the two output subtracts -- the eager path's expression.
             row = tl.program_id(0).to(tl.int64)
             x_row = x_ptr + row * row_stride
             out_row = out_ptr + row * out_stride
@@ -333,15 +231,14 @@ def _load_kernel():
                     acc = t
                 vec = tl.where(tl.arange(0, G) == g, acc, vec)
 
-            # the combine_order(G) fold: the identical pairwise tl.split schedule finalize_rows
-            # runs (elementwise adds -- value-independent of warp count or layout).
+            # the combine_order(G) fold: the same pairwise tl.split schedule finalize_rows runs.
             for _ in tl.static_range(LOG2G):
                 lo, hi = tl.split(tl.reshape(vec, (vec.shape[0] // 2, 2)))
                 vec = lo + hi
             s = tl.sum(vec)  # single element after the fold: extraction, not arithmetic
             log_s = libdevice.log(s)  # bit-identical to torch.log on fp32 (probe-checked)
 
-            # pass 3: the eager tail's two fp32 subtracts, elementwise over the row.
+            # pass 3: the eager tail's two fp32 subtracts, elementwise.
             for off in range(0, V, BLOCK):
                 idx = off + tl.arange(0, BLOCK)
                 v = tl.load(x_row + idx, mask=idx < V, other=0.0).to(tl.float32)
@@ -420,11 +317,8 @@ def _admit(
 ) -> tuple[tuple[int, int, int] | None, str]:
     _S["calls"] += 1
 
-    # -- latched hot route: after a signature is unanimously admitted, the steady state is three
-    # env reads, one tuple build and one dict hit -- no contract rebuild, no rank queries, no host
-    # syncs. Any env change misses the guard and falls into the full admission below, which still
-    # RAISES on structural drift; any layout or dtype change is a new key and takes the full path
-    # once (dtype is a per-call eligibility field, never a structural fact -- see the contract).
+    # Latched hot route for admitted signatures. Any env/layout/dtype change misses the guard and
+    # falls into the full admission below, which still RAISES on structural drift.
     group_cache = _GROUP_ADMISSION.get(_group_key(group))
     if group_cache is not None and not group_cache["latched_off"]:
         if (
@@ -486,15 +380,8 @@ def _admit(
     elif _load_kernel() is None:
         reason = f"Triton/pik leaf kernel unavailable: {_KERNEL_ERROR}"
 
-    # The IMMUTABLE per-process structural contract: only facts that select the COLLECTIVE
-    # SEQUENCE, which candidate and incumbent issue differently, so rank-local divergence here is
-    # unsafe and RAISES. The payload dtypes are deliberately NOT here: every collective this
-    # module issues runs on the transiently-widened fp32 tensors whatever the input dtype (the
-    # widen is exact, so the bits match a pre-widened caller), and the same trainer process
-    # legitimately alternates bf16 (the scoring forward under SKYRL_ISOEXEC_SCORING_LOGITS_BF16)
-    # with fp32 (the training forward, which Float16Module upcasts). As in
-    # ops/collectives/logprob_gather_wire.py, dtype is a per-call eligibility field of the
-    # signature below -- each new signature is re-voted TP-unanimously, never assumed.
+    # Immutable per-process contract: only facts selecting the COLLECTIVE SEQUENCE, so rank-local
+    # divergence RAISES. Payload dtypes stay out (see below) -- collectives always run on fp32.
     contract = (
         on,
         os.environ.get("SKYRL_ISOEXEC"),
@@ -540,8 +427,8 @@ def _admit(
         if cached:
             return (world, rank, g_leaves), ""
     else:
-        # Retain the group object so a destroy/reinitialize cycle cannot reuse its Python id and
-        # inherit a prior group's admission or probe verdict.
+        # Retain the group object so a destroy/reinit cycle cannot reuse its Python id and inherit
+        # a prior group's admission or probe verdict.
         group_cache = {
             "group": group,
             "contract": contract,
@@ -554,10 +441,8 @@ def _admit(
         }
         _GROUP_ADMISSION[_group_key(group)] = group_cache
 
-    # Load-bearing: candidate and incumbent issue different collectives after this point, so every
-    # NEW signature per TP group must be unanimous -- ranks reach this vote on the same call with
-    # the same payload dtype by construction (TP shards of one tensor), so the collective aligns.
-    # MIN makes any one rank's refusal everybody's.
+    # Candidate and incumbent issue different collectives past this point, so every new signature
+    # per TP group must be unanimous; MIN makes any one rank's refusal everybody's.
     if world > 1:
         vote = torch.tensor(int(not reason), dtype=torch.int32, device=logits.device)
         dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
@@ -583,23 +468,19 @@ def _shared_pieces(
     group,
     g_leaves: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Steps 1-3+5 of the contract: (row_max [rows], leaf_sums [rows, G], sampled [rows]|None).
-
-    ``sampled`` is the exactly-distributed raw target logit for world>1; ``None`` at world=1,
-    where the finalize kernel gathers it locally instead of paying extra launches.
-    """
+    """Return (row_max [rows], leaf_sums [rows, G], sampled [rows] or None at world=1)."""
     leaf_kernel = _KERNEL[1]
     rows, shard_vocab = x.shape
     full_vocab = shard_vocab * world
     leaf_cols = full_vocab // g_leaves
     leaves_local = g_leaves // world
 
-    # 1) global row max: local amax then all_reduce(MAX). Max is exact and order-independent.
+    # 1) global row max: local amax then all_reduce(MAX); max is exact and order-independent.
     row_max = torch.amax(x, dim=-1)
     if world > 1:
         dist.all_reduce(row_max, op=dist.ReduceOp.MAX, group=group)
 
-    # 2) leaf sums for the leaves this rank owns, one program per (row, leaf), fixed order + Kahan.
+    # 2) leaf sums for this rank's leaves, one program per (row, leaf), fixed order + Kahan.
     local_sums = torch.empty((rows, leaves_local), device=x.device, dtype=torch.float32)
     leaf_kernel[(rows, leaves_local)](
         local_sums,
@@ -612,8 +493,8 @@ def _shared_pieces(
         num_warps=NUM_WARPS,
     )
 
-    # 3) every rank ends up with all G leaf sums, in global leaf order (rank ownership is
-    #    contiguous ascending, so rank-order concat IS leaf order). all_gather moves bytes only.
+    # 3) all G leaf sums on every rank, in global leaf order (ownership is contiguous ascending,
+    #    so rank-order concat IS leaf order). all_gather moves bytes only.
     if world > 1:
         parts = [torch.empty_like(local_sums) for _ in range(world)]
         dist.all_gather(parts, local_sums, group=group)
@@ -640,7 +521,7 @@ def _finalize_fused(
     full_vocab: int,
     g_leaves: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Step 4+6 in ONE launch: combine tree, log, sampled gather/mask, lse. The hot finalize."""
+    """Combine tree, log, sampled gather/mask and lse in one launch."""
     finalize_kernel = _KERNEL[2]
     rows = x.shape[0]
     out = torch.empty(rows, device=x.device, dtype=torch.float32)
@@ -672,10 +553,9 @@ def _finalize_reference(
     full_vocab: int,
     g_leaves: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The eager statement of steps 4+6: the explicit ``combine_order(G)`` fold + ``torch.log``.
+    """Eager finalize (explicit ``combine_order(G)`` fold + ``torch.log``); probe path only.
 
-    This is the contract's letter; ``_finalize_fused`` must reproduce it bit for bit and is
-    re-checked against it on every probe call. Probe-path only -- never the steady state.
+    The contract's letter: ``_finalize_fused`` must reproduce it bit for bit.
     """
     combine_order = _KERNEL[3]
     slots = list(leaf_sums.unbind(dim=1))
@@ -698,11 +578,8 @@ class _RowInvSampledLogprob(torch.autograd.Function):
         x = logits.reshape(-1, logits.shape[-1])
         t = target.reshape(-1)
         full_vocab = logits.shape[-1] * world
-        # The KERNEL INPUT dtype is pinned fp32: Triton's intra-block tl.sum order depends on the
-        # load element width (measured: a bf16 load that widens in-register moves ~30% of leaf
-        # sums by 1 ULP at num_warps=4), so a low-precision input is widened TRANSIENTLY here --
-        # the exact widen reproduces the fp32-input bits, the copy dies at call exit, and only
-        # the ORIGINAL narrow tensor is retained for backward.
+        # Kernel input dtype is pinned fp32: Triton's intra-block tl.sum order follows the load
+        # element width (a bf16 load moves ~30% of leaf sums by 1 ULP), so widen transiently here.
         x_wide = x if x.dtype is torch.float32 else x.to(torch.float32)
         row_max, leaf_sums, sampled = _shared_pieces(x_wide, t, vocab_start_index, world, group, g_leaves)
         out, lse = _finalize_fused(x_wide, t, row_max, leaf_sums, sampled, full_vocab, g_leaves)
@@ -721,8 +598,7 @@ class _RowInvSampledLogprob(torch.autograd.Function):
         valid = (t >= 0) & (t < ctx.full_vocab)
         upstream = torch.where(valid, upstream, torch.zeros_like(upstream))
         # grad_x_j = g * (delta_{j,target} - exp(x_j - lse)); local columns only, no collective.
-        # x may be the ORIGINAL bf16/fp16 shard (saved instead of a widened fp32 copy: half the
-        # held bytes); `x - lse` promotes through the exact widen, so exp runs in fp32 either way.
+        # x may be the original bf16/fp16 shard; `x - lse` promotes, so exp runs in fp32 either way.
         grad = torch.exp(x - lse.unsqueeze(1)).mul_(-upstream.unsqueeze(1))
         in_shard = valid & (t >= ctx.vocab_start_index) & (t < ctx.vocab_start_index + shard_vocab)
         local_target = (t - ctx.vocab_start_index).masked_fill(~in_shard, 0).to(torch.int64)
@@ -745,11 +621,7 @@ def _forward_reference(
     group,
     g_leaves: int,
 ) -> torch.Tensor:
-    """The whole forward with the EAGER finalize, for the probe's fused-fold bitwise self-check.
-
-    Re-runs the exact collectives of the candidate (probe calls are rank-aligned by construction,
-    so the extra sequence is symmetric), then finalizes with the explicit combine_order fold.
-    """
+    """The forward with the eager finalize, for the probe's fused-fold bitwise self-check."""
     x = logits.reshape(-1, logits.shape[-1])
     t = target.reshape(-1)
     full_vocab = logits.shape[-1] * world
@@ -766,12 +638,10 @@ def _probe_final(
     group,
     world: int,
 ) -> tuple[bool, str]:
-    """One unanimous vote over both probe halves.
+    """One unanimous vote over both probe halves: fused-vs-eager bitwise, incumbent tolerance.
 
-    (a) BITWISE: the fused finalize kernel against the eager ``combine_order`` fold -- same
-    function or the fusion is a bug. (b) TOLERANCE against the incumbent: the candidate is a
-    different (better-conditioned) fp32 lse tree than ATen's by design, ~1-2 ULP apart, so
-    ``PROBE_MAX_ABS`` catches structural bugs, which land orders of magnitude above that.
+    The candidate is a different fp32 lse tree than ATen's by design (~1-2 ULP), so the
+    incumbent half is a tolerance gate, not bit-equality.
     """
     fused_same = torch.equal(candidate.contiguous().view(torch.int32), eager_fold.contiguous().view(torch.int32))
     finite = bool(torch.isfinite(candidate).all().item()) and bool(torch.isfinite(incumbent).all().item())
@@ -816,9 +686,8 @@ def rowinv_sampled_logprobs(
         group_cache["served"] > 0 and group_cache["served"] % PROBE_EVERY == 0
     )
     if should_probe:
-        # The reference callback runs the incumbent end to end; its collectives are aligned
-        # because every rank reaches this branch on the same call by construction. The eager-fold
-        # rerun re-issues the candidate's own collective sequence, equally aligned.
+        # Both reruns issue extra collectives; every rank reaches this branch on the same call by
+        # construction, so they stay aligned.
         incumbent = reference()
         eager_fold = _forward_reference(logits, target, vocab_start_index, world, group, g_leaves)
         ok, reason = _probe_final(result.detach(), incumbent.detach(), eager_fold, group, world)
@@ -835,8 +704,8 @@ def rowinv_sampled_logprobs(
     group_cache["served"] += 1
     _S["tokens"] += target.numel()
     if world > 1:
-        # The incumbent trainer path materializes the [rows, V] fp32 full-vocabulary gather on
-        # every rank; the leaf wire replaces it with rows*G floats.
+        # The incumbent materializes a [rows, V] fp32 gather per rank; the leaf wire carries
+        # rows*G floats instead.
         _S["full_gather_bytes_avoided"] += target.numel() * logits.shape[-1] * world * 4
     _S["leaf_wire_floats"] += target.numel() * g_leaves
     _report()
@@ -853,17 +722,11 @@ def _probe_full_row(
 ) -> tuple[bool, str]:
     """The full-row entry's two probe halves; world=1, so no vote to align.
 
-    (a) BITWISE against the SAMPLED path: run the fused finalize kernel (the trainer's own
-    steady-state tail: tl.split fold + libdevice.log + in-kernel gather) on this call's
-    row_max/leaf_sums at one deterministic column per row, and bit-compare against a gather from
-    the full row. This is the load-bearing equivalence -- it proves the eager combine_order fold +
-    torch.log + broadcast subtracts produce the SAME bits the trainer's sampled path produces for
-    any column, so it is checked live, never assumed. (b) TOLERANCE against the incumbent
-    (vLLM's log_softmax): a different fp32 lse tree by design, 1-2 ULP apart; the gate catches
-    structural bugs, which land orders of magnitude above PROBE_MAX_ABS.
+    Bitwise against the sampled path (proving the full row carries the trainer's bits at any
+    column), then a tolerance gate against the incumbent's differing fp32 lse tree.
     """
     rows, shard_vocab = x_wide.shape
-    # Deterministic per-row probe columns, spread across all G leaves (Knuth hash mod V).
+    # Deterministic per-row probe columns spread across all G leaves (Knuth hash mod V).
     t = (torch.arange(rows, device=x_wide.device, dtype=torch.int64) * 2654435761) % shard_vocab
     fused, _lse = _finalize_fused(x_wide, t, row_max, leaf_sums, None, shard_vocab, g_leaves)
     gathered = torch.gather(full, 1, t.unsqueeze(1)).squeeze(1)
@@ -884,9 +747,7 @@ def _probe_full_row(
 def _full_target(rows: int, device: torch.device) -> torch.Tensor:
     """The synthesized admission target for the full-row entry, cached per device.
 
-    ``_admit`` only reads its shape/dtype (signature vocabulary and hot key); the forward never
-    reads a value. One zeros tensor per device, grown geometrically and sliced, replaces a
-    per-call ``torch.zeros`` allocation + fill launch on the hot path.
+    ``_admit`` reads only its shape/dtype; the forward never reads a value.
     """
     cached = _FULL_TARGET.get(device)
     if cached is None or cached.shape[0] < rows:
@@ -899,11 +760,9 @@ def _full_target(rows: int, device: torch.device) -> torch.Tensor:
 def _full_row_eager(
     x_wide: torch.Tensor, admit_target: torch.Tensor, g_leaves: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The full-row contract's LETTER: amax + leaf kernel + eager combine_order fold + subtracts.
+    """The full-row contract's letter: amax + leaf kernel + eager combine_order fold + subtracts.
 
-    This is the exact composition that produced the qualified 8-step bitwise-zero run; the fused
-    single-kernel fast path must reproduce it bit for bit and is demoted (to THIS path, never to
-    the incumbent) if a probe ever catches it not doing so.
+    The fused fast path must reproduce it bit for bit, and is demoted to this path if it does not.
     """
     row_max, leaf_sums, _sampled = _shared_pieces(x_wide, admit_target, 0, 1, None, g_leaves)
     combine_order = _KERNEL[3]
@@ -916,7 +775,7 @@ def _full_row_eager(
 
 
 def _full_row_fused(x_wide: torch.Tensor, g_leaves: int) -> torch.Tensor:
-    """The steady-state fast path: ONE kernel, 3 reads + 1 write of [N, V] -- incumbent traffic."""
+    """The steady-state fast path: one kernel, 3 reads + 1 write of [N, V]."""
     full_kernel = _KERNEL[4]
     rows, shard_vocab = x_wide.shape
     out = torch.empty_like(x_wide)
@@ -940,37 +799,13 @@ def rowinv_full_logprobs(
     src_dtype: torch.dtype,
     reference: Callable[[], torch.Tensor],
 ) -> torch.Tensor | None:
-    """Full-row ``[N, V]`` fp32 logprobs under the SAME leaf-tree denominator as the sampled entry.
+    """Full-row ``[N, V]`` fp32 logprobs under the same leaf-tree denominator as the sampled entry.
 
-    WHY A FULL-ROW ENTRY. The engine's V1 sampler site
-    (``vllm.v1.sample.sampler.Sampler.compute_logprobs``) is not a gather: its output feeds
-    ``gather_logprobs`` (top-k, ranks, sampled AND prompt logprobs), so the hook must return the
-    whole fp32 row, not just the sampled value. This entry returns ``(x - m) - log(S)`` over the
-    row with ``m`` and ``S`` computed EXACTLY as the sampled entry computes them: the same global
-    ``amax`` row max, the same G-leaf Kahan fp32 exp-sum arithmetic (same BLOCK, same num_warps),
-    the leaf sums folded ONLY by pik's ``combine_order(G)`` tree, then the two elementwise fp32
-    subtracts ``(x - m) - log_s`` -- one rounding each, no reduction -- so the row is row-count
-    invariant by construction from top to bottom.
-
-    TWO REALIZATIONS OF THE ONE EXPRESSION. The steady state runs ``_full_row_fused``: a single
-    Triton launch per call carrying the whole expression (row max, G Kahan leaf sums in fixed
-    ascending block order, the ``tl.split`` fold that IS ``combine_order(G)``, the output
-    subtracts) at the incumbent's memory traffic -- 3 reads + 1 write of [N, V] -- instead of the
-    eager composition's 6 passes and ~13 launches. The eager composition (``_full_row_eager``,
-    the letter: ``torch.amax`` + the leaf kernel + the eager fold + broadcast subtracts) remains
-    the arbiter: on the FIRST call, on every NEW row count, and every ``PROBE_EVERY`` serves, the
-    fused output is bit-compared against the eager letter over the ENTIRE [N, V] tensor, the
-    sampled-path finalize is bit-compared against a gather from the row (the trainer==engine
-    linkage), and the incumbent tolerance gate runs. A fused mismatch demotes the fused kernel
-    for the process and KEEPS SERVING THE EAGER PATH -- the optimization dies, the bits do not.
-
-    ENGINE world=1 ONLY: the row arrives already gathered (group=None), all G leaves are local.
-    Admission reuses the sampled entry's structural contract (same env, layout, ``V % G``,
-    capability, kernel checks, same census counters) with a synthesized target column. Declines
-    return ``None`` -- the caller keeps the incumbent, bits unchanged. A failed probe latches this
-    entry off for the process and returns the incumbent's own tensor for that call. Inference-only
-    by design: no autograd (the engine never backpropagates rollout logprobs), enforced with
-    ``torch.no_grad`` rather than assumed from the caller.
+    The engine's V1 sampler site needs the whole row (top-k, ranks, prompt logprobs), not just the
+    sampled value. Returns ``(x - m) - log(S)`` with ``m`` and ``S`` computed exactly as the
+    sampled entry computes them, so the row is row-count invariant throughout. world=1 only (the
+    row arrives already gathered); admission and census are shared with the sampled entry.
+    Returns ``None`` to retain the incumbent. Inference-only: no autograd.
     """
     if _FULL_ROW["latched_off"]:
         _S["calls"] += 1
@@ -988,7 +823,7 @@ def rowinv_full_logprobs(
     _world, _rank, g_leaves = admitted  # group=None => world == 1, all leaves local
 
     with torch.no_grad():
-        # The same transient exact widen as the sampled entry: kernel input dtype pinned fp32.
+        # Same transient exact widen as the sampled entry: kernel input dtype is pinned fp32.
         x_wide = logits if logits.dtype is torch.float32 else logits.to(torch.float32)
 
         use_fused = _FULL_ROW["fused"] is not False and len(_KERNEL) > 4
@@ -1002,7 +837,7 @@ def rowinv_full_logprobs(
         if should_probe or out is None:
             eager, row_max, leaf_sums = _full_row_eager(x_wide, admit_target, g_leaves)
             if out is not None and not torch.equal(out.view(torch.int32), eager.view(torch.int32)):
-                # The fused kernel drifted from the letter: demote the OPTIMIZATION, keep the bits.
+                # The fused kernel drifted from the letter: demote the optimization, keep the bits.
                 _FULL_ROW["fused"] = False
                 _FULL_ROW["fused_reason"] = f"fused full-row kernel != eager letter at rows={rows}"
                 print(

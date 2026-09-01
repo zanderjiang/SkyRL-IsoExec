@@ -1,16 +1,8 @@
-"""CPU gate for the QKV subgroup all-gather's ADMISSION predicates.
+"""CPU gate for the QKV subgroup all-gather's admission predicates.
 
-The op's byte-identity argument (``ops/attention/qkv_subgroup_gather.py``) rests entirely on one
-structural claim: the window megatron keeps, ``[idx*size, (idx+1)*size)`` with
-``size = full // num_query_groups``, is exactly the shards of ranks ``[idx*rpg, (idx+1)*rpg)``. The
-live 8-GPU gate (``attn_qkv_subgroup_dist.py`` in this directory) proves that on real
-operands at the real geometry. This file proves the GUARD -- that every geometry where the claim
-does not hold is refused, and refused with a reason -- and it does so on CPU, in CI, without a mesh.
-
-The failure mode this is aimed at: a model whose ``num_query_groups`` does not divide the tp world
-would take megatron's gather branch, produce a slice that CUTS A RANK SHARD, and the subgroup
-gather would return different bytes. That must be a refusal with a printed reason, never a fast
-path -- and it must stay a refusal after someone edits the predicate list.
+Byte-identity holds only when megatron's kept window ``[idx*size, (idx+1)*size)`` is exactly whole
+rank shards; every geometry where it is not (e.g. ``num_query_groups`` not dividing the tp world,
+which would cut a shard) must be refused with a printed reason, never taken as a fast path.
 """
 
 import os
@@ -33,9 +25,8 @@ def test_live_engine_geometry_admits():
 
 
 def test_trainer_geometry_admits_on_the_predicates_alone():
-    # The trainer at TP=4 has the same over-gather and passes the PURE predicates; it is kept out
-    # by the install-side "tp group must be the whole default world" rule, not by these. If this
-    # ever starts refusing, the trainer arm's scoping rationale needs rewriting too.
+    # The trainer at TP=4 passes the pure predicates; it is kept out by the install-side
+    # "tp group must be the whole default world" rule, not by these.
     assert admission_refusal(world=4, num_query_groups=2, local_width=1152) is None
 
 
@@ -57,8 +48,7 @@ def test_refusals_are_reasoned():
 
 
 def test_kept_window_is_always_a_whole_number_of_rank_shards():
-    """THE invariant. Every admissible geometry must satisfy it; if one does not, the guard is
-    letting through a case where the subgroup gather is not the slice."""
+    """Every admissible geometry keeps a window that is a whole number of rank shards."""
     checked = 0
     for world in range(1, 65):
         for ng in range(0, world + 2):
@@ -78,13 +68,7 @@ def test_kept_window_is_always_a_whole_number_of_rank_shards():
 
 
 def test_flag_defaults_on_and_zero_is_the_escape_hatch():
-    """DEFAULT FLIPPED ON 2026-08-13 -- so the thing to pin is that `=0` still works.
-
-    Rule 6 said a flag defaulting OFF means the OFF path is production, and that was the state
-    while the win was unmeasured. The one-session duration A/B (B=512, n=249 decode steps per
-    arm: 20.019 -> 19.761 ms/step median) is what moved the default; the OFF path remains the
-    reference the 33/33 bit gate proved against, so `=0` must keep selecting it exactly.
-    """
+    """The flag defaults ON, and `=0` still selects the reference OFF path exactly."""
     import os
 
     old = os.environ.pop("SKYRL_ISOEXEC_ATTN_QKV_SUBGROUP_AG", None)
@@ -101,12 +85,7 @@ def test_flag_defaults_on_and_zero_is_the_escape_hatch():
 
 
 def test_grad_enabled_takes_the_stock_autograd_gather():
-    """The subgroup path records NO autograd node (it calls the functional gather, not the
-    ``_AllGatherFromTensorParallelRegion.apply`` wrapper whose backward is a reduce-scatter). Under
-    the engine's inference_mode that is exactly right; anywhere grad is live it would delete a
-    gradient behind a green bitwise gate. The shim must fall back, and say so.
-
-    Driven on CPU by arming the shim's own globals -- no mesh, no CUDA, no megatron model."""
+    """The subgroup path records no autograd node, so with grad live the shim must fall back."""
 
     from skyrl.backends.skyrl_train.isoexec.ops.attention import (
         qkv_subgroup_gather as _qkv,
@@ -133,7 +112,7 @@ def test_grad_enabled_takes_the_stock_autograd_gather():
         assert len(calls) == 1, "grad enabled must fall through to megatron's own autograd gather"
         assert any("grad is enabled" in r for r in _qkv._REFUSED), sorted(_qkv._REFUSED)
 
-        # ...and requires_grad on the operand alone is refused too, even under no_grad.
+        # requires_grad on the operand alone is refused too, even under no_grad.
         _qkv._ARMED = plan
         with torch.no_grad():
             _qkv._shim_all_gather_last_dim(x.detach().requires_grad_(True), group=group)
@@ -147,13 +126,7 @@ def test_grad_enabled_takes_the_stock_autograd_gather():
 
 
 def test_install_off_mesh_is_silent_when_off_and_reasoned_when_on():
-    """Two properties of the installer that only a call can establish, and neither needs a mesh.
-
-    OFF: production runs this path on every engine build, so it must be a no-op that prints
-    NOTHING -- an installer that banners on the default path is how banners stop being read.
-    ON without a mesh: it must refuse with the reason, not raise and not half-install. The
-    restructure that AND-s the verdict across ranks (so a split flag cannot hang `new_group`) runs
-    a collective before the flag test, and this is the case that proves it degrades off-mesh."""
+    """OFF is a silent no-op; ON without a mesh refuses with a reason instead of raising."""
     import os
 
     from skyrl.backends.skyrl_train.isoexec.ops.attention import (
@@ -163,7 +136,7 @@ def test_install_off_mesh_is_silent_when_off_and_reasoned_when_on():
     old = os.environ.pop("SKYRL_ISOEXEC_ATTN_QKV_SUBGROUP_AG", None)
     saved = set(_qkv._REFUSED)
     try:
-        # OFF must now be spelled `=0`: the flag defaults ON since 2026-08-13.
+        # OFF must be spelled `=0`: the flag defaults ON.
         os.environ["SKYRL_ISOEXEC_ATTN_QKV_SUBGROUP_AG"] = "0"
         _qkv._REFUSED.clear()
         assert _qkv.install_engine_qkv_subgroup_ag(model=None) is False

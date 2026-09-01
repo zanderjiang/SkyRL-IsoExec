@@ -1,11 +1,7 @@
-"""Per-process ExecutionContract: build once directly from registry + model selections, hash it,
-log it, assert it. The weight-sync handshake seam.
+"""Per-process ExecutionContract: build once from registry + model selections, hash it, assert it.
 
-Both runtimes call ``get_process_contract(model_path)`` at startup; because both build the same
-complete contract from the same code, model and arch, the identities match by construction and
-``assert_contract_agreement`` turns a composition split-brain into a refuse-to-run rather than a
-broken gate. The refusal goes through ``enforce.refuse``, so SKYRL_ISOEXEC_MANIFEST_STRICT=0 and
-debug tracing demote it to a logged verdict -- with the ledger record written either way.
+Both runtimes build the same contract at startup, so identities match by construction and
+``assert_contract_agreement`` turns a composition split-brain into a refuse-to-run.
 """
 
 from __future__ import annotations
@@ -21,19 +17,16 @@ logger = logging.getLogger(__name__)
 _CONTRACT = None  # cached ExecutionContract for this process
 _VIEW = None  # cached {(op, site) -> {impl_id, version, pinned_constants, half}} projection
 
-# Named composition components that live outside the model registry but must still agree across the
-# pair. They are not registry ops because an installed op key obligates every model contract to
-# cover it, which is wrong for a cross-model process capability. A side whose install never ran
-# never registers its extension, so the hashes differ and weight-sync refuses. With no extensions
-# registered the composite hash equals the plain numerical_policy identity.
+# Named composition components outside the model registry that must still agree across the pair.
+# With none registered the composite hash equals the plain numerical_policy identity.
 _EXTENSIONS: dict = {}
 
 
 def register_contract_extension(name: str, digest_fn) -> None:
     """Fold a named component into the handshake hash.
 
-    ``digest_fn() -> str`` is called lazily at every ``contract_hash()`` read. Idempotent per name,
-    and must be registered on both sides before their handshake or the mismatch is the outcome.
+    ``digest_fn() -> str`` is called lazily at every ``contract_hash()`` read, and must be
+    registered on both sides before their handshake or the mismatch is the outcome.
     """
     _EXTENSIONS[name] = digest_fn
 
@@ -57,7 +50,7 @@ def composite_hash(base: str | None) -> str | None:
 
 
 def _decode_constant(v):
-    # Contract constants carry floats as fp64 BitPatterns; the live fingerprint compares plain values.
+    # Contract constants carry floats as fp64 BitPatterns; the fingerprint compares plain values.
     from ..contract import BitPattern
 
     if isinstance(v, BitPattern) and v.dtype == "fp64":
@@ -100,8 +93,7 @@ def get_process_contract(model_path: str | None = None, *, arch=None):
     try:
         c = models.build_for(model_path, reg, arch=arch)
     except Exception as e:
-        # Reporter: contract-build validation. The failure still propagates to the caller; the
-        # ledger records it so a wrapped-and-swallowed build failure is loud at the INSTALL close.
+        # Record the build failure in the ledger; it still propagates to the caller.
         try:
             from .enforce import BUILD_VALID, INSTALL, VIOLATION, report
 
@@ -146,8 +138,7 @@ def get_process_contract(model_path: str | None = None, *, arch=None):
 
 
 def cached_contract():
-    """This process's already-built contract, or None. Never builds one -- callers deep in a
-    forward have no model_path; the adapter builds it at startup."""
+    """This process's already-built contract, or None. Never builds one."""
     return _CONTRACT
 
 
@@ -157,9 +148,7 @@ def cached_contract_view():
 
 
 def contract_hash(model_path: str | None = None) -> str | None:
-    """The contract handshake hash: the numerical_policy identity composed with the registered
-    extensions. Builds the contract if a model_path is given and it is not built yet; None if no
-    contract can be derived yet."""
+    """The handshake hash: the numerical_policy identity folded with the registered extensions."""
     c = get_process_contract(model_path)
     return composite_hash(c.identities.numerical_policy) if c is not None else None
 
@@ -167,9 +156,7 @@ def contract_hash(model_path: str | None = None) -> str | None:
 def assert_topology_within_claims(contract, actual, *, side: str = "?") -> bool:
     """Refuse to run a topology outside the contract's claimed envelopes.
 
-    Deprecated name, kept for existing callers: the logic lives in the ContractAdapter's
-    ``TopologyChecker`` (core/adapter.py); this delegates to the aggregate check there. Same
-    ledger records, banner and refusal as before.
+    Deprecated alias: delegates to ``adapter.check_topology_claims``.
     """
     from .adapter import check_topology_claims
 
@@ -180,8 +167,7 @@ def assert_topology_within_claims(contract, actual, *, side: str = "?") -> bool:
 def assert_contract_agreement(other_hash: str, *, other_side: str = "peer") -> bool:
     """Handshake check: the peer runtime's contract hash must equal ours.
 
-    Returns True on match. A mismatch refuses unless ``enforce.demoted()`` (strict=0 or debug
-    tracing), which logs and returns False -- with the violation recorded either way.
+    A mismatch refuses unless ``enforce.demoted()``; the violation is recorded either way.
     """
     from . import enforce
 
@@ -212,10 +198,8 @@ def assert_contract_agreement(other_hash: str, *, other_side: str = "peer") -> b
 def assert_init_info_contract(init_info, *, other_side: str = "trainer") -> bool:
     """Receiver-side handshake against the contract hash a peer stamped on init_info.
 
-    Skips when the peer stamped nothing or the local contract cannot be derived; each early-out
-    records the skip under its recognized reason, so the WEIGHT_SYNC close can tell a structural
-    skip from an obligation nothing ever checked. A genuine mismatch goes to
-    ``assert_contract_agreement``.
+    Each early-out records its skip reason so the WEIGHT_SYNC close can tell a structural skip
+    from an obligation nothing ever checked.
     """
     from . import enforce
 

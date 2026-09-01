@@ -1,19 +1,8 @@
-"""Two-sided synthetic pipeline for comparator tests: the stress harness, in-process.
+"""Two-sided synthetic pipeline for comparator tests.
 
-A causal six-region chain (real IsoExec region names) is run for ``steps`` x ``layers`` through
-the real :func:`trace.wrap_region`, once per side, with at most one fault injected on the engine
-side. Faults mutate the region output in place, so contamination propagates downstream exactly as
-a real numerical fault would -- which is what makes claims about causal ordering, contamination
-marking and absent records testable rather than asserted.
-
-Chain order per layer (this is the causal order; note it is close to the REVERSE of the
-alphabetical order of the region names, which is what made alphabetical tie-breaks look right):
-
-    norms.rms -> mm.matmul -> gdn.core -> moe.router -> moe.combine -> collectives.row_parallel_ar
-
-Fault dicts are ``{"kind": ..., "region": ..., "layer": L, "step": S, ...}``; ``layer``/``step``
-default to "every one". Kinds: ulp, add, reduce_order, fp32_cast, dtype, permute_rows, pad_row,
-nan, neg_zero, ftz, drop_record (one call not traced), drop_region (region never traced).
+Runs the six-region causal chain in ``REGION_ORDER`` (close to reverse-alphabetical) through the
+real :func:`trace.wrap_region` once per side, with at most one fault injected on the engine side.
+Faults mutate region output in place, so contamination propagates downstream.
 """
 
 from __future__ import annotations
@@ -240,8 +229,8 @@ def run_pair(
 ):
     """Trainer (clean) and engine (faulted) traces under ``base``; returns (dir_a, dir_b).
 
-    ``set_step_b=False`` reproduces the applied integration's asymmetry: set_step wired on the
-    trainer only, so with SAMPLE>1 the two sides sample by different keys.
+    ``set_step_b=False`` wires set_step on the trainer only, so with SAMPLE>1 the sides sample by
+    different keys.
     """
     da, db = os.path.join(base, "trainer"), os.path.join(base, "engine")
     run_side(da, "trainer", fault=None, ranks=ranks_a, env=env_a, use_set_step=set_step_a, **kw)

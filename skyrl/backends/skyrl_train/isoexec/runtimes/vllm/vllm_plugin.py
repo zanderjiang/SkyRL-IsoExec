@@ -1,9 +1,7 @@
 """vLLM general plugin that installs the IsoExec engine stack in every vLLM process.
 
-vLLM puts each TP rank in its own process, so model registration, the attention backend, the sampler
-patches and the GDN pins have to be installed per worker rather than only in the engine actor. vLLM
-may load plugins several times per process, so everything here is idempotent, and the whole stack is
-gated on ``SKYRL_ISOEXEC=1``.
+Each TP rank is its own process, so everything must be installed per worker. vLLM may load plugins
+several times per process, so every install here is idempotent and gated on ``SKYRL_ISOEXEC=1``.
 """
 
 from __future__ import annotations
@@ -19,10 +17,8 @@ _installed = False
 def _install_shared_owner_memory_profile_scope(worker_cls=None) -> None:
     """Scope shared-owner pool provisioning around vLLM's ``profile_run``.
 
-    Persistent candidate pools are provisioned inside ``profile_run`` so they count against the KV
-    budget, but the scope ends before ``profile_cudagraph_memory`` so graph capture is sized for the
-    candidate rather than for a temporary exact reference graph. ``worker_cls`` is an injection seam
-    for tests; production resolves vLLM's concrete GPU worker.
+    Pools are provisioned inside ``profile_run`` so they count against the KV budget, but the scope
+    ends before ``profile_cudagraph_memory`` so graph capture is sized for the candidate.
     """
     if worker_cls is None:
         from vllm.v1.worker.gpu_worker import Worker as worker_cls
@@ -75,11 +71,8 @@ def register() -> None:
         return
     _installed = True
 
-    # MUST be first, and MUST be here rather than in setup_envvars_for_vllm: vLLM's
-    # init_batch_invariance re-pins NCCL_MIN/MAX_NCHANNELS=1 inside each worker before that worker's
-    # communicator exists, and a patch installed in the engine actor never runs in the worker
-    # subprocesses. Default OFF; gated on SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN=1 (SKYRL_ISOEXEC_NCCL_PIN is
-    # the trainer's flag and does not gate this).
+    # MUST be first and MUST be here: vLLM re-pins NCCL_MIN/MAX_NCHANNELS=1 inside each worker before
+    # its communicator exists. Default OFF; gated on SKYRL_ISOEXEC_ENGINE_NCCL_UNPIN=1.
     from .vllm_patches import neutralize_vllm_nccl_channel_pin
 
     neutralize_vllm_nccl_channel_pin()
@@ -98,20 +91,17 @@ def register() -> None:
     register_gptmodel_to_vllm()
 
     if os.environ.get("SKYRL_ISOEXEC_LOCAL_SPEC") == "1":
-        # `attention_backend="CUSTOM"` is resolved per worker, so the registration must exist per
-        # worker.
+        # `attention_backend="CUSTOM"` is resolved per worker, so register per worker.
         from ...ops.attention import varlen_backend
 
         varlen_backend.register_varlen_custom_backend()
-        # The sampler runs in the worker, so the logprob patch must land here.
         from .vllm_patches import (
             patch_vllm_sampler_logprobs_rowinv,
             patch_vllm_sampler_temperature,
         )
 
-        # The V1 runner's ACTUAL logprob producer -- Sampler.compute_logprobs serves both sampled
-        # and prompt logprobs. Installed unconditionally; only a failed rowinv import leaves the
-        # sampler byte-for-byte untouched, and the engagement boundary refuses that at served=0.
+        # Sampler.compute_logprobs is the V1 runner's actual producer of both sampled and prompt
+        # logprobs.
         patch_vllm_sampler_logprobs_rowinv()
         # The V1 sampler's unconditional full-vocab temperature divide is the identity at 1.0.
         patch_vllm_sampler_temperature()
@@ -122,18 +112,16 @@ def register() -> None:
 
         _install_moe_matmul_invariance()
 
-        # Re-tile that same kernel for the skinny decode GEMMs (shared-expert fc1, the
-        # shared_expert_gate linear, the fp32 router). Output tiling only -- BLOCK_SIZE_K pinned, no
-        # split-K -- so it is bitwise-neutral. MUST come after the install above: both re-register
-        # the same two aten ops and the last registration wins. Default OFF.
+        # Re-tile that same kernel for the skinny decode GEMMs. Output tiling only (BLOCK_SIZE_K
+        # pinned, no split-K), so bitwise-neutral. MUST come after the install above: both
+        # re-register the same two aten ops and the last registration wins.
         from ...ops.mm.mm_tiles import install_mm_tiles
 
         install_mm_tiles()
 
     if os.environ.get("SKYRL_ISOEXEC_GDN") == "1":
-        # The `fla` facade must exist before megatron.core.ssm.gated_delta_net is imported. The
-        # isoexec package __init__ already does this on import; called again in case of an unusual
-        # import order.
+        # The `fla` facade must exist before megatron.core.ssm.gated_delta_net is imported; the
+        # package __init__ already does this, repeated here to survive unusual import orders.
         from ...ops.gdn.gdn_batch_invariant import (
             pin_fla_autotune_configs,
             pin_gdn_rmsnorm_rows_per_block,
@@ -147,16 +135,14 @@ def register() -> None:
         lift_gdn_batch_invariance_veto()
 
     if os.environ.get("SKYRL_ISOEXEC_SLEEP_SKIP_WEIGHTS_BACKUP") == "1":
-        # THE sleep lever. Skip the D2H backup of the byte ranges the next weight sync overwrites before
-        # any read; back up only the residual non-synced pool state. Fail-to-stock: see the module
-        # docstring.
+        # Skip the D2H backup of byte ranges the next weight sync overwrites before any read; back
+        # up only the residual non-synced pool state.
         from .sleep_skip_backup import install_sleep_skip_weights_backup
 
         install_sleep_skip_weights_backup()
 
-    # Import-time inventory check of the vLLM surface this adapter patches and vendors. WARN by
-    # default -- logs each problem and continues; raises only under SKYRL_ISOEXEC_COMPAT_STRICT=1.
-    # Wrapped so a compat-check bug can never take down a run.
+    # Inventory check of the vLLM surface this adapter patches. Warns by default; raises only under
+    # SKYRL_ISOEXEC_COMPAT_STRICT=1.
     try:
         from .compat import check_vllm_compat
 
@@ -168,10 +154,8 @@ def register() -> None:
     except Exception as e:  # pragma: no cover - never let the compat check crash a run
         logger.warning("[ISOEXEC-COMPAT] compat check skipped (%s)", e)
 
-    # Bitwise auto-fusion sites. Runs in every plugin process; the TP workers are where the megatron
-    # modules live, so that is where sites actually wire. Inert unless SKYRL_ISOEXEC_AUTOFUSE=1
-    # (default 0); decisions are consumed from the fusion ledger, never made here. Wrapped: a wiring
-    # failure demotes to eager per site and must never take down the plugin.
+    # Bitwise auto-fusion sites; inert unless SKYRL_ISOEXEC_AUTOFUSE=1. Decisions come from the
+    # fusion ledger, never from here; a wiring failure demotes to eager per site.
     try:
         from ...autofuse.sites import (
             install_autofuse_sites,

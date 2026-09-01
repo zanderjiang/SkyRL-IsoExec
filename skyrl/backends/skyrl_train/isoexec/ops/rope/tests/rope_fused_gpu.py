@@ -1,35 +1,10 @@
-"""Bitwise gate for O8 -- fused attention RoPE (K5 kernel + K5a cos/sin hoist).
+"""Bitwise gate for the fused attention RoPE kernel and its cos/sin hoist.
+
+Nine sections, each labelled where it starts: shape coverage, reference identity, hoist liveness,
+FFMA contraction, FTZ, tile independence, adversarial inputs, eligibility, and decode/graph replay.
 
 Run: CUDA_VISIBLE_DEVICES=<gpu> uv run --isolated --extra isoexec \
         PYTHONPATH=. python skyrl/backends/skyrl_train/isoexec/ops/rope/tests/rope_fused_gpu.py
-
-WHAT THIS GATES, and why each section exists (every one is a failure this program has already paid
-for -- see PERFORM_GAMEPLAN.md §0):
-
-  [1] bitwise vs the eager expression, at EVERY production shape the install touches. `torch.equal`,
-      never `allclose`. O6 shipped an installed-but-ungated width (256) because its gate covered two
-      of the three widths its installer swapped.
-  [2] the reference is the RIGHT one. The stack has TWO `_apply_rotary_pos_emb_bshd` with DIFFERENT
-      rounding (stock bf16 3-round vs megatron_patches' fp32 1-round). This section asserts the real
-      megatron stock function agrees, and asserts the fp32 patched form DIFFERS -- so "we matched the
-      wrong function" cannot pass silently.
-  [3] the hoist is not INERT. K2a's first revision hoisted nothing and all 32 bitwise checks passed.
-      Counts computes vs calls, with a positive control (fresh freqs each call) that must NOT hoist.
-  [4] FFMA contraction. I predicted immunity (all operands bf16-derived, so products are exact,
-      and each is rounded to bf16 before the add) and the MEASUREMENT REFUTED IT: fusion-on differs
-      from eager in 4,762/16,384, contracting one product into the add and eliding that product's
-      explicit down-cast. `enable_fp_fusion=False` is load-bearing, and this section identifies the
-      exact contracted form so a future Triton that changes it fails rather than re-blessing.
-  [5] FTZ, with a positive control. No divide/exp/log1p/sqrt in the kernel, but "no subnormal was
-      ever produced" is how O2 shipped its bug: the input population is driven bf16-subnormal and
-      `assert_no_ftz` refuses to pass vacuously.
-  [6] the tile is not the contract (no reduction in this kernel) -- proven, not asserted.
-  [7] unrepresentative inputs. randn rows are well-conditioned; real residual streams carry
-      massive-activation outliers. Heavy-tailed and outlier-injected populations.
-  [8] eligibility / fall-through. An unmarked freqs, a grad-enabled call, `rotary_interleaved`, a
-      non-contiguous t -- each must take the ORIGINAL path and return the eager answer.
-  [9] a 150-step decode loop at ragged positions, and CUDA-graph capture+replay, both bitwise.
-      An offline gate that never replays a graph cannot see what production runs.
 """
 
 import os
@@ -56,10 +31,8 @@ from skyrl.backends.skyrl_train.isoexec.ops.rope import rope_fused as rf  # noqa
 
 DEV = "cuda"
 
-# EVERY shape the install actually touches on Qwen3.5-35B-A3B, from its config.json -- not round
-# numbers I liked. head_dim=256, partial_rotary_factor=0.25 -> rotary_dim=64. 16 q heads and 2 kv
-# heads GLOBAL, so at TP8 a rank sees H=2 (query) and H=1 (key). D=R is the full-rotary case other
-# models in this repo hit; D=128/R=64 covers a smaller head_dim.
+# Every shape the install touches on Qwen3.5-35B-A3B: head_dim=256, rotary_dim=64, and at TP8 a
+# rank sees H=2 (query) / H=1 (key). D=R is the full-rotary case other models here hit.
 PROD_HEADS = (2, 1)
 PROD_D, PROD_R = 256, 64
 SHAPES = [(D, R) for D, R in ((256, 64), (256, 256), (128, 64), (64, 64), (192, 64))]
@@ -72,11 +45,9 @@ _BITS = {torch.bfloat16: torch.int16, torch.float16: torch.int16, torch.float32:
 
 
 def check(name, a, b):
-    """`torch.equal`, but on BIT PATTERNS for float dtypes.
+    """`torch.equal`, but on bit patterns for float dtypes.
 
-    Plain `torch.equal` on floats says `-0.0 == +0.0` and `NaN != NaN`. The first would have hidden
-    this kernel's `_rotate_half` negation bug entirely (Triton's unary minus does not flip the sign
-    of zero); the second turns a NaN-producing bug into a spurious failure. Compare the bits.
+    Plain `torch.equal` on floats says `-0.0 == +0.0` (which hides negation bugs) and `NaN != NaN`.
     """
     global _checks
     _checks += 1
@@ -92,7 +63,7 @@ def check(name, a, b):
 
 
 def expect_differs(name, a, b):
-    """A control: these MUST differ, or the thing it protects is not being protected."""
+    """A control: these must differ, or the thing it protects is not being protected."""
     global _checks
     _checks += 1
     if torch.equal(a, b):
@@ -113,7 +84,7 @@ def expect(name, cond, detail=""):
 
 
 # =================================================================================================
-# the reference: megatron's STOCK _apply_rotary_pos_emb_bshd, transcribed. Section [2] checks this
+# the reference: megatron's stock _apply_rotary_pos_emb_bshd, transcribed. Section [2] checks the
 # transcription against the real thing.
 # =================================================================================================
 def _rotate_half(x):
@@ -131,7 +102,7 @@ def eager_stock(t, freqs, mscale=1.0):
 
 
 def eager_fp32_patched(t, freqs, mscale=1.0):
-    """megatron_patches' variant -- the WRONG reference for this kernel. Used as a control."""
+    """megatron_patches' variant -- the wrong reference for this kernel. Used as a control."""
     rot_dim = freqs.shape[-1]
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
     in_dtype = t.dtype
@@ -172,9 +143,8 @@ for B in (2, 3):
     t = torch.randn(64, B, 2, PROD_D, dtype=torch.bfloat16, device=DEV)
     fq = make_freqs(64, PROD_R, seed=B)
     check(f"B={B}", fused(t, fq), eager_stock(t, fq))
-# STRIDED input. `query`/`key` reach RoPE from a split of the fused qkv projection, and whether
-# that split lands contiguous depends on qk_layernorm and the rank's head counts. If the kernel
-# required contiguity it would silently fall back on some shard geometries -- correct and worthless.
+# Strided input: qkv splits are not always contiguous, and a contiguity requirement would make the
+# kernel silently fall back on some shard geometries.
 for nm, mk in (
     ("head-slice", lambda: torch.randn(320, 1, 6, PROD_D, dtype=torch.bfloat16, device=DEV)[:, :, 1:3]),
     ("feature-slice", lambda: torch.randn(320, 1, 2, PROD_D * 2, dtype=torch.bfloat16, device=DEV)[..., :PROD_D]),
@@ -207,8 +177,8 @@ try:
 except Exception as e:  # pragma: no cover
     print(f"  SKIP megatron not importable ({type(e).__name__}: {e}) -- transcription unverified")
     _fails.append("megatron stock reference not verified")
-# The control that makes [1] meaningful: the fp32 patched form is a DIFFERENT function. If these
-# were equal, matching one would say nothing about matching the other and this whole section is air.
+# The control that makes [1] meaningful: the fp32 patched form must be a different function, or
+# matching one says nothing about matching the other.
 expect_differs("stock vs fp32-patched rope", eager_stock(t, fq), eager_fp32_patched(t, fq))
 expect_differs("kernel vs fp32-patched rope", fused(t, fq), eager_fp32_patched(t, fq))
 
@@ -227,8 +197,8 @@ expect(
     f"got {rf.HOIST_STATS} -- expected 20 calls, 1 compute",
 )
 print(f"  ok   {rf.hoist_report()}")
-# POSITIVE CONTROL: a fresh freqs object per call must NOT hoist. If this also reported 1 compute,
-# the counter would be measuring nothing and section [3] would pass with the hoist deleted.
+# Positive control: a fresh freqs object per call must NOT hoist, or the counter is measuring
+# nothing and this section would pass with the hoist deleted.
 rf.HOIST_STATS.update(calls=0, computes=0)
 for i in range(20):
     fresh = make_freqs(320, PROD_R, seed=3)  # same VALUES, new OBJECT
@@ -259,7 +229,7 @@ print("\n[4] FFMA contraction -- NOT immune: enable_fp_fusion=False is load-bear
 
 @triton.jit
 def _ffma_probe(T, C, S_, O, n, D: tl.constexpr, R: tl.constexpr, BD: tl.constexpr):
-    """`x*c + r*s` kept in fp32 -- the form contraction CAN change. Not the production chain."""
+    """`x*c + r*s` kept in fp32 -- a form contraction can change. Not the production chain."""
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, BD)
     m = (row < n) & (d < R)
@@ -283,8 +253,7 @@ for fuse in (False, True):
     o = torch.zeros_like(tf)
     _ffma_probe[(N,)](tf, cf, sf, o, N, D=PROD_D, R=PROD_R, BD=256, num_warps=4, enable_fp_fusion=fuse)
     outs[fuse] = o
-# CONTROL: on an fp32 population contraction is observable. If this passed as "identical" the
-# check below would be measuring nothing -- which is exactly how O3's FFMA control went vacuous.
+# Control: on an fp32 population contraction is observable, or the check below measures nothing.
 expect_differs("FFMA control: fp32 operands, fusion on vs off", outs[False], outs[True])
 tfr = tf[:, :PROD_R]
 rot = torch.cat((-tfr[:, PROD_R // 2 :], tfr[:, : PROD_R // 2]), dim=-1)
@@ -292,11 +261,8 @@ eager_seq = tfr * cf + rot * sf
 addcmul = torch.addcmul(rot * sf, tfr, cf)
 expect_differs("FFMA control: eager mul+add vs addcmul", eager_seq, addcmul)
 check("FFMA control: fused kernel == addcmul", outs[True][:, :PROD_R], addcmul)
-# NOW THE PRODUCTION CHAIN -- and it is NOT immune, which is the opposite of what the "bf16
-# operands are exact" argument predicts. LLVM contracts one of the two products into the add and
-# ELIDES THAT PRODUCT'S EXPLICIT `.to(bf16)`; the sibling's round survives. So the control here is
-# the production kernel itself, not a synthetic fp32 stand-in: `enable_fp_fusion=False` is
-# load-bearing, and this asserts it.
+# The production chain is NOT immune: LLVM contracts one product into the add and elides that
+# product's explicit `.to(bf16)`, so `enable_fp_fusion=False` is load-bearing.
 torch.manual_seed(44)
 t = torch.randn(2048, 1, 2, PROD_D, dtype=torch.bfloat16, device=DEV)
 fq = make_freqs(2048, PROD_R, seed=44)
@@ -326,8 +292,8 @@ for fuse in (False, True):
     got[fuse] = o
 expect_differs("production chain: fp_fusion ON vs OFF", got[True], got[False])
 check("production chain: fp_fusion OFF == eager", got[False], eager_stock(t, fq))
-# and identify WHAT it contracts, so a future Triton that changes this is caught rather than
-# silently re-blessed: fuse=True keeps p2's bf16 round and folds x*cos into the add.
+# Identify what it contracts, so a future Triton that changes this is caught: fuse=True keeps p2's
+# bf16 round and folds x*cos into the add.
 xr = t[..., :PROD_R].float()
 rot_r = torch.cat((-xr[..., PROD_R // 2 :], xr[..., : PROD_R // 2]), dim=-1)
 p2_ref = (rot_r * sin_.float()).to(torch.bfloat16)
@@ -347,8 +313,8 @@ def _ftz_control(X, O, n, BLOCK: tl.constexpr):
     tl.store(O + p, libdevice.div_rn(x, 1.0), mask=m)
 
 
-# bf16 subnormals live in [1e-41, 1.18e-38); scale a randn population into that window so the
-# rope OUTPUT is subnormal too (cos/sin are O(1), so the product stays in the window).
+# bf16 subnormals live in [1e-41, 1.18e-38); scale a randn population into that window so the rope
+# output is subnormal too (cos/sin are O(1), so the product stays in the window).
 Sf = 1024
 torch.manual_seed(5)
 t_sub = (torch.randn(Sf, 1, 2, PROD_D, device=DEV) * 3e-39).to(torch.bfloat16)
@@ -357,8 +323,8 @@ ref_sub = eager_stock(t_sub, fq)
 got_sub = fused(t_sub, fq)
 st = assert_no_ftz("rope on bf16-subnormal activations", ref_sub.float(), got_sub.float(), fail_list=_fails)
 _checks += 1
-# and the control: the SAME population through a known-FTZ'd op must flush, or the population
-# contains nothing detectable and the line above proves nothing.
+# The control: the same population through a known-FTZ'd op must flush, or the line above proves
+# nothing about the population.
 flat = ref_sub.float().reshape(-1).contiguous()
 oc = torch.empty_like(flat)
 _ftz_control[(triton.cdiv(flat.numel(), 1024),)](flat, oc, flat.numel(), BLOCK=1024, enable_fp_fusion=False)
@@ -406,7 +372,7 @@ fq = make_freqs(2048, PROD_R, seed=7)
 pops = {}
 torch.manual_seed(7)
 x = torch.randn(2048, 1, 2, PROD_D, device=DEV)
-x[:, 0, 0, 0] += 1e4  # massive activation, the shape that caught O2's bug
+x[:, 0, 0, 0] += 1e4  # massive activation, as real residual streams carry
 pops["outlier"] = x.to(torch.bfloat16)
 pops["heavy_tail"] = (
     torch.randn(2048, 1, 2, PROD_D, device=DEV) * torch.exp(torch.randn(2048, 1, 2, 1, device=DEV) * 6)
@@ -416,14 +382,12 @@ pops["zeros"] = torch.zeros(2048, 1, 2, PROD_D, dtype=torch.bfloat16, device=DEV
 pops["signed_zero"] = (torch.zeros(2048, 1, 2, PROD_D, device=DEV) * -1.0).to(torch.bfloat16)
 for nm, p in pops.items():
     r, g = eager_stock(p, fq), fused(p, fq)
-    # BIT PATTERNS, not values. Two reasons: NaN != NaN, and -0.0 == +0.0 under `torch.equal` on
-    # floats -- which would have hidden the `_rotate_half` negation bug entirely.
+    # Bit patterns, not values: NaN != NaN, and -0.0 == +0.0 would hide a negation bug.
     check(f"pop={nm}", g.view(torch.int16), r.view(torch.int16))
 
 
-# SIGN OF ZERO, with a positive control. Triton's unary `-x` lowers to `0.0 - x`, which returns
-# +0.0 for a +0.0 input where torch's `neg` returns -0.0. The control below is the UNFIXED form:
-# it must differ from torch, or the `* -1.0` in the kernel is protecting against nothing.
+# Sign of zero, with a positive control: Triton's unary `-x` lowers to `0.0 - x`, which returns
+# +0.0 where torch's `neg` gives -0.0. The unfixed form below must differ from torch.
 @triton.jit
 def _neg_probe(X, O, n, MODE: tl.constexpr, BLOCK: tl.constexpr):
     p = tl.arange(0, BLOCK)
@@ -453,10 +417,8 @@ t = torch.randn(256, 1, 2, PROD_D, dtype=torch.bfloat16, device=DEV)
 fq_marked = rf.mark_engine_rope(make_freqs(256, PROD_R, seed=8))
 fq_plain = make_freqs(256, PROD_R, seed=8)
 ref = eager_stock(t, fq_marked)
-# THE ENGINE RUNS UNDER `torch.inference_mode()` (vLLM's model runner), so grad is disabled there.
-# This block must reproduce that or the grad guard rejects everything and the "fused path" check
-# below silently measures the FALLBACK -- which returns the same answer and passes. That is exactly
-# how a green gate can bless a kernel that never ran.
+# The engine runs under `torch.inference_mode()`, so grad is off there. Reproduce that here, or the
+# grad guard rejects everything and the checks below silently measure the fallback.
 with torch.no_grad():
     check("marked freqs -> fused path", rf._fused_apply_rotary_pos_emb_bshd(t, fq_marked), ref)
     expect("marked freqs is eligible", rf._eligible(t, fq_marked, False, False), "marked freqs rejected")
@@ -464,9 +426,8 @@ with torch.no_grad():
     expect("rotary_interleaved is NOT eligible", not rf._eligible(t, fq_marked, True, False), "interleaved accepted")
     expect("mla_interleaved is NOT eligible", not rf._eligible(t, fq_marked, False, True), "mla accepted")
     expect("fp32 t is NOT eligible", not rf._eligible(t.float(), fq_marked, False, False), "fp32 accepted")
-    # A non-unit LAST stride is the one layout the kernel cannot address (the feature axis uses an
-    # implicit unit stride). It must fall through -- silently rotating the wrong lanes would not
-    # fault. A merely non-contiguous t with unit last stride IS handled; section [1] gates it.
+    # A non-unit last stride is the one layout the kernel cannot address, and rotating the wrong
+    # lanes would not fault. Non-contiguous t with unit last stride IS handled (section [1]).
     _t_str = torch.randn(256, 1, 2, PROD_D, 2, dtype=torch.bfloat16, device=DEV)[..., 0]
     expect("non-unit last stride is NOT eligible", not rf._eligible(_t_str, fq_marked, False, False), "accepted")
     check(
@@ -476,15 +437,14 @@ with torch.no_grad():
     )
     _t_ok = torch.randn(256, 1, 4, PROD_D, dtype=torch.bfloat16, device=DEV)[:, :, :2]
     expect("non-contiguous (unit last stride) IS eligible", rf._eligible(_t_ok, fq_marked, False, False), "rejected")
-    # inference_mode specifically -- what vLLM actually uses, and it is not the same object as
-    # no_grad even though both disable grad.
+    # inference_mode specifically: not the same object as no_grad, though both disable grad.
     with torch.inference_mode():
         expect("eligible under inference_mode", rf._eligible(t, fq_marked, False, False), "inference_mode rejected")
-# UNMARKED: this is the guard that keeps the fusion off the trainer even though the install point
-# is a module global. It must be false, and the answer must still be right.
+# Unmarked: the guard that keeps the fusion off the trainer even though the install point is a
+# module global. It must be false, and the answer must still be right.
 check("unmarked freqs -> original path", rf._fused_apply_rotary_pos_emb_bshd(t, fq_plain), ref)
-# grad: a raw Triton call has no grad_fn, so a grad-enabled call must never reach it. This is the
-# guard whose absence severed the MoE backward for five live steps under a green forward gate.
+# grad: a raw Triton call has no grad_fn, so a grad-enabled call must never reach it or the
+# backward is severed.
 expect("grad enabled is NOT eligible", not rf._eligible(t, fq_marked, False, False), "fused path open under grad")
 tg = t.clone().requires_grad_(True)
 with torch.no_grad():
@@ -503,7 +463,7 @@ with torch.no_grad():  # as the engine runs -- otherwise every step takes the fa
         t = torch.randn(S, 1, 2, PROD_D, dtype=torch.bfloat16, device=DEV)
         fq = rf.mark_engine_rope(make_freqs(S, PROD_R, seed=step))  # new positions every step
         got = rf._fused_apply_rotary_pos_emb_bshd(t, fq)
-        # bit patterns again: -0.0 == +0.0 would let the negation bug back through
+        # bit patterns again: -0.0 == +0.0 would let a negation bug back through
         if not torch.equal(got.view(torch.int16), eager_stock(t, fq).view(torch.int16)):
             bad += 1
 expect("150-step decode loop bitwise", bad == 0, f"{bad}/150 steps differed")
@@ -537,9 +497,8 @@ for rep in range(20):
     same += int(bitwise_equal(out_static, ref_graph))
 expect("CUDA graph: 20/20 replays bitwise", same == 20, f"{same}/20 replays matched")
 
-# determinism: the same input 20x must give the same bits (a racy kernel shows up here, though a
-# race across THREADS in an in-place update would not -- this kernel has no in-place update and
-# never reads memory another program writes, which is the structural reason O3's bug cannot recur).
+# determinism: the same input 20x must give the same bits. This kernel has no in-place update and
+# never reads memory another program writes.
 torch.manual_seed(10)
 t = torch.randn(4096, 1, 2, PROD_D, dtype=torch.bfloat16, device=DEV)
 fq = make_freqs(4096, PROD_R, seed=10)
