@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import torch
 
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_matched_prep_gate as _mpg
 from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_matched_prep_gate import (
     matched_prep_fused_gate_enabled,
     maybe_matched_prep_fused_gate,
     maybe_matched_prep_fused_l2,
 )
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_matched_prep_gate as _mpg
 
 
 def matched_prep_fused_gate_stats():
     # inlined: the public module keeps the counters but not this test accessor
     return dict(_mpg._COUNTS)
-
 
 
 def test_default_on_and_explicit_off(monkeypatch):

@@ -2,9 +2,9 @@
 
 ``IsoExecGDNStateLayer`` registers each GDN layer with vLLM so the scheduler supplies Mamba metadata
 and slot identities, while ``swap_gdn_core`` keeps Megatron's projections, weights, normalization and
-output modules and routes only the stateful core through the IsoExec implementation. In chunk-synced
+output modules and routes only the stateful core through the IsoExec implementation. In CPR
 mode the vLLM Mamba tensors are minimal slot-name pages and the real state lives in
-``ChunkSyncedGDN``; native-state recurrent mode binds the vLLM tensors directly. Engine-only, enabled
+``CprGDN``; native-state recurrent mode binds the vLLM tensors directly. Engine-only, enabled
 by ``SKYRL_ISOEXEC_GDN=1``.
 """
 
@@ -79,22 +79,22 @@ def state_layer_cls():
 
             self.kv_cache = (torch.tensor([]), torch.tensor([]))
             self._cc = None
-            # Build the chunk-synced core EAGERLY at model-build time: a lazy first build would land
+            # Build the CPR core EAGERLY at model-build time: a lazy first build would land
             # on the CUDA-graph capture run, and the sleepable-pool allocation aborts the worker if it
             # happens under stream capture. Weights are re-read every call anyway.
-            from ...ops.gdn.gdn_ops import chunk_synced_mode as _cs_mode
+            from ...ops.gdn.gdn_ops import cpr_mode as _cpr_mode
 
-            if _cs_mode():
+            if _cpr_mode():
                 from vllm.model_executor.layers.fla.ops.utils import (
                     FLA_CHUNK_SIZE as _C,
                 )
 
-                from ...ops.gdn.gdn_chunk_synced_state import (
-                    build_chunk_synced_gdn as _build_cs,
+                from ...ops.gdn.gdn_cpr_state import (
+                    build_cpr_gdn as _build_cpr,
                 )
 
                 _cw = gdn.conv1d.weight.squeeze(1)
-                self._cc = _build_cs(
+                self._cc = _build_cpr(
                     max_num_seqs=self.max_num_seqs,
                     chunk_size=_C,
                     conv_weight=_cw,
@@ -111,7 +111,7 @@ def state_layer_cls():
                 )
                 self._cc.lazy_resync = True
                 logger.info(
-                    "[isoexec-gdn] %s: chunk-synced core built EAGERLY (pre-capture), capacity=%d",
+                    "[isoexec-gdn] %s: CPR core built EAGERLY (pre-capture), capacity=%d",
                     prefix,
                     self.max_num_seqs,
                 )
@@ -131,15 +131,15 @@ def state_layer_cls():
             return MambaAttentionBackendEnum.GDN_ATTN
 
         def get_state_shape(self):
-            # Chunk mode keeps all state in ChunkSyncedGDN's private pools and uses the vLLM pages
+            # Chunk mode keeps all state in CprGDN's private pools and uses the vLLM pages
             # only as a slot-id source, so they shrink to bytes. MUST agree with
             # GPTModelVLLMWrapper.get_mamba_state_shape_from_config: vLLM sizes and pads pages from
             # that at config time and carves the runtime tensors from this spec, and a full-size spec
             # over a minimally-padded page fails page unification.
-            from ...ops.gdn.gdn_ops import GDN_CS_MIN_STATE_SHAPES, gdn_cs_min_pages
+            from ...ops.gdn.gdn_ops import GDN_CPR_MIN_STATE_SHAPES, gdn_cpr_min_pages
 
-            if gdn_cs_min_pages():
-                return GDN_CS_MIN_STATE_SHAPES
+            if gdn_cpr_min_pages():
+                return GDN_CPR_MIN_STATE_SHAPES
             return MambaStateShapeCalculator.gated_delta_net_state_shape(
                 self.tp_size,
                 self.num_k_heads,
@@ -227,11 +227,11 @@ def state_layer_cls():
         def _state(self):
             from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 
-            from ...ops.gdn.gdn_chunk_synced_state import (
-                ChunkSyncedGDN,
-                build_chunk_synced_gdn,
+            from ...ops.gdn.gdn_cpr_state import (
+                CprGDN,
+                build_cpr_gdn,
             )
-            from ...ops.gdn.gdn_ops import chunk_synced_mode, recurrent_mode
+            from ...ops.gdn.gdn_ops import cpr_mode, recurrent_mode
             from ...ops.gdn.gdn_recurrent_state import (
                 build_recurrent_gdn,
                 native_state_enabled,
@@ -261,10 +261,10 @@ def state_layer_cls():
                     )
                     self._cc = None
 
-            if self._cc is None and chunk_synced_mode():
+            if self._cc is None and cpr_mode():
                 # Private pool only: the entry states + open-chunk buffers live beside our pool, and
                 # they must be sized by the concurrency cap, not by vLLM's slot count.
-                self._cc = build_chunk_synced_gdn(
+                self._cc = build_cpr_gdn(
                     max_num_seqs=self.max_num_seqs,
                     chunk_size=FLA_CHUNK_SIZE,
                     conv_weight=conv_weight,
@@ -283,7 +283,7 @@ def state_layer_cls():
                 # pure device work; boundaries are serviced pre-forward by the metadata-builder wrap.
                 self._cc.lazy_resync = True
                 logger.info(
-                    "[isoexec-gdn] %s: chunk-synced decode+prefill (LAZY resync every %d), capacity=%d",
+                    "[isoexec-gdn] %s: CPR decode+prefill (LAZY resync every %d), capacity=%d",
                     self.prefix,
                     FLA_CHUNK_SIZE,
                     self.max_num_seqs,
@@ -325,13 +325,19 @@ def state_layer_cls():
                 )
                 from ...core.process_contract import cached_contract_view
 
-                if isinstance(self._cc, ChunkSyncedGDN):
+                # Pins off the pool that was built, not off the profile that asked for it: the
+                # boundary dtype (and C) are the contract's only representation of the state the
+                # trainer's segmented scan has to match.
+                _state_dtype = str(getattr(self._cc.ssm_state, "dtype", "")).split(".")[-1]
+                if isinstance(self._cc, CprGDN):
                     # Its own fp32 entry states + open-chunk buffers; vLLM's state pages are a
                     # slot-id source only (and are refused outright as a state tensor).
-                    _state_impl = "chunk_synced_pool"
+                    _state_impl = "cpr_pool"
+                    _state_pins = {"ssm_state_dtype": _state_dtype, "chunk_size": int(self._cc.chunk_size)}
                 else:
                     _state_impl = "native_kv_cache" if getattr(self._cc, "_native", False) else "private_pool"
-                record_installs("gdn.state", ENGINE_SITES, _state_impl, self._cc)
+                    _state_pins = {"ssm_cache_dtype": _state_dtype}
+                record_installs("gdn.state", ENGINE_SITES, _state_impl, self._cc, pinned=_state_pins)
                 log_fingerprint_once(cached_contract_view(), tag="engine_first_forward")
             except Exception as _e:  # pragma: no cover - never fatal
                 logger.warning(f"[ISOEXEC-FINGERPRINT] gdn.state record skipped: {_e}")
@@ -370,7 +376,7 @@ def _gdn_inference_forward(self, hidden_states, attention_mask=None, **kwargs):
     """Replacement ``GatedDeltaNet.forward`` for the in-vLLM GPTModel. Returns ``(out, bias)``.
 
     Mirrors Megatron's own forward step for step (``in_proj`` -> split -> conv/chunk core ->
-    ``_apply_gated_norm`` -> ``out_proj``), with the conv+chunk core served by ChunkConsistentGDN
+    ``_apply_gated_norm`` -> ``out_proj``), with the conv+core step served by CprGDN
     instead of one full-sequence chunk call. CP/SP are not supported here (the IsoExec recipe runs
     CP=1), so the all-to-alls Megatron does around the core are skipped rather than faked.
     """
@@ -431,18 +437,18 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
         pin_fla_autotune_configs,
         pin_gdn_rmsnorm_rows_per_block,
     )
-    from ...ops.gdn.gdn_ops import chunk_synced_mode
+    from ...ops.gdn.gdn_ops import cpr_mode
     from .gdn_engine_patch import (
-        install_chunk_synced_lazy_driver,
+        install_cpr_lazy_driver,
         lift_gdn_batch_invariance_veto,
     )
 
     pin_fla_autotune_configs()
     pin_gdn_rmsnorm_rows_per_block()
-    if chunk_synced_mode():
-        # chunk_synced always runs the lazy resync driver on the engine: it removes the per-step
+    if cpr_mode():
+        # cpr always runs the lazy resync driver on the engine: it removes the per-step
         # host sync even eager, and is what makes decode capturable under CUDA graphs.
-        install_chunk_synced_lazy_driver()
+        install_cpr_lazy_driver()
     # The GDN layers are batch-invariant under chunk-consistent decode, so let the rest of the model
     # (softmax attention, GEMMs, log_softmax) be made invariant too.
     lift_gdn_batch_invariance_veto()
@@ -480,7 +486,7 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
             record_installs,
         )
         from ...ops.gdn.gdn_ops import (
-            chunk_synced_mode as _cs,
+            cpr_mode as _cpr,
         )
         from ...ops.gdn.gdn_ops import (
             gdn_kernel_mode as _mode,
@@ -496,10 +502,13 @@ def swap_gdn_core(gpt_modules, *, vllm_config) -> int:
         )
 
         if n:
-            _core = "native_fused_sigmoid" if (_nk() and (_rec() or _cs())) else _mode()
-            record_installs("gdn.core", ENGINE_SITES, _core, _gdn_inference_forward)
+            _core = "native_fused_sigmoid" if (_nk() and (_rec() or _cpr())) else _mode()
+            # The pin carries the kernel the native impl runs, as the trainer site does:
+            # `native_fused_sigmoid` alone cannot distinguish a recurrent build from a cpr
+            # one, and the contract pins exactly that.
+            record_installs("gdn.core", ENGINE_SITES, _core, _gdn_inference_forward, pinned={"kernel": _mode()})
             # Distinct kernels per site: the fn form at prefill, the update form at decode.
-            _conv_native = _nconv() or _cs()
+            _conv_native = _nconv() or _cpr()
             record_installs("gdn.conv", PREFILL_ONLY, "causal_conv1d_fn" if _conv_native else "elementwise_shifted_sum")
             record_installs(
                 "gdn.conv", DECODE_ONLY, "causal_conv1d_update" if _conv_native else "elementwise_shifted_sum"

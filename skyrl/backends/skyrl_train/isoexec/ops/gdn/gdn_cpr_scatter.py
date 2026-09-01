@@ -1,4 +1,4 @@
-"""One-launch open-chunk buffer scatter for ChunkSyncedGDN.decode.
+"""One-launch open-chunk buffer scatter for CprGDN.decode.
 
 Replaces four advanced-index scatters (k/v/g/beta), the ``pos`` index_put and the optional ``last_used``
 LRU stamp with one Triton program per decode lane. Pure data movement: values are stored in the dtype they
@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-_ENV = "SKYRL_ISOEXEC_GDN_CS_FUSED_SCATTER"
+_ENV = "SKYRL_ISOEXEC_GDN_CPR_FUSED_SCATTER"
 
 
 def fused_scatter_enabled() -> bool:
@@ -23,7 +23,7 @@ def fused_scatter_enabled() -> bool:
 
 
 @triton.jit
-def _cs_scatter_kernel(
+def _cpr_scatter_kernel(
     k_ptr,
     v_ptr,
     g_ptr,
@@ -79,7 +79,7 @@ def _cs_scatter_kernel(
         tl.store(lastused_ptr + row, tl.load(clock_ptr))
 
 
-def cs_buffer_scatter(
+def cpr_buffer_scatter(
     k, v, g, beta, rows, pos, k_buf, v_buf, g_buf, b_buf, chunk_size: int, last_used=None, clock=None
 ) -> None:
     """Scatter this step's post-prep values into the open-chunk buffers and advance ``pos``.
@@ -89,20 +89,20 @@ def cs_buffer_scatter(
     ``last_used``/``clock`` are optional but passed together: the int64 LRU array and a 0-d int64 clock
     the caller has already bumped for this step. Omit both to stamp the LRU yourself.
     """
-    N, Hk, K = k.shape  # Hk may be the GQA-compressed head count (v2 buffers raw k)
+    N, Hk, K = k.shape  # Hk may be the GQA-compressed head count (the native path buffers raw k)
     V = v.shape[-1]
-    HV = g.shape[-1]  # the gating slots are always HV-wide (fp32 g in v1, raw a in v2)
+    HV = g.shape[-1]  # the gating slots are always HV-wide (fp32 g eagerly, raw a natively)
     HVpow = triton.next_power_of_2(HV)
     if HVpow != HV:
-        raise ValueError(f"[isoexec-gdn] cs scatter: HV={HV} must be a power of 2 (pad the head dim path)")
+        raise ValueError(f"[isoexec-gdn] cpr scatter: HV={HV} must be a power of 2 (pad the head dim path)")
     has_lu = last_used is not None
     if has_lu != (clock is not None):
-        raise ValueError("[isoexec-gdn] cs scatter: last_used and clock are passed together or not at all")
+        raise ValueError("[isoexec-gdn] cpr scatter: last_used and clock are passed together or not at all")
     if has_lu and (last_used.dtype != torch.int64 or clock.dtype != torch.int64 or clock.numel() != 1):
-        raise TypeError("[isoexec-gdn] cs scatter: last_used must be int64[rows] and clock a 0-d int64")
+        raise TypeError("[isoexec-gdn] cpr scatter: last_used must be int64[rows] and clock a 0-d int64")
     if k.dtype != k_buf.dtype or v.dtype != v_buf.dtype or g.dtype != g_buf.dtype or beta.dtype != b_buf.dtype:
-        raise TypeError("[isoexec-gdn] cs scatter: caller converts dtypes up front (pure copies only)")
-    _cs_scatter_kernel[(N,)](
+        raise TypeError("[isoexec-gdn] cpr scatter: caller converts dtypes up front (pure copies only)")
+    _cpr_scatter_kernel[(N,)](
         k,
         v,
         g,

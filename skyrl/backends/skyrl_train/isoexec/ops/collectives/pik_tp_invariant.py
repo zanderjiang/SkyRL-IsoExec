@@ -221,11 +221,11 @@ def _assert_plan_matches_manifest(side: str, plan) -> None:
         "the model profile's pik_leaves / pik_leaf_dtype so the manifest names what you run "
         "(a different composition: new hash, new gate signature, new proof obligation)."
     )
-    strict = os.environ.get("SKYRL_ISOEXEC_MANIFEST_STRICT", "1").lower() not in ("", "0", "false", "no")
-    if strict:
-        raise RuntimeError(msg)
-    print(msg + " (SKYRL_ISOEXEC_MANIFEST_STRICT=0 -> warn-only)", flush=True)
-    logger.error(msg)
+    # Through the one demotion helper, like every other enforcement refusal: a debug run must
+    # reach its trace.
+    from ...core.enforce import refuse
+
+    refuse(msg)
 
 
 class _PikRowParallel(torch.autograd.Function):

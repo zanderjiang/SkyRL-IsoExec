@@ -60,6 +60,7 @@ def _reset_root_cast_state():
     for k in AR._ROOT_CAST_COUNTS:
         AR._ROOT_CAST_COUNTS[k] = 0
 
+
 CG = importlib.import_module("skyrl.backends.skyrl_train.isoexec.ops.collectives.pik.codegen")
 
 WORLDS = (2, 4, 8)
@@ -853,12 +854,10 @@ def test_the_two_row_parallel_twins_carry_the_same_guard():
     for src in (inspect.getsource(linear.row_parallel_linear), inspect.getsource(vllm_patch._row_forward)):
         lines = src.splitlines()
         call = next(
-            i for i, ln in enumerate(lines)
-            if "tree_all_reduce_rounded(" in ln and not ln.strip().startswith("#")
+            i for i, ln in enumerate(lines) if "tree_all_reduce_rounded(" in ln and not ln.strip().startswith("#")
         )
         guard = next(
-            ln for ln in reversed(lines[:call])
-            if ln.strip().startswith("if ") and not ln.strip().startswith("#")
+            ln for ln in reversed(lines[:call]) if ln.strip().startswith("if ") and not ln.strip().startswith("#")
         )
         assert "bias is None" in guard, guard
         assert "bf16_leaves" in guard, guard

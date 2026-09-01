@@ -1,6 +1,6 @@
 """Byte-exact launch fusion for the elementwise half of ``native_matched_prep``.
 
-The canonical boundary preparation stays defined by ``gdn_chunk_synced.native_matched_prep``; this
+The canonical boundary preparation stays defined by ``gdn_cpr.native_matched_prep``; this
 module only collapses its eager ``a/b -> g/beta`` expression into one launch. The key normalisation
 is deliberately left alone, because PyTorch's fp32 reduction order differs from vLLM's row-norm
 kernel for some 128-wide rows and substituting it would change bits.

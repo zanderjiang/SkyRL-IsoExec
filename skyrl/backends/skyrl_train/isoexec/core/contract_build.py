@@ -33,8 +33,9 @@ from ..contract import (
     compute_identities,
     validate_or_raise,
 )
-from .arch import ARCH, is_accelerator_arch
-from .registry import Registry
+from . import claim_refs
+from .arch import ARCH, HardwareTarget, is_accelerator_arch
+from .registry import Registry, RegistryError
 
 # Per-selection classification vocabulary: FUNCTION halves are hashed, DEPLOYMENT halves are
 # proven bitwise-neutral and logged but not hashed.
@@ -175,19 +176,80 @@ def _impl_spec(registry: Registry, op: str, impl_id: str):
     return None
 
 
+def _bitwise_edges(registry: Registry, op: str, impl_ids: list) -> dict:
+    """``{declaring impl -> sibling it claims byte-equality with}``, every claim checked first.
+
+    A claim that names the declarer itself, an impl the op does not register, or an impl this
+    composition does not select proves nothing about the group, so each of those refuses here
+    rather than discharging it.
+    """
+    edges = {}
+    for impl_id in impl_ids:
+        spec = _impl_spec(registry, op, impl_id)
+        ref = spec.capabilities.get("bitwise_equal_to") if spec else None
+        if ref is None:
+            continue
+        if ref == impl_id:
+            raise ContractBuildError(
+                f"op {op!r}: impl {impl_id!r} declares bitwise_equal_to ITSELF. A self-claim "
+                f"discharges nothing -- name the sibling impl the bit-pattern battery compared it "
+                f"against, or classify the entry with a proof that exists."
+            )
+        if _impl_spec(registry, op, ref) is None:
+            raise ContractBuildError(
+                f"op {op!r}: impl {impl_id!r} declares bitwise_equal_to={ref!r}, which is not a "
+                f"registered impl of this op (registered: {sorted(registry.get_op(op).impls)}). "
+                f"The claim names nothing, so it licenses nothing; fix the referent."
+            )
+        if ref not in impl_ids:
+            raise ContractBuildError(
+                f"op {op!r}: impl {impl_id!r} declares bitwise_equal_to={ref!r}, but this "
+                f"composition selects {impl_ids}; the claim does not reach the impls actually in "
+                f"the group, so the asymmetry it must discharge is a different one."
+            )
+        edges[impl_id] = ref
+    return edges
+
+
 def _group_discharge(registry: Registry, op: str, entries: dict) -> Optional[EquivalenceProof]:
-    """The claim discharging an op whose sites resolve to more than one impl."""
+    """The claim discharging an op whose sites resolve to more than one impl.
+
+    The discharge licenses the WHOLE group, so it is chosen only after the group's claims are
+    checked: bitwise_equal_to claims must link every selected impl (a pairwise claim leaves an
+    unclaimed third impl undischarged), and an equivalence_proof must resolve to a gate in the
+    tree. ``ops/AGENT.md`` §3 is the rule these enforce.
+    """
     impl_ids = sorted({e.impl_id for e in entries.values()})
     if len(impl_ids) <= 1:
         return None
+    edges = _bitwise_edges(registry, op, impl_ids)
+    if edges:
+        linked = {i: {i} for i in impl_ids}
+        for a, b in edges.items():
+            merged = linked[a] | linked[b]
+            for member in merged:
+                linked[member] = merged
+        component = linked[impl_ids[0]]
+        if len(component) != len(impl_ids):
+            raise ContractBuildError(
+                f"op {op!r} resolves to {impl_ids} across sites, but the declared bitwise_equal_to "
+                f"claims {edges} link only {sorted(component)}: {sorted(set(impl_ids) - component)} "
+                f"carry no discharge. Every impl in an asymmetric group owes a claim of its own; "
+                f"one pairwise claim does not cover the rest."
+            )
+        return EquivalenceProof("bitwise_equal_to", edges[min(edges)])
     for impl_id in impl_ids:
         spec = _impl_spec(registry, op, impl_id)
-        if spec and spec.capabilities.get("bitwise_equal_to") in impl_ids:
-            return EquivalenceProof("bitwise_equal_to", spec.capabilities["bitwise_equal_to"])
-    for impl_id in impl_ids:
-        spec = _impl_spec(registry, op, impl_id)
-        if spec and spec.capabilities.get("equivalence_proof"):
-            return EquivalenceProof("equivalence_proof", spec.capabilities["equivalence_proof"])
+        proof = spec.capabilities.get("equivalence_proof") if spec else None
+        if proof:
+            problem = claim_refs.proof_ref_problem(proof)
+            if problem:
+                raise ContractBuildError(
+                    f"op {op!r}: impl {impl_id!r} declares an equivalence_proof but {problem}. A "
+                    f"pointer nobody can follow is the evidence being asserted rather than "
+                    f"recorded; name the gate that measured the property."
+                )
+            return EquivalenceProof("equivalence_proof", proof)
     proofs = {e.neutrality_proof for e in entries.values() if e.classification == DEPLOYMENT}
     if len(proofs) == 1:
         return EquivalenceProof("neutrality_proof", proofs.pop())
@@ -276,6 +338,24 @@ def build_execution_contract(
             f"that intentionally build a sentinel contract must pass allow_non_accelerator_arch=True."
         )
 
+    if not selections:
+        raise ContractBuildError(
+            "refusing to build a contract from an empty selection map: a contract with no entries "
+            "names no execution, so it constrains nothing and two processes that both failed to "
+            "derive a composition would agree perfectly. Something upstream produced no "
+            "selections (an empty profile, a registry with no ops, a derivation that returned "
+            "early); fix that rather than shipping an empty identity."
+        )
+    try:
+        registry.assert_subsumption_closed()
+    except RegistryError as exc:
+        raise ContractBuildError(
+            f"refusing to build against a registry that is not subsumption-closed: {exc}. A "
+            f"subsumed op reaches the entry's region and the semantic identity's logical_ops, "
+            f"where nothing downstream can resolve it."
+        ) from exc
+
+    target = HardwareTarget(arch)
     normalized: Dict = {}
     for key, val in selections.items():
         op, site = key
@@ -292,6 +372,18 @@ def build_execution_contract(
             raise ContractBuildError(
                 f"selection for ({op!r}, {site!r}) names impl {sel.impl_id!r} not registered "
                 f"on the op (known: {sorted(op_spec.impls)})"
+            )
+        impl_spec = op_spec.impls[sel.impl_id]
+        # Arch admission, skipped only under the sentinel arch, which names no accelerator and so
+        # is not a claim any battery could have been run on.
+        if is_accelerator_arch(arch) and not target.supports(impl_spec.supported_archs):
+            raise ContractBuildError(
+                f"selection for ({op!r}, {site!r}) names impl {sel.impl_id!r}, which declares "
+                f"supported_archs {sorted(impl_spec.supported_archs)}, but this contract is being "
+                f"built for arch {arch!r}. Evidence is arch-scoped (ops/AGENT.md §5): the "
+                f"resulting identity would be keyed to an arch on which nothing was proven, which "
+                f"is the mis-keying the non-accelerator refusal exists to prevent. Re-run the "
+                f"impl's battery on {arch!r} and declare it, or select an impl that supports it."
             )
         normalized[(op, site)] = sel
     if validate_pins:
@@ -337,17 +429,25 @@ def build_execution_contract(
     case_ids = {site for _, site in normalized}
     cases = tuple(c for c in CASES if c.id in case_ids)
     archs = tuple(getattr(profile, "architectures", ()) or ())
+    claims = Claims(
+        topology=derive_topology_claims(topology),
+        state=derive_state_claims(states),
+        tolerances=derive_tolerance_claims(tolerances),
+    )
+    for t in claims.topology:
+        problem = None if t.proof is None else claim_refs.proof_ref_problem(t.proof)
+        if problem:
+            raise ContractBuildError(
+                f"topology claim {t.axis!r}: {problem}. The proof ref is what makes the claimed "
+                f"envelope a recorded measurement rather than an assertion."
+            )
     contract = ExecutionContract(
-        schema_version="1",
+        schema_version="2",
         model=ModelRef(model or "", archs, f"models/{model or 'unknown'}"),
         identities=Identities("", "", ""),
         cases=cases,
         composition=tuple(composition),
-        claims=Claims(
-            topology=derive_topology_claims(topology),
-            state=derive_state_claims(states),
-            tolerances=derive_tolerance_claims(tolerances),
-        ),
+        claims=claims,
     )
     contract = dataclasses.replace(contract, identities=compute_identities(contract))
     required = {

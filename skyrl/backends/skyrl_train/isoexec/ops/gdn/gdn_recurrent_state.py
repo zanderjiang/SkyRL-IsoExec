@@ -39,11 +39,11 @@ def _slot_map_size() -> int:
     v = os.environ.get(_SLOT_MAP_ENV)
     if v:
         return int(v)
-    # CS_MIN_PAGES shrinks the page size, multiplying vLLM's block-id space; every id the mamba
+    # CPR_MIN_PAGES shrinks the page size, multiplying vLLM's block-id space; every id the mamba
     # group hands a live request must still fit this map (out-of-range live ids raise in _assign).
-    from .gdn_ops import gdn_cs_min_pages
+    from .gdn_ops import gdn_cpr_min_pages
 
-    return (1 << 20) if gdn_cs_min_pages() else 65536
+    return (1 << 20) if gdn_cpr_min_pages() else 65536
 
 
 # Chunked-prefill resume, default off. vLLM may split one prompt across several forward passes; chunk
@@ -73,8 +73,8 @@ def native_state_enabled() -> bool:
 
 
 # Counters for the two host reads that would otherwise synchronize every GDN layer in an engine
-# prefill: the LRU snapshot (only when the private pool is full) and chunk_synced's position gather.
-# The position counters are bumped in gdn_chunk_synced_state.
+# prefill: the LRU snapshot (only when the private pool is full) and cpr's position gather.
+# The position counters are bumped in gdn_cpr_state.
 _HOST_BOOKKEEPING_STATS = {
     "lru_mirror": 0,
     "lru_device_fallback": 0,
@@ -348,15 +348,15 @@ class RecurrentGDN:
         The captured decode graph's consumers of ``rows`` want int32 (``causal_conv1d_update``'s
         ``conv_state_indices``, the GDN core's ``state_indices``) while the buffer scatter and the
         ``last_used`` write want int64, so the ATen composition is five single-block kernels per layer.
-        ``gdn_cs_rows`` does the whole chain in one program and emits both widths; this method declines
+        ``gdn_cpr_rows`` does the whole chain in one program and emits both widths; this method declines
         to the bit-identical ATen chain when that kernel is off or the shapes are unexpected. The
         ``_native`` branch always keeps the ATen form -- its clamp is a different function.
         """
         if not self._native:
-            from .gdn_cs_rows import cs_resolve_rows, fused_rows_enabled
+            from .gdn_cpr_rows import cpr_resolve_rows, fused_rows_enabled
 
             if fused_rows_enabled() and slots.is_cuda:
-                pair = cs_resolve_rows(slots, self.slot2row)
+                pair = cpr_resolve_rows(slots, self.slot2row)
                 if pair is not None:
                     return pair
         rows = self._rows(slots)
@@ -496,7 +496,7 @@ class RecurrentGDN:
                     if row in owner:
                         raise RuntimeError(f"[isoexec-gdn] free-list row {row} is still mapped by slot {owner[row]}")
                 else:
-                    # The chunk-synced driver owns request lifetime exactly (finished and preempted
+                    # The CPR driver owns request lifetime exactly (finished and preempted
                     # rows return to `_free`, unscheduled live requests keep their mappings), so a full
                     # driver-managed pool has no legal victim and LRU eviction would steal an
                     # unscheduled live request's row. Offline callers have no such lifecycle and keep
@@ -713,7 +713,7 @@ class RecurrentGDN:
         Two independent facts must agree, and neither alone is sufficient:
 
         * ``slot in self._slot2row`` -- we still hold a row for this slot, whose carried conv/ssm (and,
-          under chunk_synced, entry state and open-chunk buffers) the resume reads.
+          under cpr, entry state and open-chunk buffers) the resume reads.
         * vLLM's ``prefill_has_initial_state[i]`` -- the scheduler says this request continues a prefill
           it already started; only the scheduler knows a request's ``num_computed_tokens``.
 
@@ -742,7 +742,7 @@ class RecurrentGDN:
                     f"[isoexec-gdn] vLLM reports an initial state for prefill row {i} (slot "
                     f"{int(slots_cpu[i])}) but the private state pool holds none -- a prefix-cache "
                     "hit. The private-pool modes cannot resume a prefix they did not themselves "
-                    "scan. Under chunk_synced, set SKYRL_ISOEXEC_GDN_CS_APC=1 so the boundary-state "
+                    "scan. Under cpr, set SKYRL_ISOEXEC_GDN_CPR_APC=1 so the boundary-state "
                     "store serves the hit (its admission clamp then guarantees the row is adopted "
                     "before this call); otherwise run the G4 native composition "
                     "(GDN_KERNEL=recurrent + GDN_NATIVE_KERNELS=1 + GDN_NATIVE_STATE=1)."

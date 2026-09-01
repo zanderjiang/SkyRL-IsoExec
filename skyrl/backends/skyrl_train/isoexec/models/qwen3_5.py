@@ -7,8 +7,6 @@ EP=engine_prefill, ED=engine_decode.
 
 from __future__ import annotations
 
-import os
-
 from .policy import build_selections
 from .profile import (
     SCORE_SOFTMAX,
@@ -63,8 +61,11 @@ PROFILE = ModelProfile(
     #          pipeline_model_parallel_size=1 (runtimes/vllm/gptmodel_vllm.py).
     #   CP  -- pinned 1: the GDN packed-meta shim keeps every cp_size!=1 path unreachable until
     #          the CP=1 tautology is discharged (the named gate pins that unreachability).
-    # EP is deliberately ABSENT: the trainer-EP8/engine-EP1 asymmetry has no recorded invariance
-    # gate in this tree, and an unproven domain is not declarable (profile.TopologyAxisFact refuses).
+    # EP  -- the composition is EP-invariant: the two sides may run different expert-parallel
+    #        degrees (live: trainer EP=8, engine EP=1) without moving forward bits. Not declared
+    #        as a TopologyAxisFact here only because an `invariant` axis requires a repo-relative
+    #        proof ref naming the gate that measured it (profile.TopologyAxisFact refuses an
+    #        unproven domain); add the axis once that gate has a path in this tree.
     topology=(
         TopologyAxisFact(
             axis="TP",
@@ -111,6 +112,11 @@ PROFILE = ModelProfile(
     # scoring) -> a ToleranceClaim. Values are the qualified thresholds the gate enforced
     # (skyrl/train/utils/trainer_utils.py); the gate now READS them back from this claim wherever
     # a contract exists, so the envelope is contract data, not a controller constant.
+    #
+    # These are the RECURRENT variant's bounds, and they are the pre-rowinv envelope: the live
+    # evidence for the exact-zero claim (below, on CPR_PROFILE) was produced under
+    # SKYRL_ISOEXEC_GDN_KERNEL=cpr, and evidence licenses only the composition that
+    # produced it. Tighten this to 0.0 when a recurrent-variant run serves it, not before.
     tolerances=(
         ToleranceFact(
             case_pair=("engine_decode", "trainer_score"),
@@ -124,14 +130,35 @@ PROFILE = ModelProfile(
 EXCEPTIONS: dict = {}
 
 # The second live variant. ``gdn_kernel`` decides TWO ops: the ``gdn.core`` kernel pin, and the
-# ``gdn.state`` impl -- chunk_synced owns its own pools and the engine refuses ``GDN_NATIVE_STATE=1``
+# ``gdn.state`` impl -- cpr owns its own pools and the engine refuses ``GDN_NATIVE_STATE=1``
 # under it, so ``native_kv_cache`` is not selectable there. Declaring the variant here gives it a
 # contract entry and an identity of its own.
 #
 # ``build()`` selects between the two by ``SKYRL_ISOEXEC_GDN_KERNEL`` when no profile is passed:
 # both runtimes read the same forwarded env var, so a matched pair derives the same variant and a
 # one-sided flip is a hash mismatch that refuses at the handshake.
-CHUNK_SYNCED_PROFILE = PROFILE.with_overrides(gdn_kernel="chunk_synced")
+#
+# It also carries the only tolerance claim proven at EXACT ZERO. The leaf-tree logprob makes the
+# engine's and the trainer's denominator the same expression at every row count and TP degree, so
+# the gate's admitted envelope is not "small" but "no difference at all": measured on this
+# composition over 18 gate steps, every step
+# reported mean=0.000e+00 max=0.000e+00 with exact=n/n on ~4M tokens per step. A single ULP now
+# fails the gate -- which is the point: with the denominator pinned there is no floor left for a
+# real regression to hide under.
+CPR_PROFILE = PROFILE.with_overrides(
+    gdn_kernel="cpr",
+    tolerances=(
+        ToleranceFact(
+            case_pair=("engine_decode", "trainer_score"),
+            bounds=(("abs_diff_max_max", "0.0"), ("abs_diff_mean_max", "0.0")),
+        ),
+    ),
+)
+
+# The kernel names this model has a DECLARED variant for. "chunk" is absent by construction, not by
+# omission: the native fused core's schedule admits kernel=OneOf("recurrent", "cpr")
+# (ops/gdn/_register.py), so a chunk composition has no impl to name and cannot be pinned.
+PROFILE_BY_KERNEL = {"recurrent": PROFILE, "cpr": CPR_PROFILE}
 
 # UN-SHARDED widths, derived from the checkpoint's config (NOT back-derived from the legacy
 # cuBLASLt shape table, which omits the gate projections).
@@ -177,15 +204,38 @@ def build(registry, *, arch=None, profile=None):
     """Build the Qwen3.5 ExecutionContract against a registry.
 
     ``profile`` selects the variant explicitly; by default it follows ``SKYRL_ISOEXEC_GDN_KERNEL``
-    (the value the read sites use), so the declaration matches what installs. Same derivation,
-    different hash, so a one-sided flip refuses to run.
+    through the same parser the read sites use (``core/gdn_kernel_env``), so the declaration
+    matches what installs. Same derivation, different hash, so a one-sided flip refuses to run.
     """
     from ..core.arch import ARCH
-    from ..core.contract_build import build_execution_contract
+    from ..core.contract_build import ContractBuildError, build_execution_contract
+    from ..core.gdn_kernel_env import (
+        KERNEL_ENV,
+        TRAINER_KERNEL_ENV,
+        gdn_kernel_mode,
+        gdn_trainer_kernel_override,
+    )
 
     if profile is None:
-        kernel = os.environ.get("SKYRL_ISOEXEC_GDN_KERNEL", "")
-        profile = CHUNK_SYNCED_PROFILE if kernel == "chunk_synced" else PROFILE
+        kernel = gdn_kernel_mode()
+        if kernel not in PROFILE_BY_KERNEL:
+            raise ContractBuildError(
+                f"{KERNEL_ENV}={kernel!r} is the kernel the GDN read sites will run, but this "
+                f"model declares no profile variant for it (declared: {sorted(PROFILE_BY_KERNEL)}). "
+                f"Declaring one of the others anyway would hash a composition that is not the one "
+                f"executing, identically on both runtimes. Export {KERNEL_ENV}=recurrent or "
+                f"{KERNEL_ENV}=cpr, or pass the variant explicitly."
+            )
+        profile = PROFILE_BY_KERNEL[kernel]
+    override = gdn_trainer_kernel_override()
+    if override is not None and override != profile.gdn_kernel:
+        raise ContractBuildError(
+            f"{TRAINER_KERNEL_ENV}={override!r} runs a different delta-rule kernel on the trainer "
+            f"than the {profile.gdn_kernel!r} this contract declares, and the contract pins ONE "
+            f"gdn.core kernel for all four sites -- it has no way to say 'trainer runs a different "
+            f"function'. Both sides would still hash identically, so nothing downstream would "
+            f"catch it. That ablation is not a IsoExec configuration; unset {TRAINER_KERNEL_ENV}."
+        )
     return build_execution_contract(
         registry,
         build_selections(profile, EXCEPTIONS),

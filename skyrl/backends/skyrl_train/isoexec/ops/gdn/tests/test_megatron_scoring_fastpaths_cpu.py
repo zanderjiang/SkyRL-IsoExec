@@ -21,7 +21,6 @@ def _reset_scoring_fused_outnorm_stats():
     shim._SCORING_FUSED_OUTNORM_COUNTS["served"] = 0
 
 
-
 @pytest.fixture(autouse=True)
 def _default_off(monkeypatch):
     monkeypatch.delenv("SKYRL_ISOEXEC_GDN_SCORING_FUSED_OUTNORM", raising=False)
@@ -47,7 +46,7 @@ def test_scoring_fused_outnorm_source_is_eval_and_no_grad_only():
     assert "not self.training" in contract
     assert "not torch.is_grad_enabled()" in contract
     assert "ZeroCenteredTorchRMSNorm" in contract
-    assert 'gate.dtype == torch.bfloat16' in contract
+    assert "gate.dtype == torch.bfloat16" in contract
     assert "_SCORING_FUSED_OUTNORM_MAX_WIDTH" in contract
     assert "tuple(weight.shape) == (width,)" in contract
     assert "weight.device == gate.device" in contract

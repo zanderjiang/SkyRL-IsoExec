@@ -105,13 +105,13 @@ def _l2norm_subsumed_by_core() -> bool:
         3. ``_eager_prepare_qkv``           -- skips ``gdn_l2norm`` when subsumed (negated)
     """
     from ...ops.gdn.gdn_ops import (
-        chunk_synced_mode,
+        cpr_mode,
         gdn_native_kernels_enabled,
         recurrent_mode,
     )
 
-    # chunk_synced-native also runs the fused core within chunks, so l2norm is in-kernel there too.
-    return gdn_native_kernels_enabled() and (recurrent_mode() or chunk_synced_mode())
+    # cpr-native also runs the fused core within chunks, so l2norm is in-kernel there too.
+    return gdn_native_kernels_enabled() and (recurrent_mode() or cpr_mode())
 
 
 def _shim_chunk_gated_delta_rule(
@@ -150,11 +150,11 @@ def _shim_chunk_gated_delta_rule(
         if initial_state is not None or output_final_state:
             raise NotImplementedError("isoexec GDN shim (native): stateless training entry only")
         A_log, dt_bias = _pop_gating_stash()
-        from ...ops.gdn.gdn_ops import chunk_synced_mode, gdn_native_chunk_synced
+        from ...ops.gdn.gdn_ops import cpr_mode, gdn_native_cpr
 
-        if chunk_synced_mode():
-            # Native chunk-synced: fused kernel within chunks, boundary states on the matched prep.
-            return gdn_native_chunk_synced(query, key, value, g, beta, A_log, dt_bias, cu_seqlens=cu_seqlens), None
+        if cpr_mode():
+            # Native CPR: fused kernel within chunks, boundary states on the matched prep.
+            return gdn_native_cpr(query, key, value, g, beta, A_log, dt_bias, cu_seqlens=cu_seqlens), None
         return gdn_native_core(query, key, value, g, beta, A_log, dt_bias, cu_seqlens=cu_seqlens), None
 
     if use_qk_l2norm_in_kernel:
@@ -265,12 +265,12 @@ def _patch_megatron_gdn_native_gating() -> bool:
 
     def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
         from ...ops.gdn.gdn_ops import (
-            chunk_synced_mode,
+            cpr_mode,
             gdn_native_kernels_enabled,
             recurrent_mode,
         )
 
-        if gdn_native_kernels_enabled() and (recurrent_mode() or chunk_synced_mode()):
+        if gdn_native_kernels_enabled() and (recurrent_mode() or cpr_mode()):
             _GATING_STASH.append((A_log_local_cp, dt_bias_local_cp))
             return alpha, beta
         return orig(self, A_log_local_cp, dt_bias_local_cp, alpha, beta)
@@ -302,7 +302,7 @@ def _shim_causal_conv1d(
     import torch
 
     from ...ops.gdn.gdn_ops import (
-        chunk_synced_mode,
+        cpr_mode,
         gdn_causal_conv,
         gdn_native_conv,
         gdn_native_conv_enabled,
@@ -315,8 +315,8 @@ def _shim_causal_conv1d(
     if weight.ndim != 2:
         raise ValueError(f"isoexec GDN shim: causal_conv1d expects weight=[D, W], got {tuple(weight.shape)}")
 
-    if (gdn_native_kernels_enabled() and (recurrent_mode() or chunk_synced_mode())) or (
-        gdn_native_conv_enabled() and chunk_synced_mode()
+    if (gdn_native_kernels_enabled() and (recurrent_mode() or cpr_mode())) or (
+        gdn_native_conv_enabled() and cpr_mode()
     ):
         # One varlen launch for the whole packed batch, bitwise-equal to the engine's prefill conv;
         # its fp32 bias-in-accumulator rounding differs from the eager conv below, so the trainer has

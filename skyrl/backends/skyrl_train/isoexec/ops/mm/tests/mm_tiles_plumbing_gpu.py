@@ -9,7 +9,6 @@ import os
 
 import torch
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)

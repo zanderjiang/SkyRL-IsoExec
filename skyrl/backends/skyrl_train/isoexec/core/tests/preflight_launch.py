@@ -76,7 +76,7 @@ def _run_script_env():
         line = line.strip()
         if not line.startswith("export "):
             continue
-        for tok in line[len("export "):].split():
+        for tok in line[len("export ") :].split():
             if "=" not in tok:
                 continue
             k, _, v = tok.partition("=")
@@ -123,9 +123,7 @@ def _build_contract():
     for side in ("trainer", "engine"):
         plan = enforce.derive_obligation_plan(c, reg, side)
         cnt = Counter((o.phase, o.kind) for o in plan.obligations)
-        by_phase = ", ".join(
-            f"{p}:{sum(n for (ph, _), n in cnt.items() if ph == p)}" for p in enforce.PHASES
-        )
+        by_phase = ", ".join(f"{p}:{sum(n for (ph, _), n in cnt.items() if ph == p)}" for p in enforce.PHASES)
         n_exc = sum(1 for o in plan.obligations if enforce.exemption_for(o.obligation_id) is not None)
         print(
             f"obligations[{side}]: total={len(plan.obligations)} ({by_phase}) "
@@ -146,7 +144,10 @@ def main():
     for f in files:
         r = subprocess.run(
             [sys.executable, str(HERE), "--run-file", str(f)],
-            cwd=REPO, env=env, capture_output=True, text=True,
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
         )
         m = re.search(r"^(\d+)/(\d+) passed\s*$", r.stdout, re.M)
         n_pass, n_total = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
@@ -161,7 +162,10 @@ def main():
 
     r = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", LEAF_PKG, "-t", "."],
-        cwd=REPO, env=env, capture_output=True, text=True,
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
     )
     m = re.search(r"Ran (\d+) tests", r.stderr)
     n_leaf = int(m.group(1)) if m else 0
@@ -177,7 +181,10 @@ def main():
         print("\n[contract] building the production contract under the run-script env")
         r = subprocess.run(
             [sys.executable, str(HERE), "--build-contract"],
-            cwd=REPO, env=env, capture_output=True, text=True,
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
         )
         for line in r.stdout.splitlines():
             print(f"  {line}")

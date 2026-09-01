@@ -1,7 +1,7 @@
 """Integrate the canonical IsoExec GDN state machine with vLLM.
 
 The patch routes GDN model calls through the selected IsoExec core and supplies scheduler-owned
-lifecycle metadata; in the ``chunk_synced`` composition it also maintains private rows, open-chunk
+lifecycle metadata; in the ``cpr`` composition it also maintains private rows, open-chunk
 buffers, fp32 boundary chains and chunked-prefill continuations, and decode is CUDA-graph
 replayable. vLLM-visible Mamba pages are slot identities for that private state, not recurrent-state
 storage, and prefix caching or speculative state advancement fail at engine initialization rather
@@ -18,16 +18,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 _patched = False
-
-
-def _graph_decode() -> bool:
-    """Graph-decode: route decode rows through device-side slot indices, no host readback.
-
-    Implied by CUDA graphs, which force padded decode. Read at call time, not import time -- the env
-    var is set in the same function that first imports this module, so an import-time read could
-    silently freeze the whole graph path off.
-    """
-    return os.environ.get("SKYRL_ISOEXEC_GDN_PADDED_DECODE") == "1"
 
 
 # Engagement count for both native-vLLM and Megatron-in-vLLM GDN call paths.
@@ -52,14 +42,14 @@ def assert_engine_args_compatible(kwargs: dict) -> None:
     Called from ``vllm_engine.setup_envvars_for_vllm``. Loud on purpose: each of these silently
     reinterprets ``ssm_state`` and would produce a plausible-looking, non-bitwise rollout.
     """
-    from ...ops.gdn.gdn_ops import chunk_synced_mode, recurrent_mode
+    from ...ops.gdn.gdn_ops import cpr_mode, recurrent_mode
     from ...ops.gdn.gdn_recurrent_state import chunked_prefill_enabled
 
-    # Chunked prefill is bitwise-safe under recurrent and chunk_synced GDN with the resume flag on:
+    # Chunked prefill is bitwise-safe under recurrent and cpr GDN with the resume flag on:
     # a continuation chunk resumes from the carried state. It stays incompatible for the chunk kernel
     # or with the flag off, and prefix caching / speculative decode are incompatible in all cases.
     incompatible = INCOMPATIBLE_ENGINE_ARGS
-    if (recurrent_mode() or chunk_synced_mode()) and chunked_prefill_enabled():
+    if (recurrent_mode() or cpr_mode()) and chunked_prefill_enabled():
         incompatible = tuple(k for k in incompatible if k != "enable_chunked_prefill")
     # The native composition resumes a prompt at any token boundary from vLLM's own state blocks,
     # driven by has_initial_state, so chunked prefill and prefix caching are both sound there.
@@ -74,16 +64,16 @@ def assert_engine_args_compatible(kwargs: dict) -> None:
     # replay reads stable pointers, and the chunk roll is a masked write rather than a gather over a
     # data-dependent list. Recurrent decode gets all of that for free -- one token per sequence is
     # already static and it never reads the host -- so it needs no padding flag.
-    if chunk_synced_mode() and not kwargs.get("enforce_eager", False):
-        # Graphs under chunk_synced ride on the LAZY resync driver: decode() is pure device work
+    if cpr_mode() and not kwargs.get("enforce_eager", False):
+        # Graphs under cpr ride on the LAZY resync driver: decode() is pure device work
         # (capturable, like recurrent -- no padding flag), and the boundary resync runs host-driven
         # in the metadata builder BETWEEN replays. Install it here (idempotent) -- this assert runs
         # in the engine process before the engine is built, which is exactly when the builder class
         # must be wrapped. If the import/wrap fails, the raise below keeps graphs off.
         try:
-            install_chunk_synced_lazy_driver()
+            install_cpr_lazy_driver()
         except Exception as e:  # noqa: BLE001 - converted to the loud config error below
-            bad.append(f"enforce_eager=False (CUDA graphs) under chunk_synced: lazy resync driver failed ({e})")
+            bad.append(f"enforce_eager=False (CUDA graphs) under cpr: lazy resync driver failed ({e})")
     elif (
         not kwargs.get("enforce_eager", False)
         and not recurrent_mode()
@@ -115,15 +105,15 @@ def lift_gdn_batch_invariance_veto() -> None:
 
 
 def _get_layer_state(self):
-    """Lazily build this layer's GDN core -- ChunkConsistentGDN or RecurrentGDN, per the kernel mode.
+    """Lazily build this layer's GDN core -- CprGDN or RecurrentGDN, per the kernel mode.
 
     Weight tensors are re-read from the module on every call rather than captured: native weight sync
     rebinds ``.data``, and a stale reference here would silently roll back the policy update.
     """
     from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 
-    from ...ops.gdn.gdn_chunk_synced_state import build_chunk_synced_gdn
-    from ...ops.gdn.gdn_ops import chunk_synced_mode, recurrent_mode
+    from ...ops.gdn.gdn_cpr_state import build_cpr_gdn
+    from ...ops.gdn.gdn_ops import cpr_mode, recurrent_mode
     from ...ops.gdn.gdn_recurrent_state import build_recurrent_gdn, native_state_enabled
 
     conv_weight = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
@@ -150,11 +140,11 @@ def _get_layer_state(self):
     except Exception:  # pragma: no cover - profiling dummies with exotic shapes
         slot_map_hint = 0
 
-    if cc is None and chunk_synced_mode():
+    if cc is None and cpr_mode():
         # Private pool only (the entry states + open-chunk buffers live beside it), sized by the
         # scheduler's concurrency cap -- NOT by kv_cache rows -- for the same reason as chunk mode
         # below: an open-chunk buffer per slot at thousands of slots is tens of GiB per layer.
-        cc = build_chunk_synced_gdn(
+        cc = build_cpr_gdn(
             max_num_seqs=getattr(self, "_isoexec_max_num_seqs", None) or self.kv_cache[1].shape[0],
             slot_map_hint=slot_map_hint,
             chunk_size=FLA_CHUNK_SIZE,
@@ -175,7 +165,7 @@ def _get_layer_state(self):
         cc.lazy_resync = True
         self._isoexec_gdn = cc
         logger.info(
-            "[isoexec-gdn] %s: chunk-synced decode+prefill (LAZY resync every %d), capacity=%d",
+            "[isoexec-gdn] %s: CPR decode+prefill (LAZY resync every %d), capacity=%d",
             self.prefix,
             FLA_CHUNK_SIZE,
             cc.capacity,
@@ -313,7 +303,7 @@ def _step_cpu(md, n_dec: int, n_pre: int) -> dict:
                 "own block table / state-slot ids) and no canonical-group metadata alias is "
                 "active. Host bookkeeping would track one group's ids while each layer's decode "
                 "gathers its own group's -- the unmapped ids fold onto null row 0 and every "
-                "request shares one state row (the 2026-08-12 v9 corruption). chunk_synced runs "
+                "request shares one state row. cpr runs "
                 "install the alias via resolve_gdn_groups (lazy driver); other modes must not run "
                 "this geometry."
             )
@@ -343,7 +333,7 @@ def _step_cpu(md, n_dec: int, n_pre: int) -> dict:
         # and is detected by slot membership; prefix caching stays hard off there.
         if step["pre_has_init"] is not None and any(step["pre_has_init"]):
             from ...ops.gdn.gdn_ops import (
-                chunk_synced_mode,
+                cpr_mode,
                 gdn_native_kernels_enabled,
                 recurrent_mode,
             )
@@ -353,7 +343,7 @@ def _step_cpu(md, n_dec: int, n_pre: int) -> dict:
             # both resume from vLLM's own state blocks, driven by this mask. The raise below only
             # protects the compositions that cannot resume.
             resumable = (recurrent_mode() and (chunked_prefill_enabled() or gdn_native_kernels_enabled())) or (
-                chunk_synced_mode() and chunked_prefill_enabled()
+                cpr_mode() and chunked_prefill_enabled()
             )
             if not resumable:
                 raise RuntimeError(
@@ -388,65 +378,13 @@ def _step_cpu(md, n_dec: int, n_pre: int) -> dict:
 
 
 @torch.no_grad()
-def chunk_consistent_core(cc, md, mixed_qkv, a, b):
-    """Run one GDN layer's core for a vLLM batch: ``GDNAttentionMetadata`` -> ChunkConsistentGDN.
+def recurrent_core(rg, md, mixed_qkv, a, b):
+    """Run one GDN layer's core for a vLLM batch: ``GDNAttentionMetadata`` -> RecurrentGDN.
 
     Engine-shape plumbing only, shared by the two engines that need it: vLLM's native
     ``QwenGatedDeltaNetAttention`` (:func:`_isoexec_forward_core`) and the Megatron ``GPTModel``
     running inside vLLM (``isoexec.gdn_gptmodel``). ``mixed_qkv`` is PRE-conv (the conv is ours),
     ``a`` is the gate input and ``b`` the beta input. Returns ``o [T, Hv, Dv]``.
-    """
-    global CALL_COUNT
-    CALL_COUNT += 1
-    if md.spec_sequence_masks is not None:
-        raise RuntimeError(
-            "[isoexec-gdn] speculative decoding advances ssm_state with the spec kernels, which do "
-            "not respect the chunk grid. Disable spec decode for bitwise IsoExec."
-        )
-
-    n_dec, n_pre = md.num_decodes, md.num_prefills
-    if n_dec == 0 and n_pre == 0:
-        return None
-    if md.num_decode_tokens != n_dec:
-        raise RuntimeError(f"[isoexec-gdn] expected 1 token per decode, got {md.num_decode_tokens} for {n_dec}")
-
-    # Under graph decode every decode row goes through decode_dev, which takes the state indices as
-    # a device tensor and never reads them back -- `_step_cpu`'s `.tolist()` is a D2H sync and is
-    # illegal under capture. It must be every row, not just pure-decode batches: decode_dev advances
-    # the fill counts on the device and the eager decode() reads its own host counters, so mixing the
-    # two would place a token at a stale position.
-    graph = _graph_decode()
-    if graph and n_pre == 0 and n_dec:
-        T = md.num_actual_tokens
-        slots = md.non_spec_state_indices_tensor[:n_dec]
-        return cc.decode_dev(slots, mixed_qkv[:T], a[:T], b[:T])
-
-    step = _step_cpu(md, n_dec, n_pre)
-
-    T = md.num_actual_tokens
-    x, b, a = mixed_qkv[:T], b[:T], a[:T]
-    out = torch.empty(T, cc.num_v_heads, cc.head_v_dim, dtype=x.dtype, device=x.device)
-
-    # Non-spec token order is decode-first, then prefill (see GDNAttentionMetadata builder), and
-    # output rows map 1:1 onto mixed_qkv rows.
-    if n_dec:
-        if graph:  # mixed batch under graph decode: device state, eager launch (never captured)
-            out[:n_dec] = cc.decode_dev(md.non_spec_state_indices_tensor[:n_dec], x[:n_dec], a[:n_dec], b[:n_dec])
-        else:
-            out[:n_dec] = cc.decode(None, x[:n_dec], a[:n_dec], b[:n_dec], slots_cpu=step["dec_slots"], step=step)
-
-    if n_pre:
-        qsl = step["qsl"]  # initial-state / overlap checks ran once in _step_cpu
-        for i, slot in enumerate(step["pre_slots"]):
-            s, e = n_dec + qsl[i], n_dec + qsl[i + 1]
-            out[s:e] = cc.prefill(int(slot), x[s:e], a[s:e], b[s:e])
-    return out
-
-
-@torch.no_grad()
-def recurrent_core(rg, md, mixed_qkv, a, b):
-    """Run one GDN layer's core for a vLLM batch in recurrent mode; the twin of
-    :func:`chunk_consistent_core`.
 
     A pure-decode step touches no host data -- slot ids stay on the device, there are no fill
     counters or ragged open chunks -- so it captures into a CUDA graph directly. ``_step_cpu``, which
@@ -497,7 +435,7 @@ def recurrent_core(rg, md, mixed_qkv, a, b):
 
 
 def gdn_layer_core(state, md, mixed_qkv, a, b):
-    """Dispatch one GDN layer's core to whichever mode built ``state``.
+    """Run one GDN layer's core, whichever mode built ``state``.
 
     Also the single owner of the alpha/beta compaction decision: callers hand in strided views of
     the ``in_proj`` output, the native-core composition materialises them inside its fused q/k/v
@@ -505,13 +443,10 @@ def gdn_layer_core(state, md, mixed_qkv, a, b):
     tensor launches nothing.
     """
     from ...ops.gdn.gdn_fused_split import defer_ab
-    from ...ops.gdn.gdn_recurrent_state import RecurrentGDN
 
     if not defer_ab(state):
         a, b = a.contiguous(), b.contiguous()
-    if isinstance(state, RecurrentGDN):
-        return recurrent_core(state, md, mixed_qkv, a, b)
-    return chunk_consistent_core(state, md, mixed_qkv, a, b)
+    return recurrent_core(state, md, mixed_qkv, a, b)
 
 
 def gdn_metadata(prefix: str):
@@ -541,7 +476,7 @@ def gdn_metadata(prefix: str):
 @torch.no_grad()
 def _isoexec_forward_core(self, mixed_qkv, b, a, core_attn_out):
     """Drop-in ``QwenGatedDeltaNetAttention._forward_core``: one code path, both phases."""
-    md = gdn_metadata(self.prefix)  # CALL_COUNT is bumped by chunk_consistent_core, below
+    md = gdn_metadata(self.prefix)  # CALL_COUNT is bumped by recurrent_core, below
     if md is None:
         # V1 profiling run: vLLM warms its own chunk kernel here, which we never call, and a single
         # pinned autotune config means there is nothing to benchmark. Nothing to warm.
@@ -604,7 +539,7 @@ def _align_block_size(runner) -> int:
 # is built from the first group's table, each layer's forward consumes its own group's state indices,
 # and unmapped ids fold onto null row 0, silently sharing one state row across requests.
 #
-# Under chunk_synced the mamba pages are only a slot-id source (no bits live in them), so the ids are
+# Under cpr the mamba pages are only a slot-id source (no bits live in them), so the ids are
 # opaque names and all GDN layers can read the same names: every GDN metadata fetch resolves to the
 # canonical GDN layer's metadata object -- the first GDN layer in model order, whose group is the
 # first MambaSpec group, i.e. exactly the group `_mamba_group_index` hands the driver. With a single
@@ -672,7 +607,7 @@ def resolve_gdn_groups(runner) -> None:
             f"(sizes {sizes}) and SKYRL_ISOEXEC_GDN_GROUP_ALIAS=0 refuses to run that geometry. "
             "Each group carries its own block table, so without the canonical-group metadata "
             "alias the GDN layers disagree on state slot ids and decode folds the unmapped ones "
-            "onto null row 0 -- silent corruption (the 2026-08-12 v9 arm). Unset the flag (or set "
+            "onto null row 0 -- silent corruption. Unset the flag (or set "
             "1) to run with the alias."
         )
     gi = _mamba_group_index(runner)
@@ -736,7 +671,7 @@ def _remember_slots_before_layers(req_ids, slots) -> None:
     """Remember the first prefill's slot names before the private GDN pools exist.
 
     The lazy driver is invoked before the first model forward.  On that call
-    ``CHUNK_SYNCED_LAYERS`` is still empty, but the forward is about to assign each request's row
+    ``CPR_LAYERS`` is still empty, but the forward is about to assign each request's row
     under the slot in ``slots``.  Retaining those names is what lets the next chunk rebind a row
     when Mamba ALIGN rotates to a new block.
     """
@@ -749,7 +684,7 @@ def _sync_slot_lifecycle(runner, sched_out, n: int, nct, slots, layers) -> None:
     """Maintain request->slot ownership during chunked prefill.
 
     Mamba ALIGN may rotate a live request's block id between prefill chunks, and the private
-    chunk-synced state must follow that name change without moving or recomputing the row. This
+    CPR state must follow that name change without moving or recomputing the row. This
     lifecycle is mandatory for chunked prefill and independent of prefix-cache admission.
 
     Unscheduled requests keep their rows; finished requests are released; a preemption resume starts
@@ -837,8 +772,8 @@ def _sync_slot_lifecycle(runner, sched_out, n: int, nct, slots, layers) -> None:
 _lazy_driver_installed = False
 
 
-def install_chunk_synced_lazy_driver() -> bool:
-    """Wrap ``GDNAttentionMetadataBuilder.build`` with the chunk-synced LAZY-resync driver.
+def install_cpr_lazy_driver() -> bool:
+    """Wrap ``GDNAttentionMetadataBuilder.build`` with the CPR LAZY-resync driver.
 
     The builder runs on the host once per step, before the forward and outside any CUDA graph (vLLM
     rebuilds attention metadata even for replayed steps), which makes it the one place a boundary
@@ -864,8 +799,8 @@ def install_chunk_synced_lazy_driver() -> bool:
         global _DRIVER_HOST_STEP
         _DRIVER_HOST_STEP = None  # fail closed on every early return below; this step must re-arm it
 
-        from ...ops.gdn.gdn_chunk_synced_state import (
-            CHUNK_SYNCED_LAYERS,
+        from ...ops.gdn.gdn_cpr_state import (
+            CPR_LAYERS,
         )
 
         # Before the layer-existence check: the KV-group geometry must be resolved before the first
@@ -881,22 +816,22 @@ def install_chunk_synced_lazy_driver() -> bool:
         slots = (
             _slot_ids(runner, sched_out, n, nct) if n else np.empty(0, dtype=np.int64)
         )  # honours mamba align mode's rotating column
-        if not CHUNK_SYNCED_LAYERS or not CHUNK_SYNCED_LAYERS[0].lazy_resync:
+        if not CPR_LAYERS or not CPR_LAYERS[0].lazy_resync:
             # The first prefill reaches the driver before the model has constructed its private GDN
             # pools.  Its forward will assign rows under these exact slots; remember their names so
             # the next chunk can rebind rather than looking like an unmapped live request.
             if n:
                 _remember_slots_before_layers(ib.req_ids[:n], slots)
             return
-        C = CHUNK_SYNCED_LAYERS[0].chunk_size
+        C = CPR_LAYERS[0].chunk_size
 
         # Latch scheduler lifecycle ownership before adoption can call `_assign`: from here on a
         # mapped row is never an LRU victim.
-        if not CHUNK_SYNCED_LAYERS[0]._driver_managed:
-            for ly in CHUNK_SYNCED_LAYERS:
+        if not CPR_LAYERS[0]._driver_managed:
+            for ly in CPR_LAYERS:
                 ly._driver_managed = True
 
-        _sync_slot_lifecycle(runner, sched_out, n, nct, slots, CHUNK_SYNCED_LAYERS)
+        _sync_slot_lifecycle(runner, sched_out, n, nct, slots, CPR_LAYERS)
 
         # Position mirror. The input batch is decode -> prefill and `_row_pos` is read only by
         # prefill, so mirror just that suffix; if the split cannot be validated, clear each mirror so
@@ -908,13 +843,13 @@ def install_chunk_synced_lazy_driver() -> bool:
             _DRIVER_HOST_STEP = _build_driver_host_step(ib.req_ids[:n], nst, nct, slots)
             slot_pos = _driver_prefill_slot_positions(_DRIVER_HOST_STEP, nct)
             if slot_pos is None:
-                for ly in CHUNK_SYNCED_LAYERS:
+                for ly in CPR_LAYERS:
                     ly.note_slot_positions(None)
-                _HOST_BOOKKEEPING_STATS["driver_position_layer_calls"] += len(CHUNK_SYNCED_LAYERS)
+                _HOST_BOOKKEEPING_STATS["driver_position_layer_calls"] += len(CPR_LAYERS)
             elif slot_pos:
-                for ly in CHUNK_SYNCED_LAYERS:
+                for ly in CPR_LAYERS:
                     ly.note_slot_positions(slot_pos)
-                nlayers = len(CHUNK_SYNCED_LAYERS)
+                nlayers = len(CPR_LAYERS)
                 _HOST_BOOKKEEPING_STATS["driver_position_layer_calls"] += nlayers
                 _HOST_BOOKKEEPING_STATS["driver_position_rows"] += nlayers * len(slot_pos)
 
@@ -923,7 +858,7 @@ def install_chunk_synced_lazy_driver() -> bool:
         # Fail-closed slot audit. On the device a padding lane and a live-but-unmapped slot both
         # fold onto row 0; here every id in `slots` belongs to a live request, so a miss is never
         # padding.
-        l0 = CHUNK_SYNCED_LAYERS[0]
+        l0 = CPR_LAYERS[0]
         if not l0._native:
             global _slot_space_checked
             if not _slot_space_checked:
@@ -949,7 +884,7 @@ def install_chunk_synced_lazy_driver() -> bool:
         # to replay read the device map, so this must sit above every return path below.
         from ...ops.gdn.gdn_recurrent_state import flush_slot_maps
 
-        flush_slot_maps(CHUNK_SYNCED_LAYERS)
+        flush_slot_maps(CPR_LAYERS)
 
         if n == 0:
             return
@@ -960,10 +895,10 @@ def install_chunk_synced_lazy_driver() -> bool:
         # The GDN state slot is the mamba group's block-table column. The batched resync dedups per
         # (row, pos), so prefill-serviced boundaries are no-ops.
         pairs = [(int(slots[i]), int(nct[i])) for i in hits]
-        # One stacked state pass for all layers; see gdn_chunk_synced_state.layer_batched_resync.
-        from ...ops.gdn.gdn_chunk_synced_state import layer_batched_resync
+        # One stacked state pass for all layers; see gdn_cpr_state.layer_batched_resync.
+        from ...ops.gdn.gdn_cpr_state import layer_batched_resync
 
-        layer_batched_resync(CHUNK_SYNCED_LAYERS, pairs)
+        layer_batched_resync(CPR_LAYERS, pairs)
 
     # Hook after _update_states (input_batch reflects THIS step's scheduling) and before the
     # forward; _prepare_inputs is exactly that point. execute_model runs before _update_states, so
@@ -980,7 +915,7 @@ def install_chunk_synced_lazy_driver() -> bool:
     GPUModelRunner._prepare_inputs = _prepare_inputs
     _lazy_driver_installed = True
     logger.info(
-        "[isoexec-gdn] chunk-synced LAZY resync driver installed on GPUModelRunner._prepare_inputs "
+        "[isoexec-gdn] CPR LAZY resync driver installed on GPUModelRunner._prepare_inputs "
         "(host-state only, no device syncs)"
     )
     return True
@@ -1005,12 +940,12 @@ def install_gdn_engine_patch(*, force: bool = False) -> bool:
     )
 
     pin_fla_autotune_configs()
-    from ...ops.gdn.gdn_ops import chunk_synced_mode as _cs_mode
+    from ...ops.gdn.gdn_ops import cpr_mode as _cpr_mode
 
-    if _cs_mode():
-        # chunk_synced always runs the lazy driver: it removes the per-step host sync even for eager
+    if _cpr_mode():
+        # cpr always runs the lazy driver: it removes the per-step host sync even for eager
         # engines, and is what makes decode capturable under graphs.
-        install_chunk_synced_lazy_driver()
+        install_cpr_lazy_driver()
     # RMSNormGated sizes its Triton tile from the row count, so its fp32 reduction order differs
     # between decode and prefill; chunk-consistent decode is pointless while that stands.
     pin_gdn_rmsnorm_rows_per_block()
@@ -1038,7 +973,7 @@ def install_gdn_engine_patch(*, force: bool = False) -> bool:
     mode = gdn_kernel_mode()
     _desc = {
         "recurrent": "recurrent prefill+decode",
-        "chunk_synced": "chunk-synced prefill + recurrent decode w/ boundary resync",
+        "cpr": "CPR prefill + recurrent decode w/ boundary resync",
     }.get(mode, "chunk-consistent decode")
     print(
         f"[ISOEXEC-GDN] engine: QwenGatedDeltaNetAttention._forward_core -> {mode} ({_desc})",

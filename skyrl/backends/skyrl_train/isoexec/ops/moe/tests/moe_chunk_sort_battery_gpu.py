@@ -60,7 +60,6 @@ os.environ.setdefault("SKYRL_ISOEXEC_MOE_CHUNK_SORT", "1")
 
 import torch
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)

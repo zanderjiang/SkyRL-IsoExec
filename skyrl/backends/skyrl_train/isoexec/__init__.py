@@ -54,8 +54,12 @@ if _os.environ.get("SKYRL_ISOEXEC_AUTOFUSE", "1") == "1":
 # construction; a side that declared identically but installed differently carries its INSTALL-phase
 # violations in the digest and the pair refuses at weight sync -- the failure class hashing alone
 # can never see (both sides equally wrong is still caught when only one side's install deviates).
-from .core.enforce import install_attestation_digest as _install_attestation_digest  # noqa: E402
-from .core.process_contract import register_contract_extension as _register_attest_ext  # noqa: E402
+from .core.enforce import (
+    install_attestation_digest as _install_attestation_digest,  # noqa: E402
+)
+from .core.process_contract import (
+    register_contract_extension as _register_attest_ext,  # noqa: E402
+)
 
 _register_attest_ext("install_attestation", _install_attestation_digest)
 

@@ -253,11 +253,14 @@ FLAGS: List[Flag] = [
     Flag("SKYRL_ISOEXEC_GDN", "0", ("both",), "install fla shim (trainer) + GDN engine patch", FUNCTION, (TRAIN,)),
     Flag(
         "SKYRL_ISOEXEC_GDN_KERNEL",
-        "chunk",
+        "recurrent",
         ("both",),
-        "delta-rule kernel: chunk|recurrent (MUST agree)",
+        "delta-rule kernel: chunk|cpr|recurrent (MUST agree)",
         FUNCTION,
         (TRAIN,),
+        notes="Default and vocabulary are core/gdn_kernel_env's, which both the declaration site (models/qwen3_5) "
+        "and the executing sites (ops/gdn/gdn_ops) now parse through. 'chunk' was the executing default while no "
+        "model declares a chunk composition, so unset named a function the process did not run.",
     ),
     Flag(
         "SKYRL_ISOEXEC_GDN_TRAINER_KERNEL",
@@ -266,6 +269,8 @@ FLAGS: List[Flag] = [
         "override trainer delta-rule kernel only (ablation)",
         FUNCTION,
         (TRAIN,),
+        notes="Not an IsoExec configuration: the contract pins ONE gdn.core kernel for all four sites, so a build "
+        "refuses when this asks for a trainer/engine split. Same vocabulary, same parser.",
     ),
     Flag(
         "SKYRL_ISOEXEC_GDN_NATIVE_KERNELS",
@@ -295,7 +300,7 @@ FLAGS: List[Flag] = [
         "SKYRL_ISOEXEC_GDN_NATIVE_CONV",
         "0",
         ("both",),
-        "chunk_synced v1.5: native conv fn/update pair (MUST agree)",
+        "cpr: native conv fn/update pair (MUST agree)",
         FUNCTION,
         (TRAIN, ENGINE),
     ),
@@ -326,7 +331,7 @@ FLAGS: List[Flag] = [
         (TRAIN,),
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_FUSED_SCATTER",
+        "SKYRL_ISOEXEC_GDN_CPR_FUSED_SCATTER",
         "1",
         ("engine",),
         "one-launch open-chunk buffer scatter (data movement)",
@@ -334,7 +339,7 @@ FLAGS: List[Flag] = [
         (TRAIN, ENGINE),
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_FUSED_ROWS",
+        "SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS",
         "1",
         ("engine",),
         "one-launch slot->row resolution, both widths (integer index movement)",
@@ -367,33 +372,33 @@ FLAGS: List[Flag] = [
         "not an allclose. OFF restores the ATen chain, bit-identical.",
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_MIN_PAGES",
+        "SKYRL_ISOEXEC_GDN_CPR_MIN_PAGES",
         "0",
         ("engine",),
-        "minimal vLLM mamba pages under chunk_synced (private pools carry the state)",
+        "minimal vLLM mamba pages under cpr (private pools carry the state)",
         DEPLOYMENT,
         (TRAIN, ENGINE),
-        notes="Engine memory only, moves no bits: chunk_synced never reads vLLM GDN state pages (it uses them as a "
-        "slot-id source), so they shrink and the freed KV pool returns to attention. Scoped to chunk_synced "
+        notes="Engine memory only, moves no bits: cpr never reads vLLM GDN state pages (it uses them as a "
+        "slot-id source), so they shrink and the freed KV pool returns to attention. Scoped to cpr "
         "without native state; recurrent and native-state keep full pages.",
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_APC",
+        "SKYRL_ISOEXEC_GDN_CPR_APC",
         "0",
         ("engine",),
-        "prefix caching under chunk_synced via the boundary-state store",
+        "prefix caching under cpr via the boundary-state store",
         FUNCTION,
         (TRAIN, ENGINE),
         notes="Engine-only but FUNCTION-half: it changes which tokens the GDN layers scan for a request. Requires "
-        "SKYRL_ISOEXEC_GDN_CHUNKED_PREFILL=1 and chunk_synced. A mode, not a boolean: 1 is in-process admission "
+        "SKYRL_ISOEXEC_GDN_CHUNKED_PREFILL=1 and cpr. A mode, not a boolean: 1 is in-process admission "
         "and is refused unless world_size==1; 2/shm/shared uses a shared membership index and works at any "
         "topology.",
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_APC_MB",
+        "SKYRL_ISOEXEC_GDN_CPR_APC_MB",
         "1024",
         ("engine",),
-        "device-memory ceiling for the CS-APC boundary-state store",
+        "device-memory ceiling for the CPR-APC boundary-state store",
         DEPLOYMENT,
         (TRAIN, ENGINE),
         notes="Capacity only: an eviction costs a cache hit, never a wrong resume, because the admission clamp reads "
@@ -401,10 +406,10 @@ FLAGS: List[Flag] = [
         "evicting, since the mirror must never advertise an entry a worker dropped.",
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_SLEEP",
+        "SKYRL_ISOEXEC_GDN_CPR_SLEEP",
         "0",
         ("engine",),
-        "chunk-synced state arena is DISCARDED at engine sleep and re-created at wake",
+        "CPR state arena is DISCARDED at engine sleep and re-created at wake",
         DEPLOYMENT,
         (TRAIN, ENGINE),
         notes="Engine memory and time only: the arena contents are dead across a generate/train/generate boundary, "
@@ -1484,16 +1489,6 @@ FLAGS: List[Flag] = [
         "communication path -- so the gate, a forward quantity, cannot see this flag.",
     ),
     Flag(
-        "SKYRL_ISOEXEC_LOGPROBS_FASTPATH",
-        "1",
-        ("engine",),
-        "engine logprobs fast path: fused sub+exp (libdevice.exp==aten) + gather-first",
-        DEPLOYMENT,
-        (TRAIN,),
-        notes="Execution twin of the aten reference chain with a first-call in-situ bitwise self-check and permanent "
-        "fallback; 0 is the pure reference chain.",
-    ),
-    Flag(
         "SKYRL_ISOEXEC_SCORING_AUDIT_INTERVAL",
         "1",
         ("trainer",),
@@ -1714,7 +1709,7 @@ FLAGS: List[Flag] = [
         "is what the compile guard required-config check exists to prevent.",
     ),
     Flag(
-        "SKYRL_ISOEXEC_GDN_CS_HOST_META",
+        "SKYRL_ISOEXEC_GDN_CPR_HOST_META",
         "1",
         ("engine",),
         "host-built GDN chunk metadata instead of the vendored prepare_chunk_indices/offsets",
@@ -1802,10 +1797,10 @@ FLAGS: List[Flag] = [
         "the enforcement.json verdict beside it)",
         DIAGNOSTIC,
         (TRAIN, ENGINE),
-        notes="The enforcement audit proved the launcher-exported value reached NO actor -- the name was not in this "
-        "table, so actor_forwarding_tuple could not carry it and no worker ever wrote contract.json. Registered "
-        "on both channels so the artifact write hooks actually fire. Non-SKYRL_ name kept: existing launch "
-        "scripts and contract_delivery already spell it.",
+        notes="A launcher-exported value reaches no actor unless the name is in this table: "
+        "actor_forwarding_tuple carries only registered flags, so an unregistered name means no worker "
+        "writes contract.json. Registered on both channels so the artifact write hooks fire. Non-SKYRL_ "
+        "name kept: existing launch scripts and contract_delivery already spell it.",
     ),
     Flag(
         "SKYRL_ISOEXEC_HANDSHAKE_NEGATIVE_CONTROL",
@@ -1816,6 +1811,85 @@ FLAGS: List[Flag] = [
         (TRAIN,),
         notes="ON registers a trainer-only manifest extension so the engine receiver MUST refuse at weight sync "
         "(workers/worker.py stamp site). Proves the handshake detects a mismatch; never ON in production.",
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_TRACE",
+        "",
+        ("both",),
+        "debug mode master switch: trace directory for per-region output digests",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+        notes="Set -> the ContractAdapter installs region hooks on both sides and EVERY enforcement refusal demotes "
+        "to logged-and-continue (core/enforce.demoted), so any kernel mix runs and the trace localizes the "
+        "divergence. The ledger is untouched: every demoted violation is still recorded and the verdict stays "
+        "red. Its own condition, not an alias for MANIFEST_STRICT=0. Run the engine eager: replayed CUDA graphs "
+        "execute no Python and record nothing.",
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_SIDE",
+        "",
+        ("both",),
+        "trace record label; stamped per-process by the ContractAdapter, not by hand",
+        DIAGNOSTIC,
+        (),
+        should_forward=False,
+        notes="The one debug env that must NOT be forwarded: each process stamps its own side in "
+        "ContractAdapter._install_debug_trace, so carrying a launch-shell value to both actors would label the "
+        "engine's records 'trainer'. Forwarding it would BE the bug, hence should_forward=False rather than a "
+        "latent split-brain entry.",
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_SAMPLE",
+        "",
+        ("both",),
+        "record every Nth forward (step-keyed via debug.set_step)",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_LADDER",
+        "",
+        ("both",),
+        "also record the mantissa-truncation k-ladder per region",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_RING",
+        "",
+        ("both",),
+        "in-memory record buffer size before a flush",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_REGIONS",
+        "",
+        ("both",),
+        "comma allow list of regions to trace (default: every hooked region except mm)",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_DIGEST",
+        "",
+        ("both",),
+        "digest backend override: 'eager' forces the non-triton path",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+        notes="Both sides must run the same backend only for perf parity -- the digests are bit-identical "
+        "across backends by test; forwarded so a pinned choice reaches both actors.",
+    ),
+    Flag(
+        "SKYRL_ISOEXEC_DEBUG_SEGMENTS",
+        "",
+        ("both",),
+        "row-segment digests: one digest per N rows of dim 0",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+        notes="Lets the comparator separate a fault localized to some rows from a whole-tensor round-off/reduction "
+        "-order difference, which the k-ladder cannot. Unregistered it reached no actor, so it worked only for "
+        "single-process runs.",
     ),
     Flag(
         "SKYRL_ISOEXEC_LIFECYCLE_ASSERTS",

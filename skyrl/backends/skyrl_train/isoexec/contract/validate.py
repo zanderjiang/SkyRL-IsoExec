@@ -1,5 +1,6 @@
 """Structural invariants over a frozen contract. Build-time / CI checkpoint."""
 
+import math
 import re
 from collections.abc import Mapping
 
@@ -10,6 +11,7 @@ from .types import (
     DISCHARGE_KINDS,
     HALVES,
     ROUTES,
+    STATE_EVENTS,
     TOPOLOGY_KINDS,
     BitPattern,
     ExecutionContract,
@@ -22,6 +24,15 @@ class ValidationError(Exception):
     pass
 
 
+def _is_finite_threshold(value) -> bool:
+    # A bound is a decimal string, so "nan"/"inf" parse: they are the values that make a comparison
+    # against the bound vacuous, which is why float() alone is not the check.
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def validate(contract: ExecutionContract, required_ops: Mapping[str, frozenset[str]] | None = None) -> list[str]:
     """Return human-readable violations; empty list means valid."""
     v: list[str] = []
@@ -32,6 +43,12 @@ def validate(contract: ExecutionContract, required_ops: Mapping[str, frozenset[s
 
     if len(case_ids) != len(contract.cases):
         v.append("duplicate case ids")
+
+    if not contract.composition:
+        v.append(
+            "empty composition: a contract that names no entry claims nothing, so two processes "
+            "that both failed to derive a composition would agree perfectly"
+        )
 
     seen_keys: set[tuple] = set()
     for e in contract.composition:
@@ -47,6 +64,8 @@ def validate(contract: ExecutionContract, required_ops: Mapping[str, frozenset[s
             v.append(f"{name}: unknown half {e.half!r}")
         if e.discharge is not None and e.discharge.kind not in DISCHARGE_KINDS:
             v.append(f"{name}: unknown discharge kind {e.discharge.kind!r}")
+        if e.discharge is not None and not e.discharge.ref.strip():
+            v.append(f"{name}: {e.discharge.kind} discharge with an empty ref")
         if e.coverage is not None and e.coverage.kind not in COVERAGE_KINDS:
             v.append(f"{name}: unknown coverage kind {e.coverage.kind!r}")
 
@@ -100,17 +119,44 @@ def validate(contract: ExecutionContract, required_ops: Mapping[str, frozenset[s
         for cid in t.case_pair:
             if cid not in case_ids:
                 v.append(f"tolerance {t.case_pair}: unknown case {cid!r}")
+        if not t.bounds:
+            v.append(f"tolerance {t.case_pair}: no bounds (an envelope with no threshold admits everything)")
+        for k, bound in t.bounds:
+            if not _is_finite_threshold(bound):
+                v.append(f"tolerance {t.case_pair}: bound {k}={bound!r} is not a finite threshold")
+
+    for st in contract.claims.state:
+        if not st.ref.strip():
+            v.append(f"state {st.state_id!r}: empty ref (the claim names no implementing hook)")
+        if not st.invalidated_by:
+            v.append(f"state {st.state_id!r}: empty invalidated_by (a state invalidated by nothing is not a claim)")
+        unknown_events = sorted(set(st.invalidated_by) - STATE_EVENTS)
+        if unknown_events:
+            v.append(
+                f"state {st.state_id!r}: unknown lifecycle event(s) {unknown_events}; the vocabulary "
+                f"is {sorted(STATE_EVENTS)} -- an event no boundary observes cannot be enforced"
+            )
 
     axes = [t.axis for t in contract.claims.topology]
     if len(axes) != len(set(axes)):
         v.append("duplicate topology axes")
     for t in contract.claims.topology:
+        if t.proof is not None and not t.proof.strip():
+            v.append(f"topology {t.axis!r}: empty proof ref (a proof that names nothing is not a proof)")
         if t.kind not in TOPOLOGY_KINDS:
             v.append(f"topology {t.axis!r}: unknown kind {t.kind!r}")
-        elif t.kind == "pinned" and (t.degree is None or t.collective_plan is None):
-            v.append(f"topology {t.axis!r}: pinned requires degree and collective_plan")
-        elif t.kind == "invariant" and (not t.domain or t.proof is None):
+        elif t.kind == "pinned":
+            if t.degree is None or t.collective_plan is None:
+                v.append(f"topology {t.axis!r}: pinned requires degree and collective_plan")
+            elif t.degree < 1:
+                v.append(f"topology {t.axis!r}: pinned degree {t.degree} is not a deployable degree (>= 1)")
+        elif not t.domain or not t.proof:
             v.append(f"topology {t.axis!r}: invariant requires a non-empty domain and a proof")
+        elif len(set(t.domain)) < 2:
+            v.append(
+                f"topology {t.axis!r}: invariant over the single degree {sorted(set(t.domain))} is a "
+                f"tautology, not an invariance claim; pin the axis instead"
+            )
 
     try:
         computed = compute_identities(contract)

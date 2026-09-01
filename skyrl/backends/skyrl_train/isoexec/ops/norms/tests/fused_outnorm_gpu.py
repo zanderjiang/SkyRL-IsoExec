@@ -64,14 +64,15 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 7)))  # repo root
 
-from skyrl.backends.skyrl_train.isoexec.core import triton_nonftz as _nonftz  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.core import (
+    triton_nonftz as _nonftz,  # noqa: E402
+)
 from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (  # noqa: E402
     _gated_out_norm_kernel,
     _tile_for,

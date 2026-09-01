@@ -6,7 +6,7 @@ Three obligations, one file:
   2. ``assert_topology_within_claims`` accepts inside a claimed envelope, REFUSES outside it,
      and demotes to warn-only under SKYRL_ISOEXEC_MANIFEST_STRICT=0.
   3. The engine install path builds the contract BEFORE the pik install, so
-     ``_assert_plan_matches_manifest`` reads a real view (the audit found it saw None and skipped).
+     ``_assert_plan_matches_manifest`` reads a real view rather than None (which would skip).
 """
 
 import os
@@ -14,10 +14,15 @@ import pathlib
 from types import SimpleNamespace
 
 from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
-from skyrl.backends.skyrl_train.isoexec.core.contract_build import derive_topology_claims
+from skyrl.backends.skyrl_train.isoexec.core.contract_build import (
+    derive_topology_claims,
+)
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
-from skyrl.backends.skyrl_train.isoexec.models.profile import ProfileError, TopologyAxisFact
+from skyrl.backends.skyrl_train.isoexec.models.profile import (
+    ProfileError,
+    TopologyAxisFact,
+)
 
 STRICT_ENV = "SKYRL_ISOEXEC_MANIFEST_STRICT"
 _ISOEXEC_DIR = pathlib.Path(__file__).resolve().parents[2]
@@ -97,6 +102,24 @@ def test_profile_refuses_ungrounded_invariant():
     assert "degree" in msg
 
 
+def test_profile_refuses_undeployable_pinned_degree():
+    for degree in (0, -4):
+        msg = _refuses(TopologyAxisFact, axis="EP", kind="pinned", degree=degree, collective_plan="none")
+        assert "deployable degree" in msg
+
+
+def test_profile_refuses_single_point_invariance():
+    # An invariance claim over one degree is a tautology: it admits exactly the pinned case while
+    # reading, to every consumer, as "this axis is free".
+    msg = _refuses(TopologyAxisFact, axis="EP", kind="invariant", domain=(8,), proof="gates/ep")
+    assert "tautology" in msg
+
+
+def test_profile_refuses_empty_proof_ref():
+    msg = _refuses(TopologyAxisFact, axis="EP", kind="pinned", degree=8, collective_plan="none", proof="  ")
+    assert "empty proof ref" in msg
+
+
 def test_enforcement_accepts_inside_domains():
     c = _contract()
     saved = os.environ.get(STRICT_ENV)
@@ -145,7 +168,9 @@ def test_enforcement_skips_unobtainable_axes_and_claimless_contracts():
         import dataclasses
 
         from skyrl.backends.skyrl_train.isoexec.contract import Claims
-        from skyrl.backends.skyrl_train.isoexec.contract.identity import compute_identities
+        from skyrl.backends.skyrl_train.isoexec.contract.identity import (
+            compute_identities,
+        )
 
         bare = dataclasses.replace(c, claims=Claims())
         bare = dataclasses.replace(bare, identities=compute_identities(bare))
@@ -155,10 +180,12 @@ def test_enforcement_skips_unobtainable_axes_and_claimless_contracts():
 
 
 def test_engine_pik_assert_sees_real_view():
-    """The audit's dead arm: with the process contract built (as the reordered engine install now
-    does), ``_assert_plan_matches_manifest`` compares the env-built plan against the REAL
-    production pins and refuses a split -- no stub view, the actual qwen35 contract."""
-    from skyrl.backends.skyrl_train.isoexec.ops.collectives import pik_tp_invariant as pik
+    """With the process contract built before the pik install, ``_assert_plan_matches_manifest``
+    compares the env-built plan against the REAL production pins and refuses a split -- no stub
+    view, the actual qwen35 contract."""
+    from skyrl.backends.skyrl_train.isoexec.ops.collectives import (
+        pik_tp_invariant as pik,
+    )
 
     saved_c, saved_v, saved_env = pc._CONTRACT, pc._VIEW, os.environ.get(STRICT_ENV)
     try:
@@ -172,9 +199,7 @@ def test_engine_pik_assert_sees_real_view():
                 pins = entry["pinned_constants"]
                 break
         assert pins and int(pins["leaves"]) == qwen3_5.PROFILE.pik_leaves
-        good = SimpleNamespace(
-            num_leaves=int(pins["leaves"]), bf16_leaves=(str(pins["leaf_dtype"]) == "bf16")
-        )
+        good = SimpleNamespace(num_leaves=int(pins["leaves"]), bf16_leaves=(str(pins["leaf_dtype"]) == "bf16"))
         pik._assert_plan_matches_manifest("ENGINE", good)  # reachable AND passing
         bad = SimpleNamespace(num_leaves=int(pins["leaves"]) * 2, bf16_leaves=good.bf16_leaves)
         msg = _refuses(pik._assert_plan_matches_manifest, "ENGINE", bad)
@@ -185,10 +210,10 @@ def test_engine_pik_assert_sees_real_view():
 
 
 def test_engine_contract_build_precedes_pik_install():
-    """Static ordering gate on the engine adapter: the audit found the contract built 110 lines
-    AFTER the pik install, making the engine arm of the pin assert silently dead. The
-    ContractAdapter now owns the ordering: run_install builds the contract and checks the claims
-    BEFORE install(), and the pik install lives inside the engine's install closure."""
+    """Static ordering gate on the engine adapter: a contract built AFTER the pik install leaves
+    the engine arm of the pin assert silently dead. The ContractAdapter owns the ordering:
+    run_install builds the contract and checks the claims BEFORE install(), and the pik install
+    lives inside the engine's install closure."""
     import inspect
 
     from skyrl.backends.skyrl_train.isoexec.core.adapter import ContractAdapter

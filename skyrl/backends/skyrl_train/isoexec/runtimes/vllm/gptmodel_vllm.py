@@ -271,14 +271,14 @@ class GPTModelVLLMWrapper(nn.Module):
             MambaStateShapeCalculator,
         )
 
-        # Under chunk_synced the GDN state lives in ChunkSyncedGDN's private pools and these pages
+        # Under cpr the GDN state lives in CprGDN's private pools and these pages
         # are only a slot-id source, so a bytes-sized state is reported here and the hybrid config
         # pass stops inflating every page to cover state nothing reads. MUST agree with
         # gdn_gptmodel.IsoExecGDNStateLayer.get_state_shape, the runtime spec.
-        from ...ops.gdn.gdn_ops import GDN_CS_MIN_STATE_SHAPES, gdn_cs_min_pages
+        from ...ops.gdn.gdn_ops import GDN_CPR_MIN_STATE_SHAPES, gdn_cpr_min_pages
 
-        if gdn_cs_min_pages():
-            return GDN_CS_MIN_STATE_SHAPES
+        if gdn_cpr_min_pages():
+            return GDN_CPR_MIN_STATE_SHAPES
 
         hf = vllm_config.model_config.hf_text_config
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
@@ -667,17 +667,24 @@ class GPTModelVLLMWrapper(nn.Module):
 
             install_engine_qkv_subgroup_ag(self.gpt, side="ENGINE")
 
-            # Patch vLLM's sampler logprob kernel to the trainer's exact formula HERE, in the worker
-            # process where the sampler runs -- doing it in the engine actor does not reach the worker.
-            # The fused Triton logprob kernel otherwise bypasses aten and diverges from the trainer.
+            # Sampler patches HERE, in the worker process where the sampler runs -- doing it in the
+            # engine actor does not reach the worker. TWO logprob sites, only one of which executes:
+            # patch_vllm_logprobs_batch_invariant rebinds the Model Runner V2 module (INERT on the
+            # V1 GPUModelRunner this composition resolves -- see its docstring for the live-counter
+            # proof), and patch_vllm_sampler_logprobs_rowinv hooks the V1 Sampler.compute_logprobs
+            # that actually produces sampled AND prompt logprobs (installed unconditionally --
+            # rowinv is the composed logprob at every site; only a failed import leaves the V1
+            # sampler untouched, and that shows up as served=0 at the engagement boundary).
             if self._local_spec:
                 try:
                     from skyrl.backends.skyrl_train.isoexec.runtimes.vllm.vllm_patches import (
                         patch_vllm_logprobs_batch_invariant,
+                        patch_vllm_sampler_logprobs_rowinv,
                         patch_vllm_sampler_temperature,
                     )
 
                     patch_vllm_logprobs_batch_invariant()
+                    patch_vllm_sampler_logprobs_rowinv()
                     patch_vllm_sampler_temperature()
                     _logprob_patched = True
                 except Exception as _e:  # pragma: no cover
@@ -699,6 +706,7 @@ class GPTModelVLLMWrapper(nn.Module):
             ):
                 _assert_engine_nccl_manifest(model_path)
             _record_engine_install_fingerprint(self, cfg, logprob_patched=_logprob_patched)
+
         # run_install: build_contract -> check_all_claims -> _isoexec_install() -> INSTALL
         # boundary (every obligation the contract derives for the engine side must have a record;
         # missing == violation; deliberate refusals propagate, internal ledger errors never do;
@@ -713,6 +721,7 @@ class GPTModelVLLMWrapper(nn.Module):
                 mp=mp,
                 tp_size=self._tp_size,
                 install_fn=_isoexec_install,
+                model_fn=lambda: self.gpt,
             )
         ).run_install()
 
@@ -801,7 +810,38 @@ class GPTModelVLLMWrapper(nn.Module):
             f"(non-native skipped, e.g. {missed}); first_w_norm={_wn:.3f}",
             flush=True,
         )
+        if loaded:
+            self._isoexec_debug_set_step()
         return all_names
+
+    def _isoexec_debug_set_step(self) -> None:
+        """Key this engine's trace records to the trainer's optim_step counter (debug mode only).
+
+        The engine has no step of its own, so the honest source is the weight-sync count: the
+        trainer bumps its counter in ``optim_step`` and syncs immediately after, and the rollout the
+        engine then generates is the one the trainer scores at that counter's value. The train loop
+        syncs ONCE before the first optim_step (trainer.py: ``sync_weights`` before the epoch loop),
+        so the Nth effective sync carries the weights of optim_step N-1 -- that inherent offset is
+        applied here rather than left for the comparator, which would otherwise pair each engine
+        step with the trainer step after it. The first sync is deliberately left unkeyed: the
+        trainer has not called ``set_step`` yet either, so both sides sample the first rollout by
+        call ordinal and switch to step keying at the same moment.
+
+        Counted on effective loads only: vLLM also calls ``load_weights`` at build time with
+        HF-checkpoint names, which all miss (the bridge already populated ``self.gpt``).
+        """
+        try:
+            from ...debug.trace import enabled
+
+            if not enabled():
+                return
+            from ...debug import set_step
+
+            self._isoexec_weight_syncs = syncs = getattr(self, "_isoexec_weight_syncs", 0) + 1
+            if syncs > 1:
+                set_step(syncs - 1)
+        except Exception as e:  # noqa: BLE001 -- diagnostics never fail a weight sync
+            logger.warning("[ISOEXEC-DEBUG] engine set_step skipped: %s: %s", type(e).__name__, e)
 
 
 class GPTModelVLLMHybridWrapper(GPTModelVLLMWrapper):
@@ -874,6 +914,7 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
     never break an engine build.
     """
     try:
+        from ...core.adapter import live_pins, log_unreported_pins
         from ...core.fingerprint import (
             ENGINE_SITES,
             NOT_INSTALLED,
@@ -903,11 +944,40 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
                 "norms.gated_out", ENGINE_SITES, "fused" if (_fused_norms and fused_outnorm_enabled()) else "eager"
             )
 
+        # ENGINE logprobs: attest the site that EXECUTES on this runner, never a patch's intent.
+        # A patch's return value is not evidence: patch_vllm_logprobs_batch_invariant() rebinds a
+        # Model Runner V2 module, and this arch resolves the V1 GPUModelRunner, so attesting off it
+        # would declare an impl that is never called. The record below is read off the LIVE V1
+        # sampler class instead (sampler_logprobs_hook_state inspects Sampler.compute_logprobs):
+        # rowinv_leaftree only when the full-row hook is verifiably bound at the site the V1 runner
+        # calls for both sampled and prompt logprobs; run-time engagement is judged separately by
+        # the rowinv served census (rowinv_engagement_boundary). Anything else records
+        # NOT_INSTALLED, so the comparator sees the disagreement instead of an attested fiction.
+        try:
+            from .vllm_patches import sampler_logprobs_hook_state
+
+            _lp_state = sampler_logprobs_hook_state()
+        except Exception as _lp_e:  # pragma: no cover - no evidence means no claim
+            _lp_state = {"v1_hook_installed": False, "rowinv_available": False, "error": repr(_lp_e)}
+        _rowinv_live = bool(_lp_state.get("v1_hook_installed")) and bool(_lp_state.get("rowinv_available"))
         record_installs(
             "logprobs.log_softmax",
             ENGINE_SITES,
-            "aten_reference_fused_exp" if logprob_patched else NOT_INSTALLED,
+            "rowinv_leaftree" if _rowinv_live else NOT_INSTALLED,
+            # Pins read off the live install (rowinv.BLOCK, the kernel's own env read), not echoed
+            # from the contract; None when nothing IsoExec-owned is bound at the executing site.
+            pinned=live_pins("logprobs.log_softmax") if _rowinv_live else None,
         )
+        if not _rowinv_live:
+            print(
+                "[ISOEXEC-WRAP] logprobs.log_softmax attested NOT_INSTALLED at the ENGINE sites: "
+                "the V1 Sampler.compute_logprobs hook is "
+                f"{'absent' if not _lp_state.get('v1_hook_installed') else 'bound but the rowinv module is unimportable'} "
+                f"(v2_patch_installed={bool(logprob_patched)} is NOT evidence -- that module never "
+                f"executes on the V1 runner; state={_lp_state}). The engine serves vLLM's stock "
+                "log_softmax.",
+                flush=True,
+            )
         record_installs("logprobs.lm_head_slice", ENGINE_SITES, "sampled_rows")
 
         # Collectives exist only at TP>1; at TP=1 they have no site and get no record.
@@ -915,7 +985,14 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
             from ...ops.collectives.pik_tp_invariant import pik_enabled
 
             _pik = "pik_tree" if pik_enabled() else NOT_INSTALLED
-            record_installs("collectives.tree_all_reduce", ENGINE_SITES, _pik)
+            # Pins off the ReductionPlan the install actually built, not off the env vars that asked
+            # for it, so "the flag arrived and the plan was built differently" is visible.
+            record_installs(
+                "collectives.tree_all_reduce",
+                ENGINE_SITES,
+                _pik,
+                pinned=live_pins("collectives.tree_all_reduce") if pik_enabled() else None,
+            )
             record_installs("collectives.row_parallel", ENGINE_SITES, _pik)
             # "Did the unpin actually happen" is the fact a reader needs, and it is otherwise
             # visible only as a print inside a worker.
@@ -944,7 +1021,12 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
             record_installs("moe.experts", ENGINE_SITES, "fused")
             from ...ops.moe.moe_batch_invariant import _moe_pik_fc2_on
 
-            record_installs("moe.combine", ENGINE_SITES, "pik_leaf_tree" if _moe_pik_fc2_on() else NOT_INSTALLED)
+            record_installs(
+                "moe.combine",
+                ENGINE_SITES,
+                "pik_leaf_tree" if _moe_pik_fc2_on() else NOT_INSTALLED,
+                pinned=live_pins("moe.combine") if _moe_pik_fc2_on() else None,
+            )
             record_installs("moe.weights", ENGINE_SITES, "fused_buffer")
             from ...ops.moe.moe_fused_experts import _fused_epilogue_on
 
@@ -953,7 +1035,9 @@ def _record_engine_install_fingerprint(wrapper, cfg, *, logprob_patched: bool) -
 
         # gdn.* records itself where it binds: its state core is built at the first
         # metadata-bearing forward, after this point, and that is when the pool becomes a fact.
-        log_fingerprint_once(cached_contract_view(), tag="engine_install")
+        _view = cached_contract_view()
+        log_fingerprint_once(_view, tag="engine_install")
+        log_unreported_pins(_view)
     except Exception as e:  # pragma: no cover - never fatal
         logger.warning(f"[ISOEXEC-FINGERPRINT] engine install fingerprint skipped: {e}")
 

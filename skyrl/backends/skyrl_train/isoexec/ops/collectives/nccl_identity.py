@@ -167,7 +167,11 @@ def assert_contract_matches(view, sites, impl_id: str, constants: Mapping[str, s
     except Exception:  # pragma: no cover - never fatal
         pass
     if problems:
-        raise RuntimeError(
+        # Through the one demotion helper, like the sibling pik plan check: the violations are
+        # already in the ledger above, and a debug run must reach its trace.
+        from ...core.enforce import refuse
+
+        refuse(
             "[ISOEXEC-NCCL-MANIFEST] effective ALGO/MIN/MAX disagrees with the frozen contract; "
             "refusing before forward:\n  " + "\n  ".join(problems)
         )

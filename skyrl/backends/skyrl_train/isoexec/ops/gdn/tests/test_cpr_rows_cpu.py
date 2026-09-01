@@ -1,9 +1,9 @@
-"""CPU tests for the fused slot->row resolution (``gdn_cs_rows`` + ``RecurrentGDN._rows_pair``).
+"""CPU tests for the fused slot->row resolution (``gdn_cpr_rows`` + ``RecurrentGDN._rows_pair``).
 
 WHAT THIS GATES. ``_rows`` was three ATen ops (``slots.long()``, ``clamp_``, ``slot2row[safe]``)
 and each of its two decode consumers cast the result to int32 on its own -- five single-block
 kernels per GDN layer, inside the captured decode graph, measured positionally at 11.9 us/layer =
-358 us of every decode step at 30 layers. ``cs_resolve_rows`` does the whole chain in one Triton
+358 us of every decode step at 30 layers. ``cpr_resolve_rows`` does the whole chain in one Triton
 program and emits both widths.
 
 The change is only allowed to be a LAUNCH-STRUCTURE change, so what needs testing is that it is
@@ -20,7 +20,7 @@ ATen chain and asserts bitwise equality -- that assertion is the one that matter
 skipped, never faked, when there is no device.
 
 Run: uv run --isolated --extra dev python -m pytest \
-       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_cs_rows_cpu.py -q
+       skyrl/backends/skyrl_train/isoexec/ops/gdn/tests/test_cpr_rows_cpu.py -q
 """
 
 import pytest
@@ -85,15 +85,15 @@ def test_rows_pair_matches_legacy_on_cpu():
 
 
 def test_rows_pair_honours_the_kill_switch(monkeypatch):
-    """``SKYRL_ISOEXEC_GDN_CS_FUSED_ROWS=0`` takes the ATen chain, on any device."""
-    from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_cs_rows
+    """``SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS=0`` takes the ATen chain, on any device."""
+    from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_cpr_rows
 
     def _rows_stats():
         # inlined: the accessor was stripped; the counters survive
-        return gdn_cs_rows._served, gdn_cs_rows._declined, gdn_cs_rows._decline_reason
+        return gdn_cpr_rows._served, gdn_cpr_rows._declined, gdn_cpr_rows._decline_reason
 
-    monkeypatch.setenv("SKYRL_ISOEXEC_GDN_CS_FUSED_ROWS", "0")
-    assert not gdn_cs_rows.fused_rows_enabled()
+    monkeypatch.setenv("SKYRL_ISOEXEC_GDN_CPR_FUSED_ROWS", "0")
+    assert not gdn_cpr_rows.fused_rows_enabled()
     before = _rows_stats()[0]
     rg = make_pool(device="cuda" if CUDA else "cpu")
     slots = torch.arange(64, dtype=torch.int32, device=rg.slot2row.device)
@@ -128,20 +128,20 @@ def test_native_state_keeps_the_aten_form():
     ],
 )
 def test_declines_rather_than_guesses(slots, smap, why):
-    from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cs_rows import cs_resolve_rows
+    from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_rows import cpr_resolve_rows
 
-    assert cs_resolve_rows(slots, smap) is None, why
+    assert cpr_resolve_rows(slots, smap) is None, why
 
 
 def test_decline_is_counted_and_reported(capsys):
-    from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_cs_rows
+    from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_cpr_rows
 
     def _rows_stats():
         # inlined: the accessor was stripped; the counters survive
-        return gdn_cs_rows._served, gdn_cs_rows._declined, gdn_cs_rows._decline_reason
+        return gdn_cpr_rows._served, gdn_cpr_rows._declined, gdn_cpr_rows._decline_reason
 
     before = _rows_stats()[1]
-    gdn_cs_rows.cs_resolve_rows(torch.zeros(4, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
+    gdn_cpr_rows.cpr_resolve_rows(torch.zeros(4, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert _rows_stats()[1] == before + 1
     assert "expected 1-D slots" in _rows_stats()[2]
 
@@ -168,11 +168,11 @@ def test_transcribed_arithmetic_equals_the_aten_chain():
 # ================================================================================================
 @pytest.mark.skipif(not CUDA, reason="the fused rows kernel is Triton; needs a CUDA device")
 def test_fused_kernel_is_bitwise_the_aten_chain():
-    from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cs_rows import cs_resolve_rows
+    from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_rows import cpr_resolve_rows
 
     rg = make_pool(device="cuda")
     for slots in adversarial_slots(rg.slot2row.numel(), device="cuda"):
-        pair = cs_resolve_rows(slots, rg.slot2row)
+        pair = cpr_resolve_rows(slots, rg.slot2row)
         assert pair is not None
         rows, rows32 = pair
         want = _rows_legacy(rg.slot2row, slots)
@@ -183,16 +183,16 @@ def test_fused_kernel_is_bitwise_the_aten_chain():
 @pytest.mark.skipif(not CUDA, reason="cuda graph capture needs a device")
 def test_fused_kernel_captures_into_a_cuda_graph():
     """The whole point is that it lives inside the captured decode graph: no host work, no sync."""
-    from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cs_rows import cs_resolve_rows
+    from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_cpr_rows import cpr_resolve_rows
 
     rg = make_pool(device="cuda")
     slots = torch.arange(512, dtype=torch.int32, device="cuda")
-    cs_resolve_rows(slots, rg.slot2row)  # warm the Triton compile outside capture
+    cpr_resolve_rows(slots, rg.slot2row)  # warm the Triton compile outside capture
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     holder = {}
     with torch.cuda.graph(g):
-        holder["out"] = cs_resolve_rows(slots, rg.slot2row)
+        holder["out"] = cpr_resolve_rows(slots, rg.slot2row)
     slots.copy_(torch.randint(-4, rg.slot2row.numel() + 4, (512,), device="cuda").to(torch.int32))
     g.replay()
     torch.cuda.synchronize()

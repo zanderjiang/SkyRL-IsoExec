@@ -170,10 +170,69 @@ def test_edge_shapes():
 
 def test_iter_tensor_outputs():
     t1, t2 = torch.zeros(2), torch.ones(3)
-    assert [i for i, _ in thash.iter_tensor_outputs(t1)] == [0]
+    assert [p for p, _ in thash.iter_tensor_outputs(t1)] == ["0"]
     got = list(thash.iter_tensor_outputs((t1, None, t2)))
-    assert [i for i, _ in got] == [0, 2]
+    assert [p for p, _ in got] == ["0", "2"]
     assert list(thash.iter_tensor_outputs("nope")) == []
+
+
+def test_iter_tensor_outputs_descends_nested_and_dict():
+    """Nested tuples and dict outputs are descended, not dropped."""
+    t = torch.zeros(2)
+    assert [p for p, _ in thash.iter_tensor_outputs((t, (t, t)))] == ["0", "1.0", "1.1"]
+    assert [p for p, _ in thash.iter_tensor_outputs({"h": t, "aux": [t]})] == ["h", "aux.0"]
+    assert list(thash.iter_tensor_outputs(None)) == []
+    # too deep to descend -> a (path, None) marker, never a silent drop
+    deep = (((t,),),)
+    assert list(thash.iter_tensor_outputs(deep, max_depth=2)) == [("0.0", None)]
+
+
+def test_extended_dtype_coverage():
+    """fp8 / unsigned widths / complex digest through their integer view."""
+    for name in ("float8_e4m3fn", "float8_e5m2", "uint16", "uint32", "complex64", "complex128"):
+        dtype = getattr(torch, name, None)
+        if dtype is None:
+            continue
+        t = torch.zeros(6, 4).to(dtype)
+        u = t.clone()
+        u.view(torch.int8)[3] = 1  # one bit somewhere in the buffer
+        assert thash.tensor_digest(t) == thash.tensor_digest(t.clone(), chunk_numel=7), name
+        assert thash.tensor_digest(t) != thash.tensor_digest(u), name
+        assert len(thash.segment_digests(t, rows_per_segment=2)) == 3, name
+
+
+def test_unsupported_dtype_raises():
+    """The digest refuses loudly, so trace.py can record 'unrecordable: <reason>'."""
+    exotic = next(
+        (
+            getattr(torch, n)
+            for n in ("float8_e8m0fnu", "bits8", "float4_e2m1fn_x2")
+            if getattr(torch, n, None) is not None and getattr(torch, n) not in thash._DTYPE_TABLE
+        ),
+        None,
+    )
+    if exotic is None:
+        return
+    try:
+        thash.tensor_digest(torch.zeros(4).to(exotic))
+    except TypeError as e:
+        assert "unsupported dtype" in str(e)
+    else:
+        raise AssertionError("expected TypeError for an unsupported dtype")
+
+
+def test_ladder_depth_is_per_dtype():
+    """A 4-rung ladder capped at 2**-6 cannot resolve a 1-ULP fp32 difference."""
+    assert thash.ladder_for(torch.bfloat16) == (6, 4, 2, 0)  # k=6 is bf16's finest expressible
+    assert max(thash.ladder_for(torch.float32)) == 22
+    assert max(thash.ladder_for(torch.float64)) == 48
+    assert thash.ladder_for(torch.int32) == ()
+    x = torch.randn(64, 32, dtype=torch.float32)
+    y = x.clone()
+    y.view(-1).view(torch.int32)[100] ^= 1  # 1 ULP == 2**-23 relative
+    la, lb = thash.digest_ladder(x), thash.digest_ladder(y)
+    assert la["full"] != lb["full"]
+    assert la["k22"] == lb["k22"]  # bounded below 2**-22, not "~2e-02"
 
 
 def test_gpu_equivalence_skip_gated():
@@ -186,6 +245,152 @@ def test_gpu_equivalence_skip_gated():
     t = torch.randn(1024, 512, dtype=torch.bfloat16)
     assert thash.tensor_digest(t) == thash.tensor_digest(t.cuda())
     assert thash.digest_ladder(t) == thash.digest_ladder(t.cuda())
+
+
+# -- an independent reference, so "eager == triton" cannot both be wrong the same way ---------
+
+_U64 = (1 << 64) - 1
+
+
+def _ref_mix(z: int) -> int:
+    z &= _U64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _U64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _U64
+    return z ^ (z >> 31)
+
+
+def _ref_body(t, k, seed, off=0, count=None, salt_seed=None):
+    """The weighted modular sum, written from the docstring in pure Python ints."""
+    view, umask, mbits = thash._DTYPE_TABLE[t.dtype]
+    vals = t.detach().cpu().contiguous().reshape(-1).view(view).to(torch.int64).tolist()
+    if count is not None:
+        vals = vals[off : off + count]
+    mask, kept = _U64 if umask is None else umask, mbits
+    if k is not None and mbits is not None and k < mbits:
+        mask &= _U64 ^ ((1 << (mbits - k)) - 1)
+        kept = k
+    salt = _ref_mix(seed if salt_seed is None else salt_seed) ^ 0x9E3779B97F4A7C15
+    acc = 0
+    for i, v in enumerate(vals):
+        w = ((_ref_mix((i >> 3) ^ salt) ^ ((i & 7) * 0x9E3779B97F4A7C15)) & _U64) | 1
+        acc = (acc + ((v & _U64) & mask) * w) & _U64
+    return acc, (kept if mbits is not None else -1)
+
+
+def ref_digest(t, k=None, seed=0) -> int:
+    acc, kept = _ref_body(t, k, seed)
+    return thash._mix64_i(acc ^ thash._header(t, kept, seed))
+
+
+def ref_segments(t, rows_per_segment, k=None, seed=0):
+    view, _um, _mb = thash._DTYPE_TABLE[t.dtype]
+    n = t.detach().cpu().contiguous().reshape(-1).view(view).numel()
+    rows = t.shape[thash.segment_axis(t)]
+    seg_numel = rows_per_segment * (n // rows)
+    nseg = (rows + rows_per_segment - 1) // rows_per_segment
+    head = thash._header(t, _ref_body(t, k, seed, 0, 0)[1], seed)
+    out = []
+    for si in range(nseg):
+        acc, _ = _ref_body(
+            t,
+            k,
+            seed,
+            si * seg_numel,
+            min(seg_numel, n - si * seg_numel),
+            salt_seed=seed ^ _ref_mix(si * seg_numel + 1),
+        )
+        out.append(f"{thash._mix64_i(acc ^ thash._mix64_i(head ^ (si + 1))):016x}")
+    return out
+
+
+_REF_SHAPES = ((1,), (7,), (8,), (9,), (1, 5, 3), (13, 11), (3, 1, 1))
+
+
+def test_matches_pure_python_reference():
+    for dtype in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.int8,
+        torch.uint8,
+        torch.int32,
+        torch.int64,
+        torch.bool,
+    ):
+        for shape in _REF_SHAPES:
+            t = torch.randn(shape).to(dtype) if dtype.is_floating_point else torch.randint(0, 90, shape).to(dtype)
+            assert thash.tensor_digest(t) == ref_digest(t), (dtype, shape)
+            for k in thash.ladder_for(dtype):
+                assert thash.tensor_digest(t, k=k) == ref_digest(t, k=k), (dtype, shape, k)
+            for rps in (1, 2, 64):
+                assert thash.segment_digests(t, rows_per_segment=rps) == ref_segments(t, rps), (dtype, shape, rps)
+
+
+def test_ladder_is_one_pass_but_equals_per_rung_digests():
+    """The fused multi-mask pass must produce exactly the per-rung tensor_digest values."""
+    for dtype in (torch.bfloat16, torch.float32, torch.float64):
+        t = (torch.randn(37, 9) * 5).to(dtype)
+        lad = thash.digest_ladder(t)
+        assert lad["full"] == f"{thash.tensor_digest(t):016x}"
+        assert set(lad) == {"full"} | {f"k{k}" for k in thash.ladder_for(dtype)}
+        for k in thash.ladder_for(dtype):
+            assert lad[f"k{k}"] == f"{thash.tensor_digest(t, k=k):016x}"
+
+
+def test_segment_axis_is_first_non_unit_dim():
+    """P6: dim 0 is useless on the shapes the GDN door produces -- [1,T,H,D] is one segment."""
+    assert thash.segment_axis(torch.zeros(1, 64, 4, 8)) == 1
+    assert thash.segment_axis(torch.zeros(64, 1, 2048)) == 0
+    assert thash.segment_axis(torch.zeros(1, 1, 1)) == 0
+    assert thash.segment_axis(torch.zeros(7)) == 0
+    t = torch.randn(1, 64, 4, 8, dtype=torch.float32)
+    segs = thash.segment_digests(t, rows_per_segment=16)
+    assert len(segs) == 4  # was 1 when dim 0 was segmented
+    b = t.clone()
+    b[0, 40, 1, 3] += 1.0
+    assert [i for i, (x, y) in enumerate(zip(segs, thash.segment_digests(b, rows_per_segment=16))) if x != y] == [2]
+
+
+def test_segment_index_means_the_same_slab_on_both_sides():
+    """Both sides slice their own first non-unit dim, so segment i is the same T-slab of tokens.
+
+    The digests themselves still fold the shape (that is what makes a shape difference its own
+    divergence kind), so this is about WHICH rows segment i covers, not about equal hex.
+    """
+    core = torch.randn(1, 32, 2, 4, dtype=torch.float32)  # trainer gdn.core door layout
+    flat = core.reshape(32, 8)  # same tokens, engine-side layout
+    a, b = core.clone(), flat.clone()
+    a[0, 20, 1, 2] += 1.0
+    b[20, 6] += 1.0
+    da = [
+        i
+        for i, (x, y) in enumerate(
+            zip(thash.segment_digests(core, rows_per_segment=8), thash.segment_digests(a, rows_per_segment=8))
+        )
+        if x != y
+    ]
+    db = [
+        i
+        for i, (x, y) in enumerate(
+            zip(thash.segment_digests(flat, rows_per_segment=8), thash.segment_digests(b, rows_per_segment=8))
+        )
+        if x != y
+    ]
+    assert da == db == [2]
+
+
+def test_eager_backend_override_matches_default():
+    t = (torch.randn(129, 7) * 4).to(torch.bfloat16)
+    want = thash.tensor_digest(t)
+    os.environ[thash.ENV_BACKEND] = "eager"
+    thash._reset_backend_for_tests()
+    try:
+        assert thash.digest_backend(t.device) == "eager"
+        assert thash.tensor_digest(t) == want
+    finally:
+        os.environ.pop(thash.ENV_BACKEND, None)
+        thash._reset_backend_for_tests()
 
 
 def _run():

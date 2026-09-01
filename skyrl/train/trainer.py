@@ -96,6 +96,7 @@ from skyrl.train.utils.trainer_utils import (
     cleanup_old_checkpoints,
     extract_step_from_path,
     finalize_post_update_rollout_logprob_diff_std,
+    isoexec_step1_boundary,
     reject_isoexec_gate_metric_collisions,
     run_on_each_node,
     validate_consistency_for_latest_checkpoint,
@@ -463,6 +464,10 @@ class RayPPOTrainer:
                             self.all_metrics["policy/rollout_train_logprobs_abs_diff_mean"],
                             self.all_metrics["policy/rollout_train_logprobs_abs_diff_max"],
                         )
+                        # The gate is the only STEP1 reporter, so this is the phase's boundary. It
+                        # is a no-op in a process with no obligation plan (the controller builds no
+                        # contract); armed processes get the full completeness close.
+                        isoexec_step1_boundary()
                     elif os.environ.get("SKYRL_ISOEXEC") == "1":
                         logger.info(
                             "[ISOEXEC-GATE] NOT_AUDITED step={} source=sampled_scoring_skip; "

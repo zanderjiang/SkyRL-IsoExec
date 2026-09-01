@@ -37,7 +37,9 @@ import torch
 _HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[7]))  # repo root
 
-from skyrl.backends.skyrl_train.isoexec.ops.norms import native_rmsnorm_memo as NM  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.ops.norms import (
+    native_rmsnorm_memo as NM,  # noqa: E402
+)
 
 
 class _FakeRmsnormImpl(types.SimpleNamespace):
@@ -163,7 +165,12 @@ def test_missing_torch_surface_is_fail_soft(monkeypatch):
 
 
 def test_flag_registered_default_off_and_forwarded():
-    from skyrl.backends.skyrl_train.isoexec.core.flags import ENGINE, FLAGS, TRAIN, actor_forwarding_tuple
+    from skyrl.backends.skyrl_train.isoexec.core.flags import (
+        ENGINE,
+        FLAGS,
+        TRAIN,
+        actor_forwarding_tuple,
+    )
 
     cat = {f.name: f for f in FLAGS}
     assert "SKYRL_ISOEXEC_NATIVE_NORM_MEMO" in cat

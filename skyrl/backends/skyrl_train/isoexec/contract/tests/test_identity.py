@@ -5,6 +5,7 @@ import unittest
 
 from skyrl.backends.skyrl_train.isoexec.contract import (
     CompositionEntry,
+    Coverage,
     EquivalenceProof,
     ImplRef,
     compute_identities,
@@ -19,6 +20,15 @@ def _replace_entry(c, idx, **kw):
     e = dataclasses.replace(c.composition[idx], **kw)
     comp = c.composition[:idx] + (e,) + c.composition[idx + 1 :]
     return dataclasses.replace(c, composition=comp)
+
+
+def _replace_case(c, cid, **kw):
+    cases = tuple(dataclasses.replace(x, **kw) if x.id == cid else x for x in c.cases)
+    return dataclasses.replace(c, cases=cases)
+
+
+def _coverage_idx(c):
+    return next(i for i, e in enumerate(c.composition) if e.coverage is not None)
 
 
 class TestIdentity(unittest.TestCase):
@@ -73,6 +83,38 @@ class TestIdentity(unittest.TestCase):
     def test_stable_under_case_order_within_entry(self):
         c2 = _replace_entry(self.c, 0, cases=tuple(reversed(ALL_CASES)))
         self.assertEqual(compute_identities(c2).numerical_policy, self.ids.numerical_policy)
+
+    def test_rotates_on_case_conditions(self):
+        # A case's declared conditions are what the composition was claimed to hold under, so each
+        # is both a bit-relevant fact and part of what the model means.
+        for field, value in (
+            ("grad_mode", "grad"),
+            ("runtime_role", "trainer"),
+            ("state_mode", "fresh"),
+            ("shape_domain", "anything"),
+            ("constraints", ()),
+        ):
+            with self.subTest(field=field):
+                ids2 = compute_identities(_replace_case(self.c, "engine_decode", **{field: value}))
+                self.assertNotEqual(ids2.numerical_policy, self.ids.numerical_policy)
+                self.assertNotEqual(ids2.semantic, self.ids.semantic)
+
+    def test_stable_under_constraint_reordering(self):
+        c2 = _replace_case(self.c, "engine_decode", constraints=("address_stable", "host_free", "cudagraph_capturable"))
+        self.assertEqual(compute_identities(c2), self.ids)
+
+    def test_rotates_on_coverage_kind(self):
+        idx = _coverage_idx(self.c)
+        described = self.c.composition[idx].coverage.description
+        c2 = _replace_entry(self.c, idx, coverage=Coverage("symbolic_domain", described))
+        self.assertNotEqual(compute_identities(c2).numerical_policy, self.ids.numerical_policy)
+
+    def test_coverage_description_is_documentary(self):
+        # Deliberate: the kind is the scope CLASS and is hashed; the description is prose, like
+        # RoundingSchedule.documentary, which reaches the hash through an impl version bump.
+        idx = _coverage_idx(self.c)
+        c2 = _replace_entry(self.c, idx, coverage=Coverage(self.c.composition[idx].coverage.kind, "reworded"))
+        self.assertEqual(compute_identities(c2), self.ids)
 
     def test_ignores_stored_identities(self):
         c2 = dataclasses.replace(self.c, identities=dataclasses.replace(self.ids, semantic="x"))

@@ -24,7 +24,6 @@ os.environ.setdefault("SKYRL_ISOEXEC_MM_CUBLASLT", "1")
 
 import torch
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
@@ -74,7 +73,7 @@ def signz_x(M, K):
     """Tiny mixed-sign activations that, against a matching tiny W, underflow products so ~half the
     output dot-products round to +/-0.0 with random sign -> a LIVE signed-zero population."""
     torch.manual_seed(4321 + M + K)
-    return torch.randn(M, K, device=DEV, dtype=torch.bfloat16) * (2.0 ** -72)
+    return torch.randn(M, K, device=DEV, dtype=torch.bfloat16) * (2.0**-72)
 
 
 def ext():
@@ -103,36 +102,45 @@ def gate_invariance_crossbucket(e):
 
     Ms = [1, 2, 17, 64, 320, 512, 1023]
     signz_live = 0
-    for (K, N) in SHAPES:
+    for K, N in SHAPES:
         torch.manual_seed(7 + K + N)
         W_norm = torch.randn(N, K, device=DEV, dtype=torch.bfloat16) * 0.05
-        W_signz = torch.randn(N, K, device=DEV, dtype=torch.bfloat16) * (2.0 ** -72)
+        W_signz = torch.randn(N, K, device=DEV, dtype=torch.bfloat16) * (2.0**-72)
         worst = 0
         checked = 0
         for popname in ("normal", "big", "signz"):
             for M in Ms:
                 if popname == "signz":
-                    x = signz_x(M, K); W = W_signz
-                    x8 = signz_x(8192, K); x8[:M] = x
+                    x = signz_x(M, K)
+                    W = W_signz
+                    x8 = signz_x(8192, K)
+                    x8[:M] = x
                 else:
-                    x = populations(M, K)[popname]; W = W_norm
+                    x = populations(M, K)[popname]
+                    W = W_norm
                     x8 = torch.randn(8192, K, device=DEV, dtype=torch.bfloat16) * 0.05
                     x8[:M] = x
-                o_small = raw_mm(e, x, W)          # M<1024 -> decode bucket
-                o_big = raw_mm(e, x8, W)           # M=8192 -> trainer bucket
+                o_small = raw_mm(e, x, W)  # M<1024 -> decode bucket
+                o_big = raw_mm(e, x8, W)  # M=8192 -> trainer bucket
                 if popname == "signz":
                     signz_live += neg_zeros(o_small)
                 worst = max(worst, bitcmp(o_small, o_big[:M]))
                 checked += o_small.numel()
-        _check(f"invariance+crossbucket K={K} N={N}", worst == 0,
-               f"{checked:,} elems (3 pops incl signed-zero), worst_mismatch={worst}")
-    _check("signed-zero population is LIVE (non-vacuous bit-compare)", signz_live > 0,
-           f"{signz_live} negative-zero outputs observed across the signed-zero reference")
+        _check(
+            f"invariance+crossbucket K={K} N={N}",
+            worst == 0,
+            f"{checked:,} elems (3 pops incl signed-zero), worst_mismatch={worst}",
+        )
+    _check(
+        "signed-zero population is LIVE (non-vacuous bit-compare)",
+        signz_live > 0,
+        f"{signz_live} negative-zero outputs observed across the signed-zero reference",
+    )
 
 
 def gate_determinism(e):
     print("\n[2] determinism (two identical calls bit-equal, both buckets)")
-    for (K, N) in SHAPES:
+    for K, N in SHAPES:
         torch.manual_seed(11 + K + N)
         W = torch.randn(N, K, device=DEV, dtype=torch.bfloat16) * 0.05
         bad = 0
@@ -144,7 +152,7 @@ def gate_determinism(e):
 
 def gate_graph(e):
     print("\n[3] CUDA-graph capture+replay == eager (bit-for-bit)")
-    for (K, N) in SHAPES:
+    for K, N in SHAPES:
         torch.manual_seed(13 + K + N)
         W = torch.randn(N, K, device=DEV, dtype=torch.bfloat16) * 0.05
         bad = 0
@@ -155,10 +163,12 @@ def gate_graph(e):
             e.mm(x, W, eager)
             torch.cuda.synchronize()
             cg = torch.empty((M, N), device=DEV, dtype=torch.bfloat16)
-            s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
-                e.mm(x, W, cg)                      # warm (algo already pinned; no alloc)
-            torch.cuda.current_stream().wait_stream(s); torch.cuda.synchronize()
+                e.mm(x, W, cg)  # warm (algo already pinned; no alloc)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
             try:
                 with torch.cuda.graph(g):
@@ -167,15 +177,16 @@ def gate_graph(e):
                 note = "CAPTURE_FAIL:" + type(ex).__name__
                 bad = -1
                 break
-            cg.zero_(); g.replay(); torch.cuda.synchronize()
+            cg.zero_()
+            g.replay()
+            torch.cuda.synchronize()
             bad = max(bad, bitcmp(cg, eager))
         _check(f"graph==eager K={K} N={N}", bad == 0, note if bad else "ok")
 
 
 # ---- installed-wrapper routing/composition gates -----------------------------------------------
 def _snapshot(bi):
-    return (bi.matmul_persistent,
-            getattr(bi, "_isoexec_stock_matmul_persistent", None))
+    return (bi.matmul_persistent, getattr(bi, "_isoexec_stock_matmul_persistent", None))
 
 
 def _restore(bi, snap):
@@ -190,10 +201,11 @@ def _restore(bi, snap):
 def gate_routing():
     print("\n[4/5] bias + odd-layout routed to Triton fallthrough (installed wrapper == stock)")
     from vllm.model_executor.layers import batch_invariant as bi
+
     e = ext()
     snap = _snapshot(bi)
     stock = bi.matmul_persistent
-    MC._LOG_ONCE = True   # silence duplicate install banner
+    MC._LOG_ONCE = True  # silence duplicate install banner
     MC._DISABLED = False
     # install cuBLASLt over pristine stock
     ok = MC.install_mm_cublaslt()
@@ -212,39 +224,39 @@ def gate_routing():
         # divergence, is the property.)
         o_wrap = wrapped(x, b)
         o_raw = raw_mm(e, x, W)
-        _check("production shape ROUTED to cuBLASLt (wrapper == raw ext.mm)",
-               bitcmp(o_wrap, o_raw) == 0)
+        _check("production shape ROUTED to cuBLASLt (wrapper == raw ext.mm)", bitcmp(o_wrap, o_raw) == 0)
 
         # (4) bias != None -> fallthrough == stock(bias)
         bias = torch.randn(N, device=DEV, dtype=torch.bfloat16) * 0.05
-        _check("bias!=None routed to fallthrough",
-               bitcmp(wrapped(x, b, bias=bias), stock(x, b, bias=bias)) == 0)
+        _check("bias!=None routed to fallthrough", bitcmp(wrapped(x, b, bias=bias), stock(x, b, bias=bias)) == 0)
 
         # (5a) non-contiguous b (not the (1,K) production stride) -> fallthrough == stock
         Wpad = torch.randn(N, K + 8, device=DEV, dtype=torch.bfloat16) * 0.05
         b_odd = Wpad[:, :K].t()  # [K,N] but stride (1, K+8) != (1,K)
-        _check("odd-layout b routed to fallthrough",
-               bitcmp(wrapped(x, b_odd), stock(x, b_odd)) == 0,
-               f"b.stride={tuple(b_odd.stride())}")
+        _check(
+            "odd-layout b routed to fallthrough",
+            bitcmp(wrapped(x, b_odd), stock(x, b_odd)) == 0,
+            f"b.stride={tuple(b_odd.stride())}",
+        )
 
         # (5b) non-contiguous a rows -> still correct (wrapper contiguous()-es or falls through == cuBLASLt/stock consistent)
         x_odd = torch.randn(M, K * 2, device=DEV, dtype=torch.bfloat16)[:, ::2]  # stride (2K,2)
-        _check("non-contiguous a handled (wrapper == stock on odd a-stride)",
-               bitcmp(wrapped(x_odd, b_odd), stock(x_odd, b_odd)) == 0,
-               f"a.stride={tuple(x_odd.stride())}")
+        _check(
+            "non-contiguous a handled (wrapper == stock on odd a-stride)",
+            bitcmp(wrapped(x_odd, b_odd), stock(x_odd, b_odd)) == 0,
+            f"a.stride={tuple(x_odd.stride())}",
+        )
 
         # unlisted shape (not in cuBLASLt table) -> fallthrough == stock
         Ku, Nu = 2048, 999
         xu = torch.randn(M, Ku, device=DEV, dtype=torch.bfloat16) * 0.05
         Wu = torch.randn(Nu, Ku, device=DEV, dtype=torch.bfloat16) * 0.05
-        _check("unlisted shape routed to fallthrough",
-               bitcmp(wrapped(xu, Wu.t()), stock(xu, Wu.t())) == 0)
+        _check("unlisted shape routed to fallthrough", bitcmp(wrapped(xu, Wu.t()), stock(xu, Wu.t())) == 0)
 
         # fp32 excluded even if (K,N) matched -> fallthrough (dtype guard)
         xf = torch.randn(M, K, device=DEV, dtype=torch.float32)
         Wf = torch.randn(N, K, device=DEV, dtype=torch.float32)
-        _check("fp32 routed to fallthrough (bf16-only guard)",
-               bitcmp(wrapped(xf, Wf.t()), stock(xf, Wf.t())) == 0)
+        _check("fp32 routed to fallthrough (bf16-only guard)", bitcmp(wrapped(xf, Wf.t()), stock(xf, Wf.t())) == 0)
     finally:
         _restore(bi, snap)
 
@@ -253,6 +265,7 @@ class _CountingExt:
     """Proxy over the real ext that counts mm() calls -- so the composition test can tell whether
     cuBLASLt actually RAN for a shape, independent of any numeric coincidence with Triton (on H100
     the two are bit-identical for these shapes, so 'who won' cannot be read off the output)."""
+
     def __init__(self, real):
         self._real = real
         self.mm_calls = 0
@@ -275,8 +288,9 @@ def gate_composition():
     print("\n[6] install-order composition with mm_tiles (both orders; who-ran via call counter)")
     os.environ["SKYRL_ISOEXEC_MM_TILES"] = "1"
     from vllm.model_executor.layers import batch_invariant as bi
-    from skyrl.backends.skyrl_train.isoexec.ops.mm.mm_tiles import install_mm_tiles
+
     import skyrl.backends.skyrl_train.isoexec.ops.mm.mm_tiles as MT
+    from skyrl.backends.skyrl_train.isoexec.ops.mm.mm_tiles import install_mm_tiles
 
     snap = _snapshot(bi)
     stock = snap[0]
@@ -293,8 +307,8 @@ def gate_composition():
         MC._DISABLED = False
         MC._WRAPPER = None
 
-    Kg, Ng = 2048, 1     # gate scalar: mm_tiles yes, cublaslt no
-    Ku, Nu = 2048, 999   # neither table
+    Kg, Ng = 2048, 1  # gate scalar: mm_tiles yes, cublaslt no
+    Ku, Nu = 2048, 999  # neither table
     Kc, Nc = 2048, 1024  # cublaslt (and mm_tiles) shape
     M = 320
     xg = torch.randn(M, Kg, device=DEV, dtype=torch.bfloat16) * 0.05
@@ -314,26 +328,32 @@ def gate_composition():
             w = bi.matmul_persistent
 
             # unlisted-by-cublaslt shapes must be BIT-EQUAL TO STOCK TRITON (mm_tiles neutral)
-            _check(f"[{'>'.join(order)}] unlisted (K2048,N999) == stock Triton",
-                   bitcmp(w(xu, Wu.t()), stock_u) == 0)
-            _check(f"[{'>'.join(order)}] gate N=1 (mm_tiles-only) == stock Triton",
-                   bitcmp(w(xg, Wg.t()), stock_g) == 0)
+            _check(f"[{'>'.join(order)}] unlisted (K2048,N999) == stock Triton", bitcmp(w(xu, Wu.t()), stock_u) == 0)
+            _check(f"[{'>'.join(order)}] gate N=1 (mm_tiles-only) == stock Triton", bitcmp(w(xg, Wg.t()), stock_g) == 0)
 
             # who ran the shared cuBLASLt shape? (call counter, not output compare)
             counting.mm_calls = 0
             got = w(xc, Wc.t())
             ran_cublaslt = counting.mm_calls == 1
             # correctness regardless of who ran: bit-equal to at least stock (Triton==cuBLASLt here)
-            _check(f"[{'>'.join(order)}] shared shape correct (== stock Triton)",
-                   bitcmp(got, stock(xc, Wc.t())) == 0,
-                   f"cuBLASLt {'RAN (wins)' if ran_cublaslt else 'shadowed by mm_tiles'}")
+            _check(
+                f"[{'>'.join(order)}] shared shape correct (== stock Triton)",
+                bitcmp(got, stock(xc, Wc.t())) == 0,
+                f"cuBLASLt {'RAN (wins)' if ran_cublaslt else 'shadowed by mm_tiles'}",
+            )
             if order == ("mm_tiles", "cublaslt"):
-                _check("[load-bearing order] cuBLASLt installed LAST -> cuBLASLt WINS the shared shape",
-                       ran_cublaslt, "this is the engine install order (mm_tiles L90, cublaslt after)")
+                _check(
+                    "[load-bearing order] cuBLASLt installed LAST -> cuBLASLt WINS the shared shape",
+                    ran_cublaslt,
+                    "this is the engine install order (mm_tiles L90, cublaslt after)",
+                )
             else:
                 # documents WHY order matters: cublaslt-then-mm_tiles shadows cuBLASLt.
-                _check("[reverse order] cublaslt-then-mm_tiles shadows cuBLASLt (documented hazard)",
-                       not ran_cublaslt, "engine MUST install cuBLASLt LAST; manifest handshake is the backstop")
+                _check(
+                    "[reverse order] cublaslt-then-mm_tiles shadows cuBLASLt (documented hazard)",
+                    not ran_cublaslt,
+                    "engine MUST install cuBLASLt LAST; manifest handshake is the backstop",
+                )
 
             # idempotency: re-call install in the SAME order -> chain does NOT grow (one mm/call)
             for who in order:
@@ -341,8 +361,11 @@ def gate_composition():
             counting.mm_calls = 0
             w2 = bi.matmul_persistent
             _ = w2(xc, Wc.t())
-            _check(f"[{'>'.join(order)}] idempotent re-install (<=1 cuBLASLt call/matmul)",
-                   counting.mm_calls <= 1, f"mm_calls={counting.mm_calls}")
+            _check(
+                f"[{'>'.join(order)}] idempotent re-install (<=1 cuBLASLt call/matmul)",
+                counting.mm_calls <= 1,
+                f"mm_calls={counting.mm_calls}",
+            )
         reset()
     finally:
         MC._ext = orig_ext_fn

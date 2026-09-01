@@ -48,7 +48,7 @@ def register(reg) -> None:
                         # gdn_fla_shim._use_native, i.e. the two modes below and no other; `chunk`
                         # selects the sibling `chunk` impl, so pinning kernel="chunk" here would name
                         # a function that never installs.
-                        "kernel": OneOf("recurrent", "chunk_synced"),
+                        "kernel": OneOf("recurrent", "cpr"),
                     },
                     documentary=(
                         "The native-composition core (both runtimes; all four sites). vLLM "
@@ -131,8 +131,9 @@ def register(reg) -> None:
                         "every process -> deterministic + cross-sequence + prefix invariant, exact "
                         "state chaining (verify_gdn_batch_invariance). Decode reproduces it bitwise "
                         "by pinning the recurrent state to the chunk grid and re-running this kernel "
-                        "over the open chunk (gdn_chunk_consistent.py). CUDA-graph capture needs "
-                        "SKYRL_ISOEXEC_GDN_PADDED_DECODE=1 for static decode shapes (default OFF)."
+                        "over the open chunk. No model declares a chunk composition, so a contract "
+                        "build refuses it; the mode survives as the trainer-only ablation door "
+                        "SKYRL_ISOEXEC_GDN_TRAINER_KERNEL=chunk."
                     ),
                 ),
                 capabilities={"cuda_graph": False, "padded_decode_for_graph": True},
@@ -143,12 +144,12 @@ def register(reg) -> None:
         )
         # CHUNK-SYNCED: boundary states by the chunk STATE pass (wy prep + fwd_h, autotune pinned),
         # within-chunk outputs by the recurrent scan from bf16(h_c) -- the mixed evaluation strategy.
-        # Trainer/prefill: gdn_chunk_synced_fwd (segmented
+        # Trainer/prefill: gdn_cpr_fwd (segmented
         # varlen scan, T/C-way parallel). Decode: recurrent T=1 steps + a boundary RESYNC once per C
-        # tokens (ChunkSyncedGDN). l2norm + gating outside, as in recurrent.
+        # tokens (CprGDN). l2norm + gating outside, as in recurrent.
         .add_impl(
             ImplSpec(
-                impl_id="chunk_synced",
+                impl_id="cpr",
                 version=1,
                 supported_archs=_SM90,
                 rounding=RoundingSchedule(
@@ -166,12 +167,12 @@ def register(reg) -> None:
                         "One canonical function, three evaluations: fwd_h chains chunk-entry states "
                         "in fp32 and stores bf16 snapshots; every within-chunk scan (trainer "
                         "segment, prefill segment, decode token) starts from bf16(h_c) upcast to "
-                        "fp32. Proved by gdn_chunk_synced_h1_test: trainer forward == "
+                        "fp32. Proved by gdn_cpr_h1_test: trainer forward == "
                         "decode sim with fp32-chained resyncs, bitwise on ragged lengths. Defined "
                         "ONLY on the isoexec eager/fused-prep composition -- the chunk state pass "
                         "does not reproduce the NATIVE fused core's states even on kernel-matched "
-                        "prep (2.1-3.3e-04, gdn_chunk_synced_native_h1_test) -- so it excludes "
-                        "native kernels and native state (ChunkSyncedGDN raises on both). "
+                        "prep (2.1-3.3e-04, gdn_cpr_native_h1_test) -- so it excludes "
+                        "native kernels and native state (CprGDN raises on both). "
                         "cuda_graph False in v1: the decode resync host-syncs the crossing mask."
                     ),
                 ),
@@ -333,8 +334,8 @@ def register(reg) -> None:
                         "shifted, scaled copies + bias + SiLU, fp32-accumulated and rounded ONCE. "
                         "Every op is elementwise over the token axis, so y[t] is a pure function of "
                         "x[t-3..t] -- batch/prefix invariance by construction, no equivalence proof "
-                        "needed. Used identically at prefill and decode by ChunkConsistentGDN and by "
-                        "the private-pool recurrent path, which is "
+                        "needed. Used identically at prefill and decode by the private-pool "
+                        "recurrent and CPR paths, which is "
                         "how those paths dodge the native prefill/decode conv mismatch."
                     ),
                 ),
@@ -428,13 +429,13 @@ def register(reg) -> None:
                 hazards=["null_lanes", "non_contiguous"],
             )
         )
-        # chunk_synced (GDN_KERNEL=chunk_synced, which requires GDN_NATIVE_STATE=0). A distinct object
+        # cpr (GDN_KERNEL=cpr, which requires GDN_NATIVE_STATE=0). A distinct object
         # from `private_pool` above: that pool holds one tensor per row (the running ssm state) plus the
-        # conv window, while ChunkSyncedGDN also holds the fp32 entry state the boundary chain rests on
+        # conv window, while CprGDN also holds the fp32 entry state the boundary chain rests on
         # and the open-chunk buffers the boundary pass re-reads at every C-th token.
         .add_impl(
             ImplSpec(
-                impl_id="chunk_synced_pool",
+                impl_id="cpr_pool",
                 version=1,
                 supported_archs=_SM90,
                 rounding=RoundingSchedule(
@@ -455,15 +456,15 @@ def register(reg) -> None:
                         "chunk_size": 64,  # FLA_CHUNK_SIZE
                         "capacity": "max_num_seqs",
                         "null_row": 0,  # rows = capacity + 1; row 0 never handed out
-                        # 65536 by default, 2^20 under GDN_CS_MIN_PAGES=1: that flag multiplies vLLM's
+                        # 65536 by default, 2^20 under GDN_CPR_MIN_PAGES=1: that flag multiplies vLLM's
                         # block-id space and every live slot id must fit the map.
                         "slot_map_size": OneOf(65536, 1048576),
-                        # ChunkSyncedGDN refuses a handed-in vLLM state tensor, and the engine refuses
+                        # CprGDN refuses a handed-in vLLM state tensor, and the engine refuses
                         # to start in this mode with GDN_NATIVE_STATE=1.
                         "native_state": False,
                     },
                     documentary=(
-                        "chunk_synced's OWN state pool: running ssm state (fp32) + conv window "
+                        "cpr's OWN state pool: running ssm state (fp32) + conv window "
                         "(bf16) as in the recurrent pool, PLUS a per-row fp32 entry state, an "
                         "absolute-position counter, and four open-chunk buffers (k/v/g/beta, "
                         "[rows, C, ...]) holding the raw values the boundary pass re-reads: RAW "
@@ -474,16 +475,16 @@ def register(reg) -> None:
                         "at engine sleep and the trainer gets its recompute headroom back; the tiny "
                         "position counter is a plain alloc because its host mirrors must survive "
                         "sleep. Sized ONCE and never reallocated -- a captured CUDA graph holds the "
-                        "addresses. Under GDN_CS_APC=1 prefill additionally materialises the fp32 "
+                        "addresses. Under GDN_CPR_APC=1 prefill additionally materialises the fp32 "
                         "entry + conv window at the boundaries it closes and stashes them for the "
-                        "boundary-state store (CSBoundaryStore); that store is a CACHE, a miss is "
+                        "boundary-state store (CprBoundaryStore); that store is a CACHE, a miss is "
                         "never a correctness event, so it moves no bits and adds no key here."
                     ),
                 ),
                 # cuda_graph: decode IS capturable -- the boundary resync is hoisted to the host
                 # driver that runs BEFORE the step's forward (lazy_resync), which is the
                 # difference between this pool and a self-resyncing decode.
-                capabilities={"cuda_graph": True, "chunked_prefill": True, "apc": "cs_boundary_store"},
+                capabilities={"cuda_graph": True, "chunked_prefill": True, "apc": "cpr_boundary_store"},
                 state_invalidation=StateInvalidation(
                     condition=(
                         "pool + slot->row map + open-chunk buffers are allocated once at build and "
@@ -491,7 +492,7 @@ def register(reg) -> None:
                         "exceeding the map raises rather than growing. The boundary-state store is "
                         "invalidated by a WEIGHT SYNC -- a cached prefix state computed by the "
                         "previous policy is silent and plausible -- so the engine patch clears it "
-                        "wherever vLLM resets its own prefix cache (cs_apc_reset)"
+                        "wherever vLLM resets its own prefix cache (cpr_apc_reset)"
                     ),
                     hook=None,
                 ),

@@ -13,8 +13,8 @@ from ...core.adapter import ContractAdapter
 class MegatronContractAdapter(ContractAdapter):
     build_failsoft = True
 
-    def __init__(self, model_path, *, megatron_config, install_fn, world_size=None):
-        super().__init__("trainer", model_path)
+    def __init__(self, model_path, *, megatron_config, install_fn, world_size=None, model_fn=None):
+        super().__init__("trainer", model_path, model_fn=model_fn)
         self._megatron_config = megatron_config
         self._install_fn = install_fn
         self._world_size = world_size
@@ -52,6 +52,6 @@ class MegatronContractAdapter(ContractAdapter):
                 "handshake:numerical_policy",
                 enforce.WEIGHT_SYNC,
                 enforce.SKIPPED,
-                "no local contract; stamped nothing",
+                f"{enforce.SKIP_NO_LOCAL_CONTRACT}: no local contract; stamped nothing",
             )
         return enforce.weight_sync_boundary(self.side)

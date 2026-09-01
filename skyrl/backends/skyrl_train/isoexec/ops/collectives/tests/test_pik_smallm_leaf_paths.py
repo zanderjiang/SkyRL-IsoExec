@@ -51,10 +51,7 @@ def _plan_module():
 
 def _adversarial_leaves(m: int, n: int = 4096, seed: int = 0) -> list[torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
-    return [
-        (torch.randn(n, generator=g) * torch.exp(torch.randn(n, generator=g) * 12)).float()
-        for _ in range(m)
-    ]
+    return [(torch.randn(n, generator=g) * torch.exp(torch.randn(n, generator=g) * 12)).float() for _ in range(m)]
 
 
 def test_leaf_fold_equals_pair_fold_bitwise():

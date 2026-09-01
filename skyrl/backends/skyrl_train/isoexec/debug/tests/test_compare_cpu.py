@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[6]))
 
-from skyrl.backends.skyrl_train.isoexec.debug import compare, thash, trace  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.debug import compare, trace  # noqa: E402
 
 
 def _write(d, name, recs):
@@ -32,12 +32,14 @@ def _write(d, name, recs):
             f.write(json.dumps(r) + "\n")
 
 
-def _rec(region, call, digest, *, case="x", layer=None, out=0, step=None, ladder=None):
+def _rec(region, call, digest, *, case="x", layer=None, out="0", step=None, ladder=None, rank=0):
     r = {
-        "v": 1,
+        "v": compare.FORMAT_VERSION,
         "region": region,
         "case": case,
         "side": "?",
+        "rank": rank,
+        "rank_src": "env:RANK",
         "layer": layer,
         "step": step,
         "call": call,
@@ -92,7 +94,7 @@ def test_first_divergence_region_and_layer():
         assert fd["agree_k"] == 2
         assert "1e-01" in fd["magnitude"] or "2e-01" in fd["magnitude"]  # 2**-2 = 0.25
         text = compare.render_text(rep)
-        assert "FIRST DIVERGENCE: region=moe.router layer=7" in text
+        assert "FIRST DIVERGENCE: region=moe.router rank=0 layer=7" in text
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -116,12 +118,13 @@ def test_case_filtering_and_unaligned():
         rb = [_rec("r", 1, "d1", case="engine_prefill"), _rec("r", 2, "d2", case="engine_prefill")]
         _write(a, "t.jsonl", ra)
         _write(b, "e.jsonl", rb)
-        rep = compare.compare(
-            compare.load_dir(a), compare.load_dir(b), case_a="trainer_score", case_b="engine_prefill"
-        )
+        rep = compare.compare(compare.load_dir(a), compare.load_dir(b), case_a="trainer_score", case_b="engine_prefill")
         s = rep["regions"]["r"]
         assert (s["compared"], s["matched"], s["mismatched"], s["unaligned"]) == (1, 1, 0, 1)
-        assert rep["first_divergence"] is None
+        # The record B has and A does not is a divergence, located, not a bare count
+        fd = rep["first_divergence"]
+        assert fd["kind"] == "absent" and fd["absent_in"] == "A" and fd["call"] == 2
+        assert rep["status"] == "divergent"
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -213,8 +216,9 @@ def test_end_to_end_with_real_capture():
         assert (s["compared"], s["matched"], s["mismatched"]) == (4, 3, 1)
         fd = rep["first_divergence"]
         assert fd["layer"] == 2
-        # ~2**-6 bump breaks the fine rungs; sign+exponent (k0) still agrees
-        assert fd["agree_k"] == 0 and "k<=0" in fd["magnitude"]
+        # ~2**-6 bump breaks the fine rungs; sign+exponent (k0) still agrees -> a bracket,
+        # not a saturated verdict
+        assert fd["agree_k"] == 0 and fd["magnitude"].startswith("between ~2^-2 and 2^-0")
     finally:
         for k, v in saved.items():
             os.environ.pop(k, None)
@@ -222,6 +226,78 @@ def test_end_to_end_with_real_capture():
                 os.environ[k] = v
         trace._reset_for_tests()
         shutil.rmtree(base, ignore_errors=True)
+
+
+def _fully_divergent(n_per_region=300, regions=("gdn.core", "moe.router")):
+    a, b = [], []
+    for region in regions:
+        for i in range(n_per_region):
+            a.append(_rec(region, i + 1, f"{i:016x}", layer=i % 8))
+            b.append(_rec(region, i + 1, f"{i + 1:016x}", layer=i % 8))
+    return compare.compare(a, b)
+
+
+def test_json_cap_trims_per_region_but_keeps_counts():
+    """P7: a fully divergent run serialized 66MB of near-identical mismatch records."""
+    rep = _fully_divergent()
+    full = len(rep["divergences"])
+    assert full == 600
+    capped = compare.cap_report(rep, 25)
+    assert len(capped["divergences"]) == 50  # 25 per region, two regions
+    assert {d["region"] for d in capped["divergences"]} == {"gdn.core", "moe.router"}
+    # the verdict is never trimmed
+    assert capped["status"] == rep["status"]
+    assert capped["first_divergence"] == rep["first_divergence"]
+    assert capped["regions"] == rep["regions"]
+    assert capped["regions"]["gdn.core"]["mismatched"] == 300
+    assert capped["truncated"]["divergences_total"] == 600
+    assert capped["truncated"]["divergences_dropped"] == {"gdn.core": 275, "moe.router": 275}
+    assert rep["divergences"][:1] == capped["divergences"][:1]  # earliest kept, causal order
+
+
+def test_json_cap_is_a_noop_when_small_or_disabled():
+    rep = _fully_divergent(n_per_region=3)
+    assert compare.cap_report(rep, 0) is rep
+    assert compare.cap_report(rep, -1) is rep
+    capped = compare.cap_report(rep, 100)
+    assert len(capped["divergences"]) == len(rep["divergences"])
+    assert capped["truncated"] is None
+
+
+def test_json_cap_shrinks_the_serialized_file(tmp_path=None):
+    import tempfile
+
+    rep = _fully_divergent()
+    d = tempfile.mkdtemp(prefix="ix-cap-")
+    try:
+        big = os.path.join(d, "big.json")
+        small = os.path.join(d, "small.json")
+        with open(big, "w") as f:
+            json.dump(rep, f, indent=2)
+        with open(small, "w") as f:
+            json.dump(compare.cap_report(rep, 10), f, indent=2)
+        assert os.path.getsize(small) < os.path.getsize(big) / 10
+        # and it is still valid, readable JSON with the verdict in it
+        back = json.load(open(small))
+        assert back["status"] == "divergent" and back["first_divergence"]["region"] == "gdn.core"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_cli_json_cap_flag():
+    d = tempfile.mkdtemp(prefix="ix-cli-")
+    try:
+        da, db = os.path.join(d, "a"), os.path.join(d, "b")
+        _write(da, "trainer-r0-h-1.jsonl", [_rec("gdn.core", i + 1, f"{i:016x}") for i in range(40)])
+        _write(db, "engine-r0-h-1.jsonl", [_rec("gdn.core", i + 1, f"{i + 1:016x}") for i in range(40)])
+        out = os.path.join(d, "r.json")
+        assert compare.main([da, db, "--json", out, "--json-max-per-region", "5"]) == 2
+        rep = json.load(open(out))
+        assert len(rep["divergences"]) == 5
+        assert rep["regions"]["gdn.core"]["mismatched"] == 40
+        assert rep["truncated"]["divergences_dropped"]["gdn.core"] == 35
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _run():

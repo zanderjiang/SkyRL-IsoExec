@@ -30,6 +30,7 @@ class ResolvedFingerprint:
     def keys(self) -> frozenset:
         return frozenset(self.installed.keys())
 
+
 # The site vocabulary, as tuples an install site can spell in one word. Kept here rather than in
 # models/policy.py so an op folder never imports the derivation to describe itself, and so the
 # coverage test can resolve these names statically.
@@ -47,6 +48,9 @@ NOT_INSTALLED = "NOT_INSTALLED"
 
 _RECORDER: "FingerprintRecorder | None" = None
 _LOGGED_TAGS: set = set()
+#: (op, site, impl_id, pins) already attested to the obligation ledger. Guards the per-forward
+#: recorders from re-reporting a fact the ledger already holds; see record_install.
+_ATTESTED: set = set()
 
 
 class FingerprintRecorder:
@@ -87,7 +91,21 @@ def record_install(op: str, site: str, impl_id: str, obj=None, pinned=None) -> N
     # The attestation ledger: a record's existence is what discharges install_attest@INSTALL
     # (NOT_INSTALLED included -- attesting a non-install is the record; the comparator decides
     # whether it violates the contract). Fail-safe, separately from the record itself.
+    #
+    # ATTESTED ONCE PER DISTINCT FACT. An install is a process-wide fact, but some recorders sit on
+    # a per-forward path (gdn_gptmodel._state rebinds on a (data_ptr, shape) change and re-records
+    # every call), and after the INSTALL phase closes each repeat is a LATE record -- which logs an
+    # error AND rewrites the whole enforcement.json. Measured on a live engine: 61,834 repeats of
+    # the same gdn.state attestation rewriting an 11 MB artifact per GDN layer per forward, with the
+    # ledger growing unboundedly, i.e. quadratic; generation ran >=25x slower than baseline.
+    # Keying on (op, site, impl_id, pins) keeps the semantics -- the record's EXISTENCE is what
+    # discharges the obligation, and a genuine drift changes impl_id or the pins and so re-reports.
     try:
+        key = (op, site, impl_id, repr(sorted(pinned.items())) if isinstance(pinned, dict) else repr(pinned))
+        if key in _ATTESTED:
+            return
+        _ATTESTED.add(key)
+
         from . import enforce
 
         enforce.report(f"install_attest:{op}:{site}", enforce.INSTALL, enforce.OK, impl_id)
@@ -103,6 +121,27 @@ def record_installs(op: str, sites, impl_id: str, obj=None, pinned=None) -> None
     """
     for site in (sites,) if isinstance(sites, str) else sites:
         record_install(op, site, impl_id, obj, pinned)
+
+
+def pin_disagreements(want_pins, got_pins) -> list:
+    """Per-key disagreements between the contract's pinned constants and the recorded ones.
+
+    The contract's pins are the claim, so every key it names must be recorded and must agree; a key
+    the install reports and the contract does not pin is the install's own detail. Values compare
+    by the registry's pin equality, since a pin round-trips through JSON (a declared tuple arrives
+    as a list) and a bool is never an int. Pure and import-light: an install site can call it
+    directly to compare what it is about to bind.
+    """
+    from .registry import pin_values_equal
+
+    want, got = dict(want_pins or {}), dict(got_pins or {})
+    problems = []
+    for key in sorted(want, key=str):
+        if key not in got:
+            problems.append(f"{key}: contract pins {want[key]!r}, install recorded nothing")
+        elif not pin_values_equal(want[key], got[key]):
+            problems.append(f"{key}: contract pins {want[key]!r}, install used {got[key]!r}")
+    return problems
 
 
 def log_fingerprint_once(view=None, tag: str = "default") -> dict:
@@ -173,11 +212,16 @@ def log_fingerprint(view=None, tag: str = "default") -> dict:
                     f"{key}: manifest={want['impl_id']!r} but INSTALLED={got['impl_id']!r} "
                     f"({got['module']}.{got['qualname']})"
                 )
-            elif "pinned_constants" in got and want["pinned_constants"] != got["pinned_constants"]:
-                problem = (
-                    f"{key}: manifest pins={want['pinned_constants']!r} but INSTALLED pins="
-                    f"{got['pinned_constants']!r} ({got['module']}.{got['qualname']})"
-                )
+            elif "pinned_constants" in got:
+                # Only when the recorder reported pins: an install that reports none is a blind
+                # spot (missing_from_fingerprint's business), not evidence that the pins agree.
+                bad = pin_disagreements(want.get("pinned_constants"), got["pinned_constants"])
+                if bad:
+                    problem = (
+                        f"{key}: manifest pins={want.get('pinned_constants')!r} but INSTALLED pins="
+                        f"{got['pinned_constants']!r} -- {'; '.join(bad)} "
+                        f"({got['module']}.{got['qualname']})"
+                    )
             if problem is not None:
                 problems.append(problem)
             if enforce is not None:

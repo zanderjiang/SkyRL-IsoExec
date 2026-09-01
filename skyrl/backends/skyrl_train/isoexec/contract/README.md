@@ -21,9 +21,15 @@ ExecutionContract
 
 | hash | computed over | job |
 |---|---|---|
-| `semantic` | model ref, logical-op vocabulary, case structure | "same logical model?" — catches green-gate-wrong-model |
-| `numerical_policy` | function-half entries: impl ids/versions/arch, constants (bit patterns), routes, artifacts, topology claims | **the signature key** — mismatch refuses before weight sync; any bit-relevant change rotates it |
+| `semantic` | model ref, logical-op vocabulary, every case with its declared conditions | "same logical model?" — catches green-gate-wrong-model |
+| `numerical_policy` | function-half entries: impl ids/versions/arch, constants (bit patterns), routes, artifacts, coverage kind, topology claims, and the same case conditions | **the signature key** — mismatch refuses before weight sync; any bit-relevant change rotates it |
 | `deployment` | deployment-half entries, adapters, ABI, proven-neutral knobs | compared/logged, never signature-keyed — neutral toggles don't fragment the signature table |
+
+A case is hashed whole — `runtime_role`, `grad_mode`, `state_mode`, `shape_domain`, `constraints` —
+because each is a condition the composition was claimed to hold under; deleting `engine_decode`'s
+`cudagraph_capturable` is a change to what was claimed, not an edit to a label. A `coverage` block
+contributes its `kind` (the class of scope), while its `description` is documentary prose that
+reaches the hash the way `RoundingSchedule.documentary` does: through an impl version bump.
 
 Identities are stored for the handshake and recomputed by the validator. The numerical hash
 is closed over dependencies: it reaches through impl names to artifact identities, so an
@@ -104,8 +110,9 @@ worse than none.
   redeploy — or `invariant(axis, domain, proof)` — expensive once, buys mesh freedom. The
   handshake refuses a deployed topology outside the admitted domain.
 - **State obligations**: each state (KV, recurrent, prefix cache, fused buffers, graph
-  addresses) declares what invalidates it (weight sync, sleep/wake, storage move) and
-  replay safety. Stale derived state after weight sync becomes machine-visible.
+  addresses) declares what invalidates it and its replay safety. The event vocabulary is
+  closed and small (`weight_sync`, `sleep_wake`) — an event no boundary observes is not
+  declarable. Stale derived state after weight sync becomes machine-visible.
 - **Admitted tolerances** — residual attribution: every non-bitwise case-pair boundary is
   *named*, bounded, and attributed to responsible regions. An observed diff outside the
   named set is a coverage gap, and alarms. Empty set ⇔ zero KL is a theorem, not a measurement.
@@ -113,9 +120,13 @@ worse than none.
 ## Enforcement — three checkpoints
 
 1. **Build-time** (`contract.validate`, CI + freeze): partition totality and no duplicate
-   ownership per case; explicit-entry rule; discharge obligations present; no raw floats;
-   route requirements (B ⇒ artifact, A ⇒ reference); stored identities == recomputed;
-   unknown function-half fields refuse.
+   ownership per case; explicit-entry rule; discharge obligations present *and* discharging
+   (no self-claim, no dangling referent, no unclaimed member of an N-impl group, no
+   unresolvable proof pointer); no raw floats; route requirements (B ⇒ artifact, A ⇒
+   reference); the selected impl proven on the build arch; claim content (finite tolerance
+   bounds, deployable pinned degrees, invariance over more than one degree, known lifecycle
+   events); stored identities == recomputed; an empty contract and unknown function-half
+   fields refuse.
 2. **Startup/handshake** (runtimes): load the frozen artifact, install bindings, record
    first-forward resolved fingerprints, assert fingerprint == plan and trainer hash ==
    engine hash before weight sync. Refuse, don't warn.
@@ -127,7 +138,7 @@ worse than none.
 
 ```jsonc
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "model": {
     "family": "qwen3_5",
     "architectures": ["Qwen3_5MoeForConditionalGeneration"],

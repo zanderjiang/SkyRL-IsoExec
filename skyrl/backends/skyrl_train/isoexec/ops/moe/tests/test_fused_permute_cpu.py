@@ -183,9 +183,7 @@ def test_wrapper_preemits_and_consumer_reuses_rows_without_sort(monkeypatch):
     monkeypatch.setenv(P.GATHER_ENV, "kernel")
     P.reset_fused_permute_stats()
     routing_map = _skewed_map(19, 31, 8, seed=7)
-    _, _, sorted_indices, _, _ = P._fused_permute(
-        torch.randn(19, 5, dtype=torch.bfloat16), routing_map, None, 19 * 8
-    )
+    _, _, sorted_indices, _, _ = P._fused_permute(torch.randn(19, 5, dtype=torch.bfloat16), routing_map, None, 19 * 8)
     rows = P.get_preemitted_combine_rows(sorted_indices, 19)
     ref = torch.argsort(sorted_indices, stable=True).view(19, 8).to(torch.int32)
     assert torch.equal(rows, ref)
@@ -194,7 +192,9 @@ def test_wrapper_preemits_and_consumer_reuses_rows_without_sort(monkeypatch):
 
 
 def test_pik_owner_reuses_the_same_preemitted_rows(monkeypatch):
-    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_pik_combine_owner import _build_rows
+    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_pik_combine_owner import (
+        _build_rows,
+    )
 
     routing_map = _topk_map(23, 29, 8, seed=12)
     sidx, experts, _ = P.compact_route_positions_reference(routing_map, 23 * 8)
@@ -285,7 +285,10 @@ def test_grad_without_exact_topk_declines_rather_than_guessing_a_vjp(monkeypatch
     routing_map[1, :2] = True  # 5 routed pairs over 4 tokens: not an exact top-k
     x = torch.randn(4, 3, requires_grad=True)
     assert P._fused_permute(x, routing_map, None, 5) == "FELL-BACK"
-    assert P._decline_reason(x, routing_map, None, num_out_tokens=5, fused=False, drop_and_pad=False) == "grad_without_exact_topk"
+    assert (
+        P._decline_reason(x, routing_map, None, num_out_tokens=5, fused=False, drop_and_pad=False)
+        == "grad_without_exact_topk"
+    )
     # DIVERGENCE FROM THE PRIVATE PROOF, kept visible on purpose: privately the same layout was
     # SERVED under no_grad (row emission was opt-in). This repo emits canonical combine rows on
     # every served call, and those rows are only lawful for an exact top-k layout -- so a no_grad

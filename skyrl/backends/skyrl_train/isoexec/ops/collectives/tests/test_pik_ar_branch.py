@@ -16,9 +16,7 @@ import importlib
 
 import pytest
 
-ar_branch = importlib.import_module(
-    "skyrl.backends.skyrl_train.isoexec.ops.collectives.pik.ar_branch"
-)
+ar_branch = importlib.import_module("skyrl.backends.skyrl_train.isoexec.ops.collectives.pik.ar_branch")
 
 BUDGET = 2 << 20  # the shipped SKYRL_ISOEXEC_PIK_ONESHOT_MB default, in bytes-read
 

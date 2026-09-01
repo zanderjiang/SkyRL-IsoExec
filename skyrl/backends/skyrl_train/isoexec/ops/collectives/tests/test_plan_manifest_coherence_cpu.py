@@ -63,8 +63,10 @@ def test_leaves_split_refuses(monkeypatch):
         pmod._assert_plan_matches_manifest("TEST", _plan(4, bf16=False))
 
 
-def test_strict_off_downgrades_to_warning(monkeypatch, capsys):
+def test_strict_off_downgrades_to_warning(monkeypatch, caplog):
     monkeypatch.setenv("SKYRL_ISOEXEC_MANIFEST_STRICT", "0")
     manifest_mod._VIEW = _StubManifest({"leaves": 8, "leaf_dtype": "fp32"})
-    pmod._assert_plan_matches_manifest("TEST", _plan(8, bf16=True))  # no raise
-    assert "SPLIT" in capsys.readouterr().out
+    with caplog.at_level("ERROR"):
+        pmod._assert_plan_matches_manifest("TEST", _plan(8, bf16=True))  # no raise
+    # The demotion is enforce.refuse's ERROR log -- the check says the split once, there.
+    assert [r for r in caplog.records if "SPLIT" in r.getMessage()]

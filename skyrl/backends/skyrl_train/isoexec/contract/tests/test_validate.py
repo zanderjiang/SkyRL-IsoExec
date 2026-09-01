@@ -8,6 +8,8 @@ from skyrl.backends.skyrl_train.isoexec.contract import (
     CompositionEntry,
     EquivalenceProof,
     ImplRef,
+    StateClaim,
+    ToleranceClaim,
     TopologyClaim,
     ValidationError,
     compute_identities,
@@ -27,6 +29,10 @@ def _rehash(c):
 
 def _with_entry(c, entry):
     return _rehash(dataclasses.replace(c, composition=c.composition + (entry,)))
+
+
+def _with_claims(c, **kw):
+    return _rehash(dataclasses.replace(c, claims=dataclasses.replace(c.claims, **kw)))
 
 
 def _replace_entry(c, idx, **kw):
@@ -138,6 +144,40 @@ class TestValidate(unittest.TestCase):
 
     def test_unknown_route(self):
         self._assert_violation(_replace_entry(self.c, 1, route="freestyle"), "unknown route")
+
+    def test_empty_composition(self):
+        self._assert_violation(_rehash(dataclasses.replace(self.c, composition=())), "empty composition")
+
+    def test_empty_discharge_ref(self):
+        idx = next(i for i, e in enumerate(self.c.composition) if e.discharge is not None)
+        c2 = _replace_entry(self.c, idx, discharge=EquivalenceProof("equivalence_proof", "  "))
+        self._assert_violation(c2, "discharge with an empty ref")
+
+    def test_pinned_degree_below_one(self):
+        for degree in (0, -4):
+            t = (TopologyClaim("EP", "pinned", degree=degree, collective_plan="none"),)
+            self._assert_violation(_with_claims(self.c, topology=t), "is not a deployable degree")
+
+    def test_invariance_over_one_degree(self):
+        t = (TopologyClaim("EP", "invariant", domain=(8,), proof="gates/ep"),)
+        self._assert_violation(_with_claims(self.c, topology=t), "is a tautology")
+
+    def test_empty_proof_ref(self):
+        t = (TopologyClaim("EP", "pinned", degree=8, collective_plan="none", proof=""),)
+        self._assert_violation(_with_claims(self.c, topology=t), "empty proof ref")
+
+    def test_non_finite_tolerance_bound(self):
+        for bound in ("nan", "inf", "-inf"):
+            claim = ToleranceClaim(case_pair=("engine_decode", "trainer_score"), bounds={"max": bound})
+            self._assert_violation(_with_claims(self.c, tolerances=(claim,)), "is not a finite threshold")
+
+    def test_tolerance_without_bounds(self):
+        claim = ToleranceClaim(case_pair=("engine_decode", "trainer_score"))
+        self._assert_violation(_with_claims(self.c, tolerances=(claim,)), "no bounds")
+
+    def test_state_claim_unknown_event(self):
+        claim = StateClaim("kv_cache", ("the_vibes_changed",), True, "lifecycle/kv_rebind")
+        self._assert_violation(_with_claims(self.c, state=(claim,)), "unknown lifecycle event(s)")
 
     def test_unknown_schema_version(self):
         self._assert_violation(_rehash(dataclasses.replace(self.c, schema_version="99")), "unsupported schema_version")

@@ -9,12 +9,15 @@ naming the claiming impl id, and (c) every declared hazard is referenced in the 
 from __future__ import annotations
 
 import importlib
-import os
 import pathlib
 import re
 
 from skyrl.backends.skyrl_train.isoexec.core.registry import HAZARDS, Registry
-from skyrl.backends.skyrl_train.isoexec.core.registry_build import _FAMILIES, _ISOEXEC_ROOT, build_registry
+from skyrl.backends.skyrl_train.isoexec.core.registry_build import (
+    _FAMILIES,
+    _ISOEXEC_ROOT,
+    build_registry,
+)
 
 _OPS_DIR = pathlib.Path(__file__).resolve().parents[2] / "ops"
 
@@ -109,7 +112,13 @@ def _findings():
                 for hz in impl.hazards:
                     if not any(alias in blob for alias in _HAZARD_ALIASES[hz]):
                         reports.append(
-                            (fam, op_name, impl_id, f"hazard {hz!r} never referenced in {fam}/tests", "hazard unreferenced")
+                            (
+                                fam,
+                                op_name,
+                                impl_id,
+                                f"hazard {hz!r} never referenced in {fam}/tests",
+                                "hazard unreferenced",
+                            )
                         )
     return violations, reports
 
@@ -129,7 +138,9 @@ def test_registry_builds():
 
 def test_bitwise_referents_resolve():
     violations, reports = _findings()
-    _print_table([r for r in reports if r[-1] == "allowlisted external baseline"], "external-baseline referents (allowlisted)")
+    _print_table(
+        [r for r in reports if r[-1] == "allowlisted external baseline"], "external-baseline referents (allowlisted)"
+    )
     _print_table(violations, "DANGLING bitwise_equal_to referents")
     assert not violations, f"{len(violations)} bitwise_equal_to referent(s) name no registered impl"
 

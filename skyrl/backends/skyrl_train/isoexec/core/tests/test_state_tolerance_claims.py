@@ -7,15 +7,26 @@ same numbers) where none can be built (the CPU driver).
 """
 
 import dataclasses
+import math
+import os
 import pathlib
 import re
+import tempfile
 
 from skyrl.backends.skyrl_train.isoexec.contract import ToleranceClaim
 from skyrl.backends.skyrl_train.isoexec.contract.identity import compute_identities
+from skyrl.backends.skyrl_train.isoexec.core import enforce
 from skyrl.backends.skyrl_train.isoexec.core import process_contract as pc
+from skyrl.backends.skyrl_train.isoexec.core.adapter import ToleranceChecker
+from skyrl.backends.skyrl_train.isoexec.core.contract_delivery import write_contract_file
 from skyrl.backends.skyrl_train.isoexec.core.registry_build import build_registry
+from skyrl.backends.skyrl_train.isoexec.debug import trace
 from skyrl.backends.skyrl_train.isoexec.models import qwen3_5
-from skyrl.backends.skyrl_train.isoexec.models.profile import ProfileError, StateFact, ToleranceFact
+from skyrl.backends.skyrl_train.isoexec.models.profile import (
+    ProfileError,
+    StateFact,
+    ToleranceFact,
+)
 
 _ISOEXEC_DIR = pathlib.Path(__file__).resolve().parents[2]
 
@@ -47,9 +58,9 @@ def test_state_claim_hooks_exist():
         f = _ISOEXEC_DIR / path
         assert f.is_file(), f"state claim {s.state_id}: ref file {path!r} missing under {_ISOEXEC_DIR}"
         src = f.read_text()
-        assert re.search(rf"^def {re.escape(symbol)}\(", src, re.M), (
-            f"state claim {s.state_id}: hook {symbol!r} not defined in {path}"
-        )
+        assert re.search(
+            rf"^def {re.escape(symbol)}\(", src, re.M
+        ), f"state claim {s.state_id}: hook {symbol!r} not defined in {path}"
 
 
 def test_profile_refuses_hookless_state_fact():
@@ -58,6 +69,14 @@ def test_profile_refuses_hookless_state_fact():
         raise AssertionError("state fact without a hook ref must refuse")
     except ProfileError as e:
         assert "hook" in str(e)
+
+
+def test_profile_refuses_unknown_lifecycle_event():
+    try:
+        StateFact(state_id="x", invalidated_by=("the_vibes_changed",), replay_safe=True, ref="lifecycle/ordering.py::f")
+        raise AssertionError("an event no boundary observes must refuse")
+    except ProfileError as e:
+        assert "unknown lifecycle event(s)" in str(e)
 
 
 def test_tolerance_claim_matches_gate_constants():
@@ -76,6 +95,15 @@ def test_profile_refuses_non_decimal_bound():
         raise AssertionError("non-decimal bound must refuse")
     except ProfileError as e:
         assert "decimal" in str(e)
+
+
+def test_profile_refuses_non_finite_bound():
+    for bound in ("nan", "inf", "-inf"):
+        try:
+            ToleranceFact(case_pair=GATE_PAIR, bounds=(("abs_diff_mean_max", bound),))
+            raise AssertionError(f"bound {bound!r} must refuse")
+        except ProfileError as e:
+            assert "finite threshold" in str(e)
 
 
 def _gate_metrics(mean, maximum):
@@ -105,9 +133,7 @@ def test_gate_reads_limits_from_contract_claim():
         pc._CONTRACT = dataclasses.replace(c2, identities=compute_identities(c2))
         assert tu.isoexec_gate_limits() == (5.0e-6, 1.0e-4)
         assert (
-            tu.validate_isoexec_forward_gate(
-                _gate_metrics(1.0e-6, 1.0e-5), enabled=True, scoring_audit_skipped=False
-            )
+            tu.validate_isoexec_forward_gate(_gate_metrics(1.0e-6, 1.0e-5), enabled=True, scoring_audit_skipped=False)
             is True
         )
         try:
@@ -117,6 +143,173 @@ def test_gate_reads_limits_from_contract_claim():
             assert "5.0e-06" in str(e)
     finally:
         pc._CONTRACT = saved
+
+
+def test_cpr_variant_claims_exact_zero():
+    """The cpr composition claims 0.0, and the recurrent one deliberately does not.
+
+    The exact-zero envelope is licensed by live evidence produced under
+    SKYRL_ISOEXEC_GDN_KERNEL=cpr (18 gate steps at mean=max=0.000e+00, exact=n/n); the
+    recurrent variant has no such run, so it keeps the pre-rowinv bounds. Evidence licenses the
+    composition that produced it, not the model.
+    """
+    reg = build_registry(strict=True)
+    cpr = qwen3_5.build(reg, arch="sm90", profile=qwen3_5.CPR_PROFILE)
+    rec = qwen3_5.build(reg, arch="sm90", profile=qwen3_5.PROFILE)
+    assert dict(cpr.claims.tolerances[0].bounds) == {"abs_diff_max_max": "0.0", "abs_diff_mean_max": "0.0"}
+    assert dict(rec.claims.tolerances[0].bounds) == {"abs_diff_max_max": "1.0e-4", "abs_diff_mean_max": "1.0e-5"}
+
+
+def test_zero_bounds_admit_exactly_zero_and_refuse_one_ulp():
+    """A 0.0 claim is a real gate, not a vacuous one: 0.0 passes, the next float refuses.
+
+    The gate compares with ``>`` against the limit, so 0.0 <= 0.0 is admitted while any positive
+    difference -- a single ULP of an fp32 logprob -- is a violation. With the leaf-tree denominator
+    pinned there is no rounding floor left for a regression to hide under, so this is the property
+    the tightened claim rests on.
+    """
+    from skyrl.train.utils import trainer_utils as tu
+
+    saved = pc._CONTRACT
+    try:
+        reg = build_registry(strict=True)
+        c = qwen3_5.build(reg, arch="sm90", profile=qwen3_5.CPR_PROFILE)
+        pc._CONTRACT = c
+        assert tu.isoexec_gate_limits() == (0.0, 0.0)
+        assert (
+            tu.validate_isoexec_forward_gate(_gate_metrics(0.0, 0.0), enabled=True, scoring_audit_skipped=False) is True
+        )
+        one_ulp = math.ulp(1.0e-7)
+        for mean, maximum in ((0.0, one_ulp), (one_ulp, one_ulp)):
+            try:
+                tu.validate_isoexec_forward_gate(
+                    _gate_metrics(mean, maximum), enabled=True, scoring_audit_skipped=False
+                )
+                raise AssertionError(f"mean={mean} max={maximum} must refuse against a 0.0 claim")
+            except RuntimeError as e:
+                assert "RED before backward" in str(e)
+    finally:
+        pc._CONTRACT = saved
+
+
+def test_zero_bounds_survive_validation_and_the_checker():
+    """0.0 is a finite threshold, and the install-time ToleranceChecker resolves the gate from it."""
+    from skyrl.backends.skyrl_train.isoexec.contract.validate import validate
+
+    reg = build_registry(strict=True)
+    c = qwen3_5.build(reg, arch="sm90", profile=qwen3_5.CPR_PROFILE)
+    assert validate(c) == []
+
+    saved = pc._CONTRACT
+    try:
+        pc._CONTRACT = c
+        res = ToleranceChecker().check(c.claims.tolerances[0], {})
+        assert res.result == enforce.OK, res
+    finally:
+        pc._CONTRACT = saved
+
+
+class _limits_env:
+    """Isolate one gate-limit resolution: no process contract, no cached artifact, no log latch."""
+
+    def __init__(self, path=None):
+        self.path = path
+
+    def __enter__(self):
+        from skyrl.train.utils import trainer_utils as tu
+
+        self._saved = (pc._CONTRACT, pc._VIEW, os.environ.get(tu.ISOEXEC_CONTRACT_PATH_ENV))
+        pc._CONTRACT, pc._VIEW = None, None
+        tu._gate_artifact_cache.clear()
+        tu._gate_limit_logged.clear()
+        os.environ.pop(tu.ISOEXEC_CONTRACT_PATH_ENV, None)
+        if self.path is not None:
+            os.environ[tu.ISOEXEC_CONTRACT_PATH_ENV] = self.path
+        return self
+
+    def __exit__(self, *exc):
+        from skyrl.train.utils import trainer_utils as tu
+
+        pc._CONTRACT, pc._VIEW = self._saved[:2]
+        tu._gate_artifact_cache.clear()
+        tu._gate_limit_logged.clear()
+        if self._saved[2] is None:
+            os.environ.pop(tu.ISOEXEC_CONTRACT_PATH_ENV, None)
+        else:
+            os.environ[tu.ISOEXEC_CONTRACT_PATH_ENV] = self._saved[2]
+
+
+def _gate_logs(fn):
+    """(result, [ISOEXEC-GATE] lines) -- the provenance line is part of the contract here."""
+    from loguru import logger
+
+    msgs = []
+    sink = logger.add(lambda m: msgs.append(m.record["message"]), level="WARNING")
+    try:
+        return fn(), [m for m in msgs if m.startswith("[ISOEXEC-GATE]")]
+    finally:
+        logger.remove(sink)
+
+
+def test_gate_limits_resolve_from_the_delivered_artifact():
+    """The CONTROLLER builds no contract, so the delivered artifact is its honest limit source.
+
+    Reading the module fallback 1e-5/1e-4 while the delivered contract for that very composition
+    claims 0.0/0.0 judges the run against the wrong envelope. The artifact is validated (stored identities ==
+    recomputed) by ``contract_delivery.load_contract`` before anything is read out of it.
+    """
+    from skyrl.train.utils import trainer_utils as tu
+
+    reg = build_registry(strict=True)
+    cpr = qwen3_5.build(reg, arch="sm90", profile=qwen3_5.CPR_PROFILE)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "contract.json")
+        write_contract_file(cpr, path)
+        with _limits_env(path):
+            limits, logs = _gate_logs(tu.isoexec_gate_limits)
+            assert limits == (0.0, 0.0)
+            assert any("source=contract_artifact" in m and path in m for m in logs), logs
+            # ...and the gate then judges by the CONTRACT: 0.0 admits 0.0 and refuses one ulp.
+            metrics = _gate_metrics(0.0, math.ulp(1.0e-7))
+            try:
+                tu.validate_isoexec_forward_gate(metrics, enabled=True, scoring_audit_skipped=False)
+                raise AssertionError("the artifact's 0.0 claim must refuse a positive difference")
+            except RuntimeError as e:
+                assert "RED before backward" in str(e) and "max_limit=0.0e+00" in str(e)
+            assert metrics["policy/isoexec_forward_gate_max_limit"] == 0.0
+
+
+def test_gate_limit_fallback_logs_its_provenance():
+    """The module constants stay the documented fallback -- but never a silent one.
+
+    With no artifact configured they are used and named. With one configured that cannot be
+    resolved, falling back IS the defect, so it refuses instead (and debug tracing demotes that
+    refusal to the fallback, still named).
+    """
+    from skyrl.train.utils import trainer_utils as tu
+
+    fallback = (tu.ISOEXEC_FORWARD_GATE_MEAN_MAX, tu.ISOEXEC_FORWARD_GATE_MAX_MAX)
+    with _limits_env():
+        limits, logs = _gate_logs(tu.isoexec_gate_limits)
+        assert limits == fallback
+        assert any("source=module_fallback" in m and "no ISOEXEC_CONTRACT_PATH" in m for m in logs), logs
+
+    with tempfile.TemporaryDirectory() as d:
+        missing = os.path.join(d, "contract.json")
+        with _limits_env(missing):
+            try:
+                tu.isoexec_gate_limits()
+                raise AssertionError("a configured artifact that never appeared must refuse")
+            except RuntimeError as e:
+                assert "never appeared" in str(e) and missing in str(e)
+        with _limits_env(missing):
+            os.environ[trace.ENV_TRACE] = d
+            try:
+                limits, logs = _gate_logs(tu.isoexec_gate_limits)
+                assert limits == fallback
+                assert any("source=module_fallback" in m and "DEMOTED" in m for m in logs), logs
+            finally:
+                os.environ.pop(trace.ENV_TRACE, None)
 
 
 def _run():

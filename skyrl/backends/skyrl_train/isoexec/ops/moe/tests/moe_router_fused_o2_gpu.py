@@ -46,7 +46,6 @@ os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 
 import torch  # noqa: E402
 
-
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
     raise SystemExit(0)
@@ -128,7 +127,9 @@ def test_ref():
 
     # 2. ref_router_dense == megatron's topk_routing_with_score_function, deterministic branch
     try:
-        from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+        from megatron.core.transformer.moe.moe_utils import (
+            topk_routing_with_score_function,
+        )
 
         prev = torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -198,7 +199,9 @@ def test_hazard():
 
     # HAZARD 2b -- FTZ. Both forms above are wrong, in opposite directions, and neither shows it on
     # well-conditioned data. This is the check the first version of this kernel did not have.
-    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_router_o2_kernel import _div_rn_nonftz  # noqa: F401
+    from skyrl.backends.skyrl_train.isoexec.ops.moe.moe_router_o2_kernel import (
+        _div_rn_nonftz,  # noqa: F401
+    )
 
     SMALL = 1.17549435e-38
     zz = torch.linspace(-87.0, -104.0, 1 << 16, device=dev)

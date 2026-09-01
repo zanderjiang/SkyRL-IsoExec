@@ -9,11 +9,12 @@ Also cross-checks against the shipped K2 kernel (fused_outnorm.fused_rms_norm_ga
 
 BACKWARD: max abs grad error of (x, residual, weight) vs the same eager composition (fp32 tol).
 """
+
 import os
 import sys
+
 import torch
 import torch.nn.functional as F
-
 
 if not torch.cuda.is_available():  # promoted nightly battery: needs one CUDA device
     print("SKIP: no CUDA device")
@@ -26,7 +27,9 @@ from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_add_rmsnorm import (  # 
 )
 
 # shipped K2 kernel, to prove fused_add == CUDAFunctor_add then K2 exactly
-from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import fused_rms_norm_gamma  # noqa
+from skyrl.backends.skyrl_train.isoexec.ops.norms.fused_outnorm import (
+    fused_rms_norm_gamma,  # noqa
+)
 
 torch.manual_seed(0)
 dev = "cuda"
@@ -55,8 +58,8 @@ def populate(M, H):
     r.view(-1)[500::991] = torch.tensor(-0.0, dtype=torch.bfloat16)
     # bf16 subnormals (exponent 0)
     sub = torch.tensor([1, 2, 5, 7], dtype=torch.int16, device=dev).view(torch.bfloat16)
-    x.view(-1)[13:13 + 4] = sub
-    r.view(-1)[29:29 + 4] = -sub
+    x.view(-1)[13 : 13 + 4] = sub
+    r.view(-1)[29 : 29 + 4] = -sub
     # near-cancellation rows (added ~ 0, stresses rms of tiny values)
     r[0] = -x[0]
     return x, r
@@ -69,7 +72,7 @@ ok_shipped = True
 # widths spanning every tile-ladder bucket boundary that a hidden_size / head_dim can land in.
 # 2048 is the ONLY one the layer-boundary norm actually uses.
 for H in (2048, 4096, 5120, 128, 3072, 6144):
-    w = (torch.randn(H, device=dev, dtype=torch.bfloat16) * 0.05)  # zero-centred: near 0
+    w = torch.randn(H, device=dev, dtype=torch.bfloat16) * 0.05  # zero-centred: near 0
     for M in (320, 512, 8192, 1):
         x, r = populate(M, H)
         # exact eager composition

@@ -28,7 +28,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_chunk_synced as gcs  # noqa: E402
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import (
+    gdn_cpr as gcs,  # noqa: E402
+)
 
 CHUNK = 64
 

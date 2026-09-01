@@ -1,4 +1,4 @@
-"""CPU contracts for scheduler-wave CS-APC checkpoint adoption."""
+"""CPU contracts for scheduler-wave CPR-APC checkpoint adoption."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from collections import OrderedDict
 
 import torch
 
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_chunk_synced_state as cs
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_cpr_state as cpr
 
 
 class _Layer:
@@ -39,7 +39,7 @@ class _Layer:
 
 
 def _install_store(monkeypatch, layers):
-    store = cs.CSBoundaryStore(1 << 20)
+    store = cpr.CprBoundaryStore(1 << 20)
     entries = {
         b"a": torch.tensor(
             [
@@ -57,13 +57,12 @@ def _install_store(monkeypatch, layers):
         ),
     }
     convs = {
-        key: torch.arange(len(layers) * 6, dtype=torch.bfloat16).reshape(len(layers), 3, 2)
-        + offset
+        key: torch.arange(len(layers) * 6, dtype=torch.bfloat16).reshape(len(layers), 3, 2) + offset
         for key, offset in ((b"a", 0), (b"b", 20))
     }
     assert store.put(b"a", 64, entries[b"a"], convs[b"a"])
     assert store.put(b"b", 128, entries[b"b"], convs[b"b"])
-    monkeypatch.setattr(cs, "CS_APC_STORE", store)
+    monkeypatch.setattr(cpr, "CPR_APC_STORE", store)
     return entries, convs
 
 
@@ -72,7 +71,7 @@ def test_adopt_many_batches_assignment_and_preserves_exact_state(monkeypatch):
     entries, convs = _install_store(monkeypatch, layers)
     items = [(101, 64, b"a"), (102, 128, b"b"), (103, 64, b"a")]
 
-    rows = cs.cs_apc_adopt_many(layers, items)
+    rows = cpr.cpr_apc_adopt_many(layers, items)
 
     assert rows == [8, 7, 6]
     assert [layer.assign_calls for layer in layers] == [1, 1]
@@ -80,9 +79,7 @@ def test_adopt_many_batches_assignment_and_preserves_exact_state(monkeypatch):
         expected_entry = torch.stack([entries[key][j] for _slot, _pos, key in items])
         expected_conv = torch.stack([convs[key][j] for _slot, _pos, key in items])
         assert torch.equal(layer.entry_state[rows], expected_entry)
-        assert torch.equal(
-            layer.ssm_state[rows], expected_entry.to(torch.bfloat16).to(torch.float32)
-        )
+        assert torch.equal(layer.ssm_state[rows], expected_entry.to(torch.bfloat16).to(torch.float32))
         assert torch.equal(layer.conv_state[rows], expected_conv)
         assert torch.equal(layer.pos[rows], torch.tensor([64, 128, 64]))
         assert [layer._row_pos[row] for row in rows] == [64, 128, 64]
@@ -94,7 +91,7 @@ def test_adopt_many_miss_is_atomic(monkeypatch):
     layers = [_Layer(0), _Layer(1)]
     _install_store(monkeypatch, layers)
 
-    rows = cs.cs_apc_adopt_many(layers, [(101, 64, b"a"), (102, 128, b"missing")])
+    rows = cpr.cpr_apc_adopt_many(layers, [(101, 64, b"a"), (102, 128, b"missing")])
 
     assert rows is None
     assert [layer.assign_calls for layer in layers] == [0, 0]
@@ -106,6 +103,6 @@ def test_scalar_door_keeps_refusal_contract(monkeypatch):
     layers = [_Layer(0), _Layer(1)]
     _install_store(monkeypatch, layers)
 
-    assert cs.cs_apc_adopt(layers, 101, 64, b"a")
-    assert not cs.cs_apc_adopt(layers, 102, 65, b"a")
-    assert not cs.cs_apc_adopt(layers, 103, 64, b"missing")
+    assert cpr.cpr_apc_adopt(layers, 101, 64, b"a")
+    assert not cpr.cpr_apc_adopt(layers, 102, 65, b"a")
+    assert not cpr.cpr_apc_adopt(layers, 103, 64, b"missing")

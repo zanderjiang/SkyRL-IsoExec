@@ -48,13 +48,13 @@ from skyrl.backends.skyrl_train.isoexec.core.registry import (
     RoundingSchedule,
 )
 from skyrl.backends.skyrl_train.isoexec.models.policy import Selection, entry
-from skyrl.backends.skyrl_train.isoexec.ops.collectives import nccl_identity as ni
 
 TRAINER = ("trainer_fwd", "trainer_score")
 ENGINE = ("engine_prefill", "engine_decode")
 SITES = TRAINER + ENGINE
 
 MM_PINS = {"block": 128, "leaves": 4, "eps": 1e-6}
+ARCHS = frozenset({"sm90", "sm100"})
 
 
 def _registry():
@@ -64,10 +64,12 @@ def _registry():
         ImplSpec(
             "ref",
             1,
-            frozenset({"sm90", "sm100"}),
+            ARCHS,
             rounding=RoundingSchedule({"block": 128, "leaves": PER_MODEL, "mode": OneOf("tree", "flat"), "eps": 1e-6}),
         )
     )
+    # Every default-selected impl is proven on both archs so the arch-rotation test can build on
+    # sm100; "twin" stays sm90-only, which is what the arch-admission refusal is tested against.
     mm.add_impl(
         ImplSpec(
             "twin",
@@ -79,17 +81,17 @@ def _registry():
     )
     reg.register_op(mm)
     core = OpSpec("alpha.core", list(SITES))
-    core.add_impl(ImplSpec("fused_all", 1, frozenset({"sm90"}), subsumes=("alpha.sub",)))
+    core.add_impl(ImplSpec("fused_all", 1, ARCHS, subsumes=("alpha.sub",)))
     reg.register_op(core)
     sub = OpSpec("alpha.sub", list(SITES))
-    sub.add_impl(ImplSpec("eager", 1, frozenset({"sm90"})))
+    sub.add_impl(ImplSpec("eager", 1, ARCHS))
     reg.register_op(sub)
     pin = OpSpec("alpha.pin", list(SITES))
-    pin.add_impl(ImplSpec("pinned", 1, frozenset({"sm90"}), rounding=RoundingSchedule({"NCCL": PER_MODEL})))
-    pin.add_impl(ImplSpec("unpinned", 1, frozenset({"sm90"})))
+    pin.add_impl(ImplSpec("pinned", 1, ARCHS, rounding=RoundingSchedule({"NCCL": PER_MODEL})))
+    pin.add_impl(ImplSpec("unpinned", 1, ARCHS))
     reg.register_op(pin)
     env = OpSpec("alpha.env", list(SITES))
-    env.add_impl(ImplSpec("std", 1, frozenset({"sm90"})))
+    env.add_impl(ImplSpec("std", 1, ARCHS))
     reg.register_op(env)
     return reg
 
@@ -201,6 +203,63 @@ def test_asymmetric_impls_with_bitwise_twin_accepted():
     c = _build(sel=_with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128})))
     e = next(e for e in c.composition if e.impl.id == "twin")
     assert e.discharge and (e.discharge.kind, e.discharge.ref) == ("bitwise_equal_to", "ref")
+
+
+def _mm_impl(reg, impl_id, **kw):
+    """Replace alpha.mm's twin with a variant, keeping its schedule."""
+    reg.get_op("alpha.mm").impls[impl_id] = ImplSpec(impl_id, 1, ARCHS, rounding=RoundingSchedule({"block": 128}), **kw)
+    return reg
+
+
+def test_self_referential_bitwise_claim_refuses():
+    reg = _mm_impl(_registry(), "twin", capabilities={"bitwise_equal_to": "twin"})
+    sel = _with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128}))
+    msg = _refuses(ContractBuildError, _build, reg=reg, sel=sel)
+    assert "bitwise_equal_to ITSELF" in msg and "twin" in msg
+
+
+def test_dangling_bitwise_referent_names_the_referent():
+    reg = _mm_impl(_registry(), "twin", capabilities={"bitwise_equal_to": "does_not_exist"})
+    sel = _with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128}))
+    msg = _refuses(ContractBuildError, _build, reg=reg, sel=sel)
+    assert "does_not_exist" in msg and "not a registered impl" in msg
+
+
+def test_pairwise_claim_does_not_discharge_a_third_impl():
+    reg = _mm_impl(_registry(), "twin", capabilities={"bitwise_equal_to": "ref"})
+    _mm_impl(reg, "third")
+    sel = _selections()
+    sel[("alpha.mm", "engine_prefill")] = entry("twin", pinned={"block": 128})
+    sel[("alpha.mm", "engine_decode")] = entry("third", pinned={"block": 128})
+    msg = _refuses(ContractBuildError, _build, reg=reg, sel=sel)
+    assert "third" in msg and "carry no discharge" in msg
+
+
+def test_unresolvable_equivalence_proof_refuses():
+    reg = _mm_impl(_registry(), "twin", capabilities={"equivalence_proof": "TODO(nobody): write this"})
+    sel = _with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128}))
+    msg = _refuses(ContractBuildError, _build, reg=reg, sel=sel)
+    assert "resolves to no gate" in msg
+
+
+def test_equivalence_proof_naming_a_real_gate_discharges():
+    proof = "ops/gdn/tests/gdn_native_kernel_parity_test_gpu.py: split-exactness at any boundary"
+    reg = _mm_impl(_registry(), "twin", capabilities={"equivalence_proof": proof})
+    c = _build(reg=reg, sel=_with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128})))
+    e = next(e for e in c.composition if e.impl.id == "twin")
+    assert e.discharge and e.discharge.kind == "equivalence_proof"
+
+
+def test_empty_selections_refuse():
+    msg = _refuses(ContractBuildError, _build, sel={})
+    assert "empty selection map" in msg
+
+
+def test_dangling_subsumes_refuses_on_the_build_path():
+    reg = _registry()
+    reg.get_op("alpha.core").impls["fused_all"] = ImplSpec("fused_all", 1, ARCHS, subsumes=("alpha.sub", "alpha.ghost"))
+    msg = _refuses(ContractBuildError, _build, reg=reg)
+    assert "alpha.ghost" in msg and "subsumption-closed" in msg
 
 
 # --- 2. classification rules ---
@@ -324,6 +383,13 @@ def test_allow_non_accelerator_escape():
     assert {e.impl.arch for e in c.composition} == {"cpu"} and validate(c) == []
 
 
+def test_impl_outside_its_supported_archs_refuses():
+    # twin is proven on sm90 only; evidence is arch-scoped, so sm100 has nothing behind it.
+    sel = _with("alpha.mm", ENGINE, entry("twin", pinned={"block": 128}))
+    msg = _refuses(ContractBuildError, _build, sel=sel, arch="sm100")
+    assert "twin" in msg and "supported_archs" in msg and "sm100" in msg
+
+
 def test_arch_rotates_numerical_policy():
     a, b = _build(arch="sm90").identities, _build(arch="sm100").identities
     assert a.numerical_policy != b.numerical_policy
@@ -419,8 +485,15 @@ def test_semantic_rotates_on_model_and_vocabulary():
 def test_contract_is_frozen():
     c = _build()
     e = c.composition[0]
-    for obj, attr in ((c, "schema_version"), (c, "composition"), (e, "impl"), (e.impl, "id"), (e, "constants"),
-                      (c.identities, "numerical_policy"), (c.model, "family")):
+    for obj, attr in (
+        (c, "schema_version"),
+        (c, "composition"),
+        (e, "impl"),
+        (e.impl, "id"),
+        (e, "constants"),
+        (c.identities, "numerical_policy"),
+        (c.model, "family"),
+    ):
         _refuses(dataclasses.FrozenInstanceError, setattr, obj, attr, "x")
     assert isinstance(c.composition, tuple) and isinstance(e.constants, tuple) and isinstance(e.cases, tuple)
     _refuses(dataclasses.FrozenInstanceError, setattr, Selection("ref"), "impl_id", "x")
@@ -480,7 +553,6 @@ def test_subsumed_op_never_expects_an_installed_key():
     # the registry itself still declares alpha.sub sites, so a registry-as-installed check refuses them
     msg = _refuses(ContractDeliveryError, validate_contract_against_installed, c, reg, reg)
     assert "alpha.sub" in msg
-
 
 
 def _run():

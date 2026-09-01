@@ -1357,7 +1357,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # never ran refuses here as loudly as one that failed). Refusals propagate; internal
         # ledger errors never do.
         if os.environ.get("SKYRL_ISOEXEC"):
-            from skyrl.backends.skyrl_train.isoexec.core.adapter import set_process_adapter
+            from skyrl.backends.skyrl_train.isoexec.core.adapter import (
+                set_process_adapter,
+            )
             from skyrl.backends.skyrl_train.isoexec.runtimes.megatron.adapter import (
                 MegatronContractAdapter,
             )
@@ -1368,6 +1370,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     megatron_config=self.cfg.policy.megatron_config,
                     install_fn=_isoexec_install,
                     world_size=self._world_size,
+                    model_fn=lambda: getattr(self, "actor_module", None),
                 )
             ).run_install(close=os.environ.get("SKYRL_ISOEXEC") == "1")
         else:
@@ -1490,9 +1493,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         Fail-soft: a fingerprint bug must never break a trainer build.
         """
         try:
+            from skyrl.backends.skyrl_train.isoexec.core.adapter import (
+                live_pins,
+                log_unreported_pins,
+            )
             from skyrl.backends.skyrl_train.isoexec.core.fingerprint import (
                 NOT_INSTALLED,
-                SCORE_ONLY,
                 TRAINER_SITES,
                 log_fingerprint_once,
                 record_installs,
@@ -1529,18 +1535,44 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 # predicate the kernels use -- which is how a manifest derived from a profile field
                 # gets caught disagreeing with the flag the launcher actually exported.
                 from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_ops import (
-                    chunk_synced_mode,
+                    cpr_mode,
                     gdn_kernel_mode,
                     gdn_native_kernels_enabled,
                     recurrent_mode,
                 )
 
-                _native = gdn_native_kernels_enabled() and (recurrent_mode() or chunk_synced_mode())
-                record_installs("gdn.core", TRAINER_SITES, "native_fused_sigmoid" if _native else gdn_kernel_mode())
+                _native = gdn_native_kernels_enabled() and (recurrent_mode() or cpr_mode())
+                # The pin carries the kernel the native impl runs: `native_fused_sigmoid` alone
+                # cannot distinguish a recurrent build from a cpr one, and the contract
+                # pins exactly that.
+                record_installs(
+                    "gdn.core",
+                    TRAINER_SITES,
+                    "native_fused_sigmoid" if _native else gdn_kernel_mode(),
+                    pinned={"kernel": gdn_kernel_mode()},
+                )
                 record_installs("gdn.conv", TRAINER_SITES, "causal_conv1d_fn")
 
-            # -- logprobs: the aten-order reference lives at the SCORING site only ----------------
-            record_installs("logprobs.log_softmax", SCORE_ONLY, "aten_reference")
+            # -- logprobs -------------------------------------------------------------------------
+            # The leaf-tree impl is one function at BOTH trainer sites, unconditionally. Record
+            # what this process will actually arm, never what the contract asked for: a missing
+            # module means the model_utils hook shim declines every call, so the incumbent serves
+            # and NOT_INSTALLED is what gets recorded (the contract still names rowinv, and the
+            # fingerprint comparator is what makes that disagreement visible).
+            try:
+                import skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv  # noqa: F401
+
+                _rowinv = True
+            except ImportError:
+                _rowinv = False
+            record_installs(
+                "logprobs.log_softmax",
+                TRAINER_SITES,
+                "rowinv_leaftree" if _rowinv else NOT_INSTALLED,
+                # Pins read off the live install (rowinv.BLOCK, the kernel's own env read), not
+                # echoed from the contract, so pin_disagreements can actually disagree.
+                pinned=live_pins("logprobs.log_softmax") if _rowinv else None,
+            )
 
             # -- collectives (present iff TP>1) ---------------------------------------------------
             if int(_g("tensor_model_parallel_size", 1) or 1) > 1:
@@ -1549,7 +1581,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 )
 
                 _pik = "pik_tree" if pik_enabled() else NOT_INSTALLED
-                record_installs("collectives.tree_all_reduce", TRAINER_SITES, _pik)
+                # Pins off the ReductionPlan the install actually built, not off the env vars that
+                # asked for it, so "the flag arrived and the plan was built differently" is visible.
+                record_installs(
+                    "collectives.tree_all_reduce",
+                    TRAINER_SITES,
+                    _pik,
+                    pinned=live_pins("collectives.tree_all_reduce") if pik_enabled() else None,
+                )
                 record_installs("collectives.row_parallel", TRAINER_SITES, _pik)
                 # The trainer entry is FUNCTION-classified because this flag selects the trainer
                 # composition (and backward reduction schedule).  Clean unpinned forward A/Bs keep
@@ -1580,9 +1619,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     _moe_pik_fc2_on,
                 )
 
-                record_installs("moe.combine", TRAINER_SITES, "pik_leaf_tree" if _moe_pik_fc2_on() else NOT_INSTALLED)
+                record_installs(
+                    "moe.combine",
+                    TRAINER_SITES,
+                    "pik_leaf_tree" if _moe_pik_fc2_on() else NOT_INSTALLED,
+                    pinned=live_pins("moe.combine") if _moe_pik_fc2_on() else None,
+                )
 
-            log_fingerprint_once(cached_contract_view(), tag="trainer_install")
+            _view = cached_contract_view()
+            log_fingerprint_once(_view, tag="trainer_install")
+            log_unreported_pins(_view)
         except Exception as _e:  # pragma: no cover - never fatal
             logger.warning(f"[ISOEXEC-FINGERPRINT] trainer install fingerprint skipped: {_e}")
 
@@ -1826,6 +1872,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         if os.environ.get("SKYRL_ISOEXEC") == "1":
             self._isoexec_force_fresh_model_params()
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_TRACE"):
+            from skyrl.backends.skyrl_train.isoexec.debug import set_step
+
+            self._isoexec_debug_step = getattr(self, "_isoexec_debug_step", 0) + 1
+            set_step(self._isoexec_debug_step)
 
         # Reset counter for next accumulation cycle
         self._micro_batches_accumulated = 0
@@ -2191,6 +2242,18 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # offload state machine is unaffected.
             _ix_grads_parked = False
             if os.environ.get("SKYRL_ISOEXEC") == "1":
+                # Rowinv ENGAGEMENT boundary (trainer side), before the expensive extraction: a
+                # contract that selects rowinv_leaftree while this process's census never served
+                # it must refuse at the first post-step sync, not after hours of one-sided
+                # composition (contract hashes MATCH in that failure -- both sides carry the flag,
+                # only one executes). Exact no-op while the flag is off; the init sync (no forward
+                # has run yet) is granted inside the boundary. Deliberate refusals propagate;
+                # everything else is fail-safe inside the call.
+                from skyrl.backends.skyrl_train.isoexec.core.enforce import (
+                    rowinv_engagement_boundary,
+                )
+
+                rowinv_engagement_boundary("trainer")
                 torch.cuda.synchronize()
                 # Re-freshen the model buffer from the (CPU-offloaded) optimizer master RIGHT BEFORE
                 # extraction -- belt-and-braces against any offload/reload between the optimizer step

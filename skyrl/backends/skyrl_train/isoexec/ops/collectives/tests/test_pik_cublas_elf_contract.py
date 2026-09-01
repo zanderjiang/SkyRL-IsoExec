@@ -24,9 +24,7 @@ def test_pinned_extension_requires_cuda13_needed_runpath_and_resolution(tmp_path
  libcublasLt.so.13 => {runtime / "libcublasLt.so.13"} (0x1)
  libcublas.so.13 => {runtime / "libcublas.so.13"} (0x2)
 """
-    _CUBLAS._validate_pinned_extension(
-        extension, runtime, readelf_output=readelf, ldd_output=ldd
-    )
+    _CUBLAS._validate_pinned_extension(extension, runtime, readelf_output=readelf, ldd_output=ldd)
 
 
 def test_pinned_extension_refuses_cuda12_cache_entry(tmp_path):

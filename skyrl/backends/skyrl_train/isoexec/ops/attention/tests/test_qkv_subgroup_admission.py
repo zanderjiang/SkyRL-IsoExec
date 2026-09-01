@@ -107,7 +107,6 @@ def test_grad_enabled_takes_the_stock_autograd_gather():
     gradient behind a green bitwise gate. The shim must fall back, and say so.
 
     Driven on CPU by arming the shim's own globals -- no mesh, no CUDA, no megatron model."""
-    import torch
 
     from skyrl.backends.skyrl_train.isoexec.ops.attention import (
         qkv_subgroup_gather as _qkv,

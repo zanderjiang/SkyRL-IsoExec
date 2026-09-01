@@ -33,7 +33,6 @@ def _torch_epilogue_reference(inter, probs):
     return h.contiguous()
 
 
-
 def test_fused_combine_counts_only_after_forward_and_backward_are_served(monkeypatch):
     tokens, topk, hidden = 5, 3, 7
     rows = torch.arange(tokens * topk).view(tokens, topk)

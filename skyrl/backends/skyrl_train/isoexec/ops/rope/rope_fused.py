@@ -366,6 +366,7 @@ def revert_engine_fused_rope() -> None:
     from megatron.core.models.common.embeddings import rope_utils
 
     cur = rope_utils._apply_rotary_pos_emb_bshd
+    cur = getattr(cur, "__wrapped__", cur)
     if cur is not _fused_apply_rotary_pos_emb_bshd:
         raise RuntimeError(
             "[ISOEXEC-ROPE] refusing to revert out of order: rope_utils._apply_rotary_pos_emb_bshd is "

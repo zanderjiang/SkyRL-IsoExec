@@ -3,7 +3,8 @@
 Covers: zero-overhead-off (identity passthrough, zero installs), record content and JSONL
 round-trip, sampling, re-entrancy collapse, ladder capture, case inference, the moe.router
 installer against a faked megatron namespace triple, the gdn.core installer against the real
-``gdn_ops`` module, and layer-indexed engine GDN hooks.
+``gdn_ops`` module, layer-indexed engine GDN hooks, rank stamping, the per-side manifest,
+unrecordable outputs and segment digests.
 
 Run (CPU only):
     python skyrl/backends/skyrl_train/isoexec/debug/tests/test_trace_cpu.py
@@ -11,6 +12,7 @@ Run (CPU only):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -26,7 +28,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[6]))
 
 from skyrl.backends.skyrl_train.isoexec.debug import install, thash, trace  # noqa: E402
 
-_ENVS = (trace.ENV_TRACE, trace.ENV_SIDE, trace.ENV_SAMPLE, trace.ENV_LADDER, trace.ENV_RING)
+_ENVS = (
+    trace.ENV_TRACE,
+    trace.ENV_SIDE,
+    trace.ENV_SAMPLE,
+    trace.ENV_LADDER,
+    trace.ENV_SEGMENTS,
+    trace.ENV_RING,
+    "RANK",
+    "LOCAL_RANK",
+)
 
 
 class _env:
@@ -65,6 +76,7 @@ def _read(d):
 
 def test_zero_overhead_off():
     with _env():  # env unset
+
         def f(x):
             return x + 1
 
@@ -91,7 +103,8 @@ def test_record_roundtrip_and_digest():
             trace.flush()
             recs = _read(d)
             assert len(recs) == 2
-            assert [r["out"] for r in recs] == [0, 2]
+            assert [r["out"] for r in recs] == ["0", "2"]
+            assert all(r["v"] == trace.FORMAT_VERSION for r in recs)
             r0 = recs[0]
             assert r0["region"] == "moe.router" and r0["side"] == "trainer"
             assert r0["case"] == "trainer_score"  # no_grad on the trainer side
@@ -216,7 +229,11 @@ def test_moe_router_install_on_faked_namespaces():
             sys.modules.update(_fake_megatron(topk))
             assert install._install_moe_router() == 3
             assert install._install_moe_router() == 0  # idempotent
-            from megatron.core.transformer.moe import moe_utils, router, token_dispatcher
+            from megatron.core.transformer.moe import (
+                moe_utils,
+                router,
+                token_dispatcher,
+            )
 
             assert (
                 moe_utils.topk_routing_with_score_function
@@ -237,11 +254,14 @@ def test_moe_router_install_on_faked_namespaces():
         shutil.rmtree(d, ignore_errors=True)
 
 
+_GDN_OPS_DOORS = sorted({a for r, m, a, _i, _k in install.DOORS if r == "gdn.core" and m.endswith(".gdn_ops")})
+
+
 def test_gdn_core_install_on_real_gdn_ops():
     d = _tmpdir()
     from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_ops
 
-    originals = {n: getattr(gdn_ops, n) for n in install._GDN_TARGETS if hasattr(gdn_ops, n)}
+    originals = {n: getattr(gdn_ops, n) for n in _GDN_OPS_DOORS if hasattr(gdn_ops, n)}
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer"}):
             n = install._install_gdn_core()
@@ -250,6 +270,7 @@ def test_gdn_core_install_on_real_gdn_ops():
                 cur = getattr(gdn_ops, name)
                 assert getattr(cur, "_isoexec_debug_region") == "gdn.core"
                 assert cur._isoexec_debug_inner is orig
+                assert cur.__wrapped__ is orig  # transparent to installers that unwrap
             assert install._install_gdn_core() == 0  # idempotent
     finally:
         for name, orig in originals.items():
@@ -257,39 +278,111 @@ def test_gdn_core_install_on_real_gdn_ops():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_gdn_case_inference():
+class _FakeMD:
+    def __init__(self, nd, npf):
+        self.num_decodes, self.num_prefills = nd, npf
+
+
+@contextlib.contextmanager
+def _fake_forward_context(md):
+    """Stand in for vllm.forward_context so the honest decode/prefill signal can be tested."""
+    mods = {}
+    for name in ("vllm", "vllm.forward_context"):
+        mods[name] = sys.modules.get(name)
+    pkg = types.ModuleType("vllm")
+    fc = types.ModuleType("vllm.forward_context")
+    fc.get_forward_context = lambda: SimpleNamespace(attn_metadata=md)
+    pkg.forward_context = fc
+    sys.modules["vllm"], sys.modules["vllm.forward_context"] = pkg, fc
+    try:
+        yield
+    finally:
+        for name, old in mods.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
+def test_engine_case_from_forward_context():
+    """The case label must come from the batch, not from a token-count heuristic."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):
             trace.get_tracer()
-            decode = {"cu_seqlens": torch.tensor([0, 1, 2, 3])}
-            prefill = {"cu_seqlens": torch.tensor([0, 17, 40])}
-            assert install._gdn_case((), decode, None) == "engine_decode"
-            assert install._gdn_case((), prefill, None) == "engine_prefill"
-            assert install._gdn_case((), {}, None) == "engine"
+            for md, want in (
+                ({"model.layers.0.gdn": _FakeMD(8, 0)}, "engine_decode"),
+                ({"model.layers.0.gdn": _FakeMD(0, 3)}, "engine_prefill"),
+                (_FakeMD(4, 2), "engine_mixed"),
+            ):
+                with _fake_forward_context(md):
+                    assert install._case((), {}, None) == want
+                    # A cu_seqlens that the old heuristic would have mislabelled loses to it.
+                    assert install._case((), {"cu_seqlens": torch.tensor([0, 1, 2, 3])}, None) == want
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_gdn_layer_hooks_record_layer_index():
+def test_engine_case_structural_fallback_without_forward_context():
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):
+            trace.get_tracer()
+            assert install._case((), {"cu_seqlens": torch.tensor([0, 17, 40])}, None) == "engine_prefill"
+            assert install._case((), {"cu_seqlens": torch.tensor([0, 1, 2, 3])}, None) == "engine_prefill"
+            assert install._case((), {"cu_seqlens": None, "ssm_state": object()}, None) == "engine_decode"
+            assert install._case((), {}, None) == "engine"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_layer_context_hooks_label_the_kernel_door():
+    """The layer index reaches the SAME door on both sides instead of a second tensor."""
     d = _tmpdir()
     try:
         with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):
             out = torch.randn(7, 16, dtype=torch.bfloat16)
+            door = trace.wrap_region("gdn.core", lambda: out)
             layers = []
             for ln in (1, 2):
-                gdn = SimpleNamespace(_isoexec_state=object(), forward=lambda *a, **k: out)
-                layers.append(SimpleNamespace(self_attention=gdn, layer_number=ln))
-            layers.append(SimpleNamespace(self_attention=None))  # non-GDN layer skipped
+                gdn = SimpleNamespace(_isoexec_state=object())
+                lay = SimpleNamespace(self_attention=gdn, layer_number=ln)
+                lay.forward = lambda *a, **k: door()
+                layers.append(lay)
             gpt = SimpleNamespace(decoder=SimpleNamespace(layers=layers))
-            assert install.install_gdn_layer_hooks(gpt) == 2
-            assert install.install_gdn_layer_hooks(gpt) == 0  # idempotent
-            layers[0].self_attention.forward()
-            layers[1].self_attention.forward()
+            assert install.install_layer_context_hooks(gpt) == 2
+            assert install.install_layer_context_hooks(gpt) == 0  # idempotent
+            layers[0].forward()
+            layers[1].forward()
             trace.flush()
             recs = _read(d)
             assert [r["layer"] for r in recs] == [0, 1]
+            assert [r["layer_src"] for r in recs] == ["module", "module"]
             assert all(r["region"] == "gdn.core" for r in recs)
+            # the door itself was recorded, not a post-out_proj tensor
+            assert all(r["shape"] == [7, 16] for r in recs)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_call_order_layer_when_no_module_context():
+    """Trainer fallback: a per-layer region gets a per-step call ordinal, and says so."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer"}):
+            door = trace.wrap_region("gdn.core", lambda: torch.zeros(2))
+            other = trace.wrap_region("collectives.tree_all_reduce", lambda: torch.zeros(2))
+            trace.set_step(0)
+            door(), door(), other()
+            trace.set_step(1)
+            door()
+            trace.flush()
+            recs = _read(d)
+            gdn = [r for r in recs if r["region"] == "gdn.core"]
+            assert [r["layer"] for r in gdn] == [0, 1, 0]
+            assert {r["layer_src"] for r in gdn} == {"call_order"}
+            rest = [r for r in recs if r["region"] != "gdn.core"]
+            assert [(r["layer"], r["layer_src"]) for r in rest] == [(None, None)]
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -304,6 +397,225 @@ def test_ring_flushes_when_full():
             assert len(_read(d)) >= 4  # flushed without an explicit flush() call
             trace.flush()
             assert len(_read(d)) == 5
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _manifest(d):
+    fps = sorted(pathlib.Path(d).glob("manifest-*.json"))
+    assert len(fps) == 1, fps
+    return json.loads(fps[0].read_text())
+
+
+def test_rank_is_stamped_and_sourced():
+    """Without a rank in the record, traces from many processes align by pid luck."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine", "RANK": "3"}):
+            trace.wrap_region("r", lambda: torch.zeros(2))()
+            trace.flush()
+            recs = _read(d)
+            assert [(r["rank"], r["rank_src"]) for r in recs] == [(3, "env:RANK")]
+            man = _manifest(d)
+            assert (man["rank"], man["rank_src"]) == (3, "env:RANK")
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):  # no RANK anywhere
+            trace.wrap_region("r2", lambda: torch.zeros(2))()
+            trace.flush()
+            r = [x for x in _read(d) if x["region"] == "r2"][0]
+            assert r["rank"] == os.getpid() and r["rank_src"] == "pid"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_manifest_records_sampling_coverage():
+    """The report cannot tell 'clean' from 'not observed' without this."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer", trace.ENV_SAMPLE: "2"}):
+            w = trace.wrap_region("r", lambda: torch.zeros(2))
+            for step in range(5):
+                trace.set_step(step)
+                w()
+            trace.flush()
+            man = _manifest(d)
+            assert man["v"] == trace.FORMAT_VERSION and man["sample"] == 2
+            assert man["step_signal"] is True
+            assert man["steps_seen"] == [0, 1, 2, 3, 4]
+            assert man["steps_recorded"] == [0, 2, 4]
+            assert man["records"] == 3 and man["rank_src"] == "pid"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_unrecordable_outputs_are_recorded_not_dropped():
+    """Dict / None / nested / unsupported-dtype outputs are recorded, never dropped silently."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer"}):
+            t = torch.zeros(3)
+            trace.wrap_region("nested", lambda: (t, (t, t)))()
+            trace.wrap_region("dictout", lambda: {"h": t})()
+            trace.wrap_region("noneout", lambda: None)()
+            trace.wrap_region("scalarout", lambda: 7)()
+            trace.flush()
+            by = {}
+            for r in _read(d):
+                by.setdefault(r["region"], []).append(r)
+            assert [r["out"] for r in by["nested"]] == ["0", "1.0", "1.1"]
+            assert [r["out"] for r in by["dictout"]] == ["h"]
+            for region in ("noneout", "scalarout"):
+                (r,) = by[region]
+                assert "digest" not in r and "no tensor outputs" in r["unrecordable"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_unsupported_dtype_becomes_unrecordable_record():
+    d = _tmpdir()
+    dtype = next(
+        (
+            getattr(torch, n)
+            for n in ("float8_e8m0fnu", "bits8")
+            if getattr(torch, n, None) is not None and getattr(torch, n) not in thash._DTYPE_TABLE
+        ),
+        None,
+    )
+    if dtype is None:
+        return
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "trainer"}):
+            trace.wrap_region("odd", lambda: torch.zeros(4).to(dtype))()
+            trace.flush()
+            (r,) = _read(d)
+            assert "digest" not in r and "unsupported dtype" in r["unrecordable"]
+            assert r["dtype"] == str(dtype).replace("torch.", "")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_segment_digests_wired_behind_env():
+    """``segment_digests`` is reachable from debug mode."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SEGMENTS: "4"}):
+            t = torch.randn(16, 8, dtype=torch.float32)
+            trace.wrap_region("r", lambda: t)()
+            trace.flush()
+            (r,) = _read(d)
+            assert r["seg_rows"] == 4
+            assert r["segments"] == thash.segment_digests(t, rows_per_segment=4)
+        with _env(**{trace.ENV_TRACE: d}):  # off by default
+            trace.wrap_region("r2", lambda: torch.zeros(4, 2))()
+            trace.flush()
+            r = [x for x in _read(d) if x["region"] == "r2"][0]
+            assert "segments" not in r
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_capture_safety_skips_and_counts():
+    """A hook reached under CUDA-graph capture must never issue the digest's D2H copy."""
+    d = _tmpdir()
+    real = trace._capturing
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SIDE: "engine"}):
+            calls = []
+            w = trace.wrap_region("gdn.core", lambda: (calls.append(1), torch.zeros(4))[1])
+            trace._capturing = lambda: True
+            out = w()
+            assert out.shape == (4,)  # the wrapped call still runs; only the record is skipped
+            trace.flush()
+            assert _read(d) == []
+            assert _manifest(d)["capture_skipped"] == 1
+            trace._capturing = lambda: False
+            w()
+            trace.flush()
+            assert len(_read(d)) == 1
+            assert _manifest(d)["capture_skipped"] == 1
+            assert len(calls) == 2
+    finally:
+        trace._capturing = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_nested_different_regions_both_record():
+    """With 20 regions hooked, a single global guard would let the outer door eat the inner."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d}):
+            inner = trace.wrap_region("norms.rms", lambda: torch.ones(3))
+            outer = trace.wrap_region("gdn.core", lambda: (inner(), torch.zeros(2))[1])
+            outer()
+            trace.flush()
+            assert {r["region"] for r in _read(d)} == {"gdn.core", "norms.rms"}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_region_allow_list():
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d}):
+            tr = trace.get_tracer()
+            assert tr.wants("gdn.core") and not tr.wants("mm")  # mm is high volume, off by default
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_REGIONS: "+mm"}):
+            assert trace.get_tracer().wants("mm") and trace.get_tracer().wants("gdn.core")
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_REGIONS: "gdn.core"}):
+            tr = trace.get_tracer()
+            assert tr.wants("gdn.core") and not tr.wants("moe.router")
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_REGIONS: "all"}):
+            assert trace.get_tracer().wants("mm")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_segment_axis_is_recorded():
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d, trace.ENV_SEGMENTS: "8"}):
+            trace.wrap_region("gdn.core", lambda: torch.randn(1, 32, 2, 4, dtype=torch.bfloat16))()
+            trace.flush()
+            rec = _read(d)[0]
+            assert rec["seg_axis"] == 1 and rec["seg_rows"] == 8 and len(rec["segments"]) == 4
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_wrapper_is_transparent_to_installer_probes():
+    """Several installers read _isoexec_* markers off the live binding to pick a code path."""
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d}):
+
+            def door():
+                return torch.zeros(1)
+
+            door._isoexec_accepts_out_dtype = True
+            door._isoexec_tiled = "abc"
+            w = trace.wrap_region("moe.combine", door)
+            assert w is not door
+            assert w._isoexec_accepts_out_dtype is True and w._isoexec_tiled == "abc"
+            assert w.__wrapped__ is door
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_out_fn_digests_a_void_doors_buffer():
+    d = _tmpdir()
+    try:
+        with _env(**{trace.ENV_TRACE: d}):
+            buf = torch.arange(6, dtype=torch.float32)
+
+            def void_door(*, C):
+                C.add_(1)
+                return None
+
+            w = trace.wrap_region("moe.epilogue", void_door, out_fn=install._out_kwarg("C"))
+            w(C=buf)
+            trace.flush()
+            rec = _read(d)[0]
+            assert rec["shape"] == [6] and "unrecordable" not in rec
+            assert rec["digest"] == f"{thash.tensor_digest(buf):016x}"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

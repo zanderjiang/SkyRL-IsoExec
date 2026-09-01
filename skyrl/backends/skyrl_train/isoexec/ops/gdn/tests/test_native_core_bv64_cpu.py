@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import torch
 
+from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_native_core_bv64 as _bv64
 from skyrl.backends.skyrl_train.isoexec.ops.gdn.gdn_native_core_bv64 import (
     _eligible,
     maybe_native_core_bv64,
 )
-from skyrl.backends.skyrl_train.isoexec.ops.gdn import gdn_native_core_bv64 as _bv64
 
 
 def native_core_bv64_stats():
     # inlined: the public module keeps the counters but not this test accessor
     return dict(_bv64._STATS)
-
 
 
 def _cpu_operands():

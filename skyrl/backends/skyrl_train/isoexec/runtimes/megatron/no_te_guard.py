@@ -10,7 +10,10 @@ importable.
 """
 
 import importlib.util
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 MARKER = "# [isoexec-no-te-guard]"
@@ -39,7 +42,12 @@ _PATCHES = (
 
 def _bridge_root():
     # Resolve the path WITHOUT importing megatron.bridge (its __init__ is what crashes).
-    spec = importlib.util.find_spec("megatron.bridge")
+    # find_spec RAISES rather than returning None when the parent package is absent, which is the
+    # normal state on the CPU-only machines the trace comparator runs on -- nothing to patch there.
+    try:
+        spec = importlib.util.find_spec("megatron.bridge")
+    except (ImportError, AttributeError, ValueError):
+        return None
     if spec is None or not spec.origin:
         return None
     return os.path.dirname(spec.origin)
@@ -58,6 +66,21 @@ def install_no_te_guard() -> bool:
         return False
     except ImportError:
         pass
+    except OSError as e:
+        # OSError too: a partial TE install (the .so is there, libcublas is not) raises
+        # `OSError: libcublas.so.13: cannot open shared object file` rather than ImportError, and
+        # a TE that cannot load IS TE absent as far as the guard is concerned. Without this the
+        # probe propagates and importing the package at all fails on a CPU-only machine -- which
+        # is exactly where the stdlib-only trace comparator is meant to run. It is loud because
+        # the two cases are not the same fact: on a trainer this is a BROKEN TE, and running
+        # without it silently would change the composition.
+        logger.error(
+            "[isoexec] TransformerEngine is installed but fails to load (%s: %s); treating it as "
+            "absent and installing the no-TE guard. Expected on a CPU-only comparator box; on a "
+            "GPU trainer this is a broken TE install and the run will not use TE.",
+            type(e).__name__,
+            e,
+        )
 
     root = _bridge_root()
     if root is None:

@@ -59,7 +59,6 @@ def _fixed_order_combine_reference(permuted_tokens, rows, *, permuted_probs=None
     return out if out_dtype is None else out.to(out_dtype)
 
 
-
 # =================================================================================================
 # the adversarial fp32 population
 # =================================================================================================

@@ -1,9 +1,9 @@
-"""Allocate chunk-synced state in a discard-at-sleep CUDA VMM arena.
+"""Allocate CPR state in a discard-at-sleep CUDA VMM arena.
 
 When enabled, each layer's state tensors are views into one aligned allocation carrying the private
-``isoexec_gdn_cs`` tag, which the worker sleep hook discards without a host backup; wake re-maps it,
+``isoexec_gdn_cpr`` tag, which the worker sleep hook discards without a host backup; wake re-maps it,
 zeros it and resets all row/lifecycle bookkeeping. Any unsupported allocator surface or ambiguous
-allocation layout declines to the ordinary state allocation. ``SKYRL_ISOEXEC_GDN_CS_SLEEP=1`` enables
+allocation layout declines to the ordinary state allocation. ``SKYRL_ISOEXEC_GDN_CPR_SLEEP=1`` enables
 the feature.
 """
 
@@ -14,9 +14,9 @@ import time
 
 # A private cumem tag: not "weights" (backed up D2H at level-1 sleep) and not "kv_cache" (owned by
 # vLLM's cache-initialization lifecycle). This one is discarded at sleep but woken by us.
-CS_SLEEP_TAG = "isoexec_gdn_cs"
+CPR_SLEEP_TAG = "isoexec_gdn_cpr"
 
-FLAG = "SKYRL_ISOEXEC_GDN_CS_SLEEP"
+FLAG = "SKYRL_ISOEXEC_GDN_CPR_SLEEP"
 
 # torch caching-allocator constants this module's safety argument depends on.
 _ROUND_LARGE = 2 << 20  # kRoundLarge: large allocations are rounded up to this
@@ -29,8 +29,8 @@ _asleep = False
 _accounted = False
 
 
-def cs_sleep_enabled() -> bool:
-    """Whether the chunk-synced state arena is discarded at sleep and re-created at wake.
+def cpr_sleep_enabled() -> bool:
+    """Whether the CPR state arena is discarded at sleep and re-created at wake.
 
     Read at call time, so a test can toggle it per process.
     """
@@ -40,7 +40,7 @@ def cs_sleep_enabled() -> bool:
 def _say(msg: str) -> None:
     """Write to fd 1 rather than ``logger.info``: vLLM filters INFO out of engine subprocesses."""
     try:
-        os.write(1, f"[ISOEXEC-CS-SLEEP] pid={os.getpid()} {msg}\n".encode())
+        os.write(1, f"[ISOEXEC-CPR-SLEEP] pid={os.getpid()} {msg}\n".encode())
     except Exception:  # pragma: no cover - fd 1 closed
         pass
 
@@ -49,14 +49,14 @@ def _round_up(n: int, m: int) -> int:
     return (n + m - 1) // m * m
 
 
-def alloc_cs_arena(specs, device):
+def alloc_cpr_arena(specs, device):
     """Allocate one tagged, discard-at-sleep arena for a layer and carve it into state tensors.
 
     ``specs`` is ``[(attr_name, shape, dtype), ...]`` in allocation order; returns
     ``{attr_name: tensor}``, or ``None`` so the caller allocates the tensors the ordinary way. Every
     rejection path here is a performance fallback, never a correctness one.
     """
-    if not cs_sleep_enabled():
+    if not cpr_sleep_enabled():
         return None
     import torch
 
@@ -100,7 +100,7 @@ def alloc_cs_arena(specs, device):
         return None
 
     old_tag = alloc.current_tag
-    alloc.current_tag = CS_SLEEP_TAG
+    alloc.current_tag = CPR_SLEEP_TAG
     try:
         # A current_tag swap, not a nested ``use_memory_pool``: model build already holds an active
         # cumem MemPool context, so only the tag recorded by the malloc callback needs to change.
@@ -114,7 +114,7 @@ def alloc_cs_arena(specs, device):
         bad = None
         if data is None:
             bad = "not a cumem allocation base (served from a cached block)"
-        elif data.tag != CS_SLEEP_TAG:
+        elif data.tag != CPR_SLEEP_TAG:
             bad = f"allocation carries tag {data.tag!r}"
         elif int(data.handle[1]) != total:
             bad = f"allocation is {int(data.handle[1])} B for a {total} B request (splittable remainder)"
@@ -141,7 +141,7 @@ def register_layer(layer, flat, capacity: int) -> None:
         # Printed at build time, before any sleep, so its absence is diagnostic.
         _say(
             f"ARENA: {flat.numel() / 2**20:.1f} MiB per GDN layer at capacity={capacity} slots "
-            f"({flat.numel() / max(capacity, 1) / 2**20:.3f} MiB/slot/layer), tag={CS_SLEEP_TAG!r}"
+            f"({flat.numel() / max(capacity, 1) / 2**20:.3f} MiB/slot/layer), tag={CPR_SLEEP_TAG!r}"
         )
     install_worker_sleep_hooks()
 
@@ -224,23 +224,23 @@ def install_worker_sleep_hooks() -> None:
     except Exception as e:  # pragma: no cover - fail to stock
         _say(f"NOT INSTALLED: worker/cumem surface mismatch ({e!r})")
         return
-    if getattr(_gw.Worker.sleep, "_ix_cs_sleep", False):
+    if getattr(_gw.Worker.sleep, "_ix_cpr_sleep", False):
         _installed = True
         return
 
     _orig_sleep = _gw.Worker.sleep
     _orig_wake = _gw.Worker.wake_up
 
-    def cs_sleep(self, level: int = 1):
+    def cpr_sleep(self, level: int = 1):
         global _asleep
         # Runs first and unconditionally -- before the double-sleep guard, the arena release and
         # vLLM's own sleep -- because it also retracts the shared boundary index advertised to the
         # scheduler. Exceptions propagate: an index advertising checkpoints no worker holds must
         # never pass silently.
-        from .gdn_chunk_synced_state import CS_APC_STORE, cs_apc_store_invalidate
+        from .gdn_cpr_state import CPR_APC_STORE, cpr_apc_store_invalidate
 
-        apc_gib = CS_APC_STORE.nbytes / 2**30 if CS_APC_STORE is not None else 0.0
-        cs_apc_store_invalidate()
+        apc_gib = CPR_APC_STORE.nbytes / 2**30 if CPR_APC_STORE is not None else 0.0
+        cpr_apc_store_invalidate()
         if _asleep:
             # Already released: the pages are unmapped, so the reset below would fault.
             _say("WARNING: sleep called while already asleep; arena release skipped (already released)")
@@ -255,14 +255,14 @@ def install_worker_sleep_hooks() -> None:
         _asleep = True
         _say(
             f"RELEASE: {len(_ARENAS)} layers, {gib:.3f} GiB arena discarded at level-{level} sleep "
-            f"(tag={CS_SLEEP_TAG!r}, NO D2H backup), {apc_gib:.3f} GiB boundary store cleared, "
+            f"(tag={CPR_SLEEP_TAG!r}, NO D2H backup), {apc_gib:.3f} GiB boundary store cleared, "
             f"maps reset in {time.perf_counter() - t0:.3f}s"
         )
         out = _orig_sleep(self, level)
         _check_not_backed_up(level)
         return out
 
-    def cs_wake_up(self, tags=None):
+    def cpr_wake_up(self, tags=None):
         global _asleep
         # ``tags is None`` means wake everything, and vLLM's allocator already re-maps our tag in
         # that case; calling wake_up([tag]) again would map an already-mapped handle. So for
@@ -280,7 +280,7 @@ def install_worker_sleep_hooks() -> None:
 
             alloc = CuMemAllocator.instance
             if alloc is not None and not woken_by_vllm:
-                alloc.wake_up([CS_SLEEP_TAG])
+                alloc.wake_up([CPR_SLEEP_TAG])
         except Exception as e:
             _say(f"FATAL: arena re-map failed ({e!r})")
             raise
@@ -294,12 +294,12 @@ def install_worker_sleep_hooks() -> None:
         )
         return out
 
-    cs_sleep._ix_cs_sleep = True
-    cs_wake_up._ix_cs_sleep = True
-    _gw.Worker.sleep = cs_sleep
-    _gw.Worker.wake_up = cs_wake_up
+    cpr_sleep._ix_cpr_sleep = True
+    cpr_wake_up._ix_cpr_sleep = True
+    _gw.Worker.sleep = cpr_sleep
+    _gw.Worker.wake_up = cpr_wake_up
     _installed = True
-    _say(f"INSTALLED: Worker.sleep/wake_up hooked; arena tag={CS_SLEEP_TAG!r} is discard-at-sleep")
+    _say(f"INSTALLED: Worker.sleep/wake_up hooked; arena tag={CPR_SLEEP_TAG!r} is discard-at-sleep")
 
 
 _backup_checked = False
@@ -325,19 +325,19 @@ def _check_not_backed_up(level: int) -> None:
         backed = sum(
             int(d.handle[1])
             for d in alloc.pointer_to_data.values()
-            if d.tag == CS_SLEEP_TAG and getattr(d, "cpu_backup_tensor", None) is not None
+            if d.tag == CPR_SLEEP_TAG and getattr(d, "cpu_backup_tensor", None) is not None
         )
     except Exception as e:  # pragma: no cover - diagnostic only
         _say(f"could not verify discard-at-sleep ({e!r})")
         return
     if backed:
         _say(
-            f"WARNING: {backed / 2**30:.3f} GiB of the {CS_SLEEP_TAG!r} arena was BACKED UP to host "
+            f"WARNING: {backed / 2**30:.3f} GiB of the {CPR_SLEEP_TAG!r} arena was BACKED UP to host "
             f"at level-{level} sleep -- this vLLM's sleep offloads our tag too, so the D2H/H2D copy "
             "this feature exists to remove is still being paid. Correctness is unaffected."
         )
     else:
-        _say(f"verified: {CS_SLEEP_TAG!r} arena discarded at level-{level} sleep with no host backup")
+        _say(f"verified: {CPR_SLEEP_TAG!r} arena discarded at level-{level} sleep with no host backup")
 
 
 def _accounting_banner() -> None:
@@ -349,7 +349,7 @@ def _accounting_banner() -> None:
     n = len(_ARENAS)
     b = arena_bytes()
     _say(
-        f"ACCOUNTING: {n} chunk-synced layers x {b / n / 2**20:.1f} MiB = {b / 2**30:.3f} GiB arena; "
+        f"ACCOUNTING: {n} CPR layers x {b / n / 2**20:.1f} MiB = {b / 2**30:.3f} GiB arena; "
         f"this is what is NOT copied D2H at each sleep and NOT copied H2D at each wake, and what "
         f"stays released through the weight broadcast"
     )
