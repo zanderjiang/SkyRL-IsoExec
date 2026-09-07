@@ -1,7 +1,8 @@
 """Launch-readiness gate, run from the repo root before a production launch.
 
-Runs the full core/tests battery in subprocesses, then builds the production contract under the
-run-script env. Prints PREFLIGHT: READY, or PREFLIGHT: BLOCKED (<reason>) and exits nonzero.
+Runs the core/tests battery through pytest in subprocesses, then the contract unittest suite
+and the production contract build. Prints PREFLIGHT: READY, or PREFLIGHT: BLOCKED (<reason>)
+and exits nonzero.
 """
 
 import os
@@ -14,7 +15,7 @@ import time
 HERE = pathlib.Path(__file__).resolve()
 TEST_DIR = HERE.parent
 REPO = HERE.parents[6]
-RUN_SCRIPT = REPO / "examples/train/isoexec/run_qwen35_dapo_isoexec.sh"
+RUN_SCRIPT = REPO / "examples/isoexec/run_qwen35_dapo_isoexec.sh"
 LEAF_PKG = "skyrl/backends/skyrl_train/isoexec/contract/tests"
 PROD_ARCH = "sm90"
 
@@ -37,25 +38,37 @@ def _patch_arch():
 
 
 def _run_file(path):
-    import importlib.util
-    import traceback
+    import pytest
 
     _patch_arch()
-    spec = importlib.util.spec_from_file_location(pathlib.Path(path).stem, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    fns = [(k, v) for k, v in vars(mod).items() if k.startswith("test_") and callable(v)]
-    failed = 0
-    for name, fn in fns:
-        try:
-            fn()
-            print(f"PASS {name}")
-        except Exception:
-            traceback.print_exc()
-            print(f"FAIL {name}")
-            failed += 1
-    print(f"{len(fns) - failed}/{len(fns)} passed")
-    return 1 if failed else 0
+    # A caller's "-k" filter could make a partial run look like all tests passed.
+    os.environ.pop("PYTEST_ADDOPTS", None)
+    # Preflight behavior should not depend on unrelated plugins installed by the caller.
+    os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+
+    class Results:
+        def __init__(self):
+            self.total = 0
+            self.passed = set()
+
+        def pytest_collection_finish(self, session):
+            self.total = len(session.items)
+
+        def pytest_runtest_logreport(self, report):
+            if report.when == "call" and report.passed:
+                self.passed.add(report.nodeid)
+            elif report.failed or report.skipped:
+                # A passing test body with a teardown error is still a failed test.
+                self.passed.discard(report.nodeid)
+
+    results = Results()
+    exit_code = pytest.main([str(path), "-q", "-o", "addopts="], plugins=[results])
+    passed = len(results.passed)
+    print(f"{passed}/{results.total} passed")
+    if exit_code != pytest.ExitCode.OK:
+        return int(exit_code)
+    # Do not report READY for unverified tests.
+    return 0 if results.total > 0 and passed == results.total else 1
 
 
 def _run_script_env():
