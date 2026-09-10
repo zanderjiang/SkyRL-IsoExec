@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import ray
 from packaging import version
@@ -72,8 +72,15 @@ class RayWrappedInferenceEngine(InferenceEngineInterface):
     async def update_named_weights(self, request: WeightUpdateRequest):
         return await self.inference_engine_actor.update_named_weights.remote(request)
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True):
-        return await self.inference_engine_actor.start_weight_update.remote(is_checkpoint_format=is_checkpoint_format)
+    async def start_weight_update(
+        self,
+        is_checkpoint_format: bool = True,
+        full_distribution_version: Optional[int] = None,
+    ):
+        return await self.inference_engine_actor.start_weight_update.remote(
+            is_checkpoint_format=is_checkpoint_format,
+            full_distribution_version=full_distribution_version,
+        )
 
     async def finish_weight_update(self):
         return await self.inference_engine_actor.finish_weight_update.remote()

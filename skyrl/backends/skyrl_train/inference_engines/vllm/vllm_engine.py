@@ -896,12 +896,16 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         engine = self._get_engine()
         return await asyncio.to_thread(engine.collective_rpc, "teardown_weight_receiver")
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True):
+    async def start_weight_update(
+        self,
+        is_checkpoint_format: bool = True,
+        full_distribution_version: Optional[int] = None,
+    ):
         engine = self._get_engine()
         return await asyncio.to_thread(
             engine.collective_rpc,
             "skyrl_start_weight_update",
-            args=(is_checkpoint_format,),
+            args=(is_checkpoint_format, full_distribution_version),
         )
 
     async def finish_weight_update(self):
@@ -1202,11 +1206,15 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         engine = self._get_engine()
         return await engine.collective_rpc("teardown_weight_receiver")
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True):
+    async def start_weight_update(
+        self,
+        is_checkpoint_format: bool = True,
+        full_distribution_version: Optional[int] = None,
+    ):
         engine = self._get_engine()
         return await engine.collective_rpc(
             "skyrl_start_weight_update",
-            args=(is_checkpoint_format,),
+            args=(is_checkpoint_format, full_distribution_version),
         )
 
     async def finish_weight_update(self):

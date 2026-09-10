@@ -19,7 +19,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 # Must match trace.FORMAT_VERSION. Duplicated rather than imported: trace.py pulls in torch.
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 MAX_LOCATIONS = 10  # per list, in the rendered text; --json carries up to --json-max-per-region
 FULL_DISTRIBUTION_REGION = "logprobs.full_raw_distribution"
@@ -121,7 +121,7 @@ def _align(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple[Optional[dict], O
 
 
 def _align_full_distribution(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple[Optional[dict], Optional[dict]]], str]:
-    """Align duplicate histories as multisets, independently for each optimizer step."""
+    """Align equal duplicates inside one weight-version/history group as multisets."""
 
     def signature(record: dict) -> tuple:
         return (
@@ -156,16 +156,25 @@ def _align_full_distribution(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple
         )
         return pairs
 
-    steps = {record.get("step") for record in va + vb}
-    pairs = []
-    for step in sorted(steps, key=lambda value: (value is not None, value if value is not None else -1)):
-        pairs.extend(
-            align_bucket(
-                [record for record in va if record.get("step") == step],
-                [record for record in vb if record.get("step") == step],
-            )
+    return align_bucket(va, vb), "weight+history+multiset"
+
+
+def _full_distribution_variation(records: List[dict]) -> Optional[Tuple[dict, dict]]:
+    """Return witnesses when one weight-version/history key has multiple values."""
+    witnesses: Dict[tuple, dict] = {}
+    for record in records:
+        if record.get("unrecordable") or record.get("digest") is None:
+            continue
+        signature = (
+            tuple(record.get("shape") or ()),
+            str(record.get("dtype") or ""),
+            str(record["digest"]),
         )
-    return pairs, "step+multiset"
+        witnesses.setdefault(signature, record)
+    if len(witnesses) < 2:
+        return None
+    first, second = list(witnesses.values())[:2]
+    return first, second
 
 
 # -- magnitude -----------------------------------------------------------------------------
@@ -422,6 +431,34 @@ def compare(
             continue
 
         va, vb = va or [], vb or []
+        if region == FULL_DISTRIBUTION_REGION:
+            for side_tag, side_label, records in (("A", label_a, va), ("B", label_b, vb)):
+                variation = _full_distribution_variation(records)
+                if variation is None:
+                    continue
+                first, second = variation
+                st["mismatched"] += 1
+                divs.append(
+                    dict(
+                        _loc(first, key),
+                        kind="within-side-variation",
+                        side=side_tag,
+                        side_label=side_label,
+                        index=-1,
+                        aligned_by="weight+history uniqueness",
+                        ts=first.get("ts"),
+                        seq=first.get("seq"),
+                        call_a=first.get("call"),
+                        call_b=second.get("call"),
+                        case_a=first.get("case"),
+                        case_b=second.get("case"),
+                        magnitude=(
+                            f"same weight-version/history has multiple recordable distributions "
+                            f"on side {side_tag} ({side_label})"
+                        ),
+                        magnitude_short=f"multiple distributions on side {side_tag}",
+                    )
+                )
         pairs, how = _align_full_distribution(va, vb) if region == FULL_DISTRIBUTION_REGION else _align(va, vb)
         for i, (ra, rb) in enumerate(pairs):
             if ra is None or rb is None:

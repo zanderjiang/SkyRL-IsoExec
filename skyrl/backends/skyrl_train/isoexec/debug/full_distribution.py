@@ -27,10 +27,38 @@ _ENGINE_HISTORY_KEYS: ContextVar[Optional[tuple[Optional[str], ...]]] = ContextV
 )
 _ENGINE_GRAMMAR_ACTIVE: ContextVar[bool] = ContextVar("isoexec_full_distribution_grammar", default=False)
 _ENGINE_HASH_CACHE: dict[tuple[int, str], tuple[object, int, Any]] = {}
+_ACTIVE_WEIGHT_VERSION: Optional[int] = None
+_LAST_WEIGHT_VERSION: Optional[int] = None
 
 
 def enabled() -> bool:
     return os.environ.get(ENV, "0") == "1"
+
+
+def clear_weight_version() -> None:
+    """Make capture fail closed while a new weight-sync transaction is incomplete."""
+    global _ACTIVE_WEIGHT_VERSION
+    _ACTIVE_WEIGHT_VERSION = None
+
+
+def set_weight_version(weight_version: int) -> None:
+    """Activate the sender-minted weight-sync transaction ID in this process."""
+    global _ACTIVE_WEIGHT_VERSION, _LAST_WEIGHT_VERSION
+    if not enabled():
+        raise RuntimeError(f"{ENV}=1 is required to set the full-distribution weight version")
+    if not trace.enabled():
+        raise RuntimeError(f"{ENV}=1 requires {trace.ENV_TRACE} to be set")
+    if type(weight_version) is not int or weight_version < 0:
+        raise RuntimeError(f"{REGION} weight version must be a non-negative int, got {weight_version!r}")
+    if trace.get_tracer() is None:
+        raise RuntimeError(f"{REGION} could not initialize the debug tracer")
+    if _LAST_WEIGHT_VERSION is not None and weight_version != _LAST_WEIGHT_VERSION + 1:
+        raise RuntimeError(
+            f"{REGION} weight version must advance exactly once per completed sync, "
+            f"got previous={_LAST_WEIGHT_VERSION} next={weight_version}"
+        )
+    _LAST_WEIGHT_VERSION = weight_version
+    _ACTIVE_WEIGHT_VERSION = weight_version
 
 
 def history_key(token_ids: Sequence[int]) -> str:
@@ -56,7 +84,11 @@ def _record_rows(logprobs: torch.Tensor, keys: Sequence[Optional[str]], *, case:
         )
     if logprobs.dtype is not torch.float32:
         raise RuntimeError(f"{REGION} requires fp32 logprobs, got {logprobs.dtype}")
-    rows = [(f"history:{key}", logprobs[i]) for i, key in enumerate(keys) if key is not None]
+    if _ACTIVE_WEIGHT_VERSION is None:
+        raise RuntimeError(f"{REGION} has no active completed weight-sync transaction")
+    rows = [
+        (f"weight:{_ACTIVE_WEIGHT_VERSION}/history:{key}", logprobs[i]) for i, key in enumerate(keys) if key is not None
+    ]
     return trace.record_named_tensors(
         REGION,
         rows,
@@ -339,6 +371,7 @@ def install_engine_hooks() -> int:
 
 def arm(side: str) -> int:
     """Declare the diagnostic as required and install its engine-side hooks."""
+    global _ACTIVE_WEIGHT_VERSION, _LAST_WEIGHT_VERSION
     if not enabled():
         return 0
     if not trace.enabled():
@@ -352,6 +385,8 @@ def arm(side: str) -> int:
         raise RuntimeError(f"{ENV}=1 requires {REGION!r} in {trace.ENV_REGIONS or 'the default region set'}")
     tracer.regions_hooked.add(REGION)
     tracer.write_manifest()
+    _ACTIVE_WEIGHT_VERSION = None
+    _LAST_WEIGHT_VERSION = None
     if side == "trainer":
         return 0
     if side == "engine":
@@ -360,13 +395,22 @@ def arm(side: str) -> int:
     raise RuntimeError(f"{REGION} requires debug side 'trainer' or 'engine', got {side!r}")
 
 
+def _reset_for_tests() -> None:
+    global _ACTIVE_WEIGHT_VERSION, _LAST_WEIGHT_VERSION
+    _ACTIVE_WEIGHT_VERSION = None
+    _LAST_WEIGHT_VERSION = None
+    _ENGINE_HASH_CACHE.clear()
+
+
 __all__ = [
     "ENV",
     "REGION",
     "arm",
+    "clear_weight_version",
     "enabled",
     "engine_history_keys",
     "history_key",
     "record_trainer_action_distributions",
+    "set_weight_version",
     "trainer_action_rows",
 ]

@@ -157,6 +157,8 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
+        *,
+        full_distribution_version: Optional[int] = None,
     ) -> None:
         """Send chunks via broadcast or vLLM native NCCL.
 
@@ -167,14 +169,15 @@ class BroadcastWeightTransferSender(WeightTransferSender):
                 all chunks to collect metadata. Ignored on legacy path.
         """
         if _SKYRL_USE_NEW_INFERENCE:
-            await self._send_chunks_vllm_native(chunks, weight_metadata)
+            await self._send_chunks_vllm_native(chunks, weight_metadata, full_distribution_version)
         else:
-            await self._send_chunks_legacy(chunks)
+            await self._send_chunks_legacy(chunks, full_distribution_version)
 
     async def _send_chunks_vllm_native(
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
+        full_distribution_version: Optional[int] = None,
     ) -> None:
         """Batched path: one update_weights call + trainer_send_weights (vLLM native).
 
@@ -204,7 +207,10 @@ class BroadcastWeightTransferSender(WeightTransferSender):
                 NCCLWeightTransferEngine,
             )
 
-            await self._inference_client.start_weight_update(is_checkpoint_format=True)
+            await self._inference_client.start_weight_update(
+                is_checkpoint_format=True,
+                full_distribution_version=full_distribution_version,
+            )
 
             update_info = {**weight_metadata, "packed": True}
             update_task = asyncio.create_task(self._inference_client.update_weights_nccl(update_info))
@@ -225,7 +231,11 @@ class BroadcastWeightTransferSender(WeightTransferSender):
 
         torch.distributed.barrier()
 
-    async def _send_chunks_legacy(self, chunks: Iterable[WeightChunk]) -> None:
+    async def _send_chunks_legacy(
+        self,
+        chunks: Iterable[WeightChunk],
+        full_distribution_version: Optional[int] = None,
+    ) -> None:
         """Per-chunk packed broadcast (legacy path).
 
         Packs all tensors in each chunk into a single contiguous buffer and
@@ -240,7 +250,10 @@ class BroadcastWeightTransferSender(WeightTransferSender):
         # Bracket the whole sync with one layerwise-reload initialize/finalize so
         # per-chunk reloads don't restore non-chunk layers; see `vllm_worker.py.WorkerWrap` docs
         if rank == 0:
-            await self._inference_client.start_weight_update(is_checkpoint_format=True)
+            await self._inference_client.start_weight_update(
+                is_checkpoint_format=True,
+                full_distribution_version=full_distribution_version,
+            )
         torch.distributed.barrier()
 
         # All ranks iterate through chunks (weight extraction may involve collective ops)

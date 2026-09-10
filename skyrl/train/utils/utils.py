@@ -228,6 +228,19 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
 
 # TODO (sumanthrh): Most of this should be moved to  __post_init__ for the dataclasses
 def validate_cfg(cfg: SkyRLTrainConfig):
+    if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+        if cfg.trainer.strategy != "megatron":
+            raise ValueError("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 currently requires trainer.strategy=megatron")
+        if cfg.trainer.eval_interval > 0:
+            raise ValueError(
+                "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 requires trainer.eval_interval<=0; "
+                "eval_before_train=false alone does not disable final-step evaluation"
+            )
+        if cfg.trainer.fully_async.enabled:
+            raise ValueError(
+                "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 does not support fully async training because "
+                "buffered rollouts may span multiple weight versions"
+            )
     if cfg.trainer.strategy == "fsdp2":
         import warnings
 

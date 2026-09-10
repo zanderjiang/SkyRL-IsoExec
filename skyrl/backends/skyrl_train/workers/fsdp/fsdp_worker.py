@@ -272,7 +272,10 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         inference_engine_client,
         inference_engine_cfg,
         model_id: Optional[str] = None,
+        full_distribution_version: Optional[int] = None,
     ):
+        if full_distribution_version is not None:
+            raise RuntimeError("full-distribution trainer capture currently requires the Megatron backend")
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
         cache_reset_task = None
@@ -314,6 +317,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 await self._weight_transfer_sender.send_chunks(
                     weight_iterator,
                     weight_metadata=weight_metadata,
+                    full_distribution_version=full_distribution_version,
                 )
 
         if cache_reset_task is not None:

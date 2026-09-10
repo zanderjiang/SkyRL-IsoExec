@@ -66,6 +66,8 @@ class WeightTransferSender(ABC):
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
+        *,
+        full_distribution_version: Optional[int] = None,
     ) -> None:
         """Send chunks using this transfer strategy.
 
@@ -77,6 +79,8 @@ class WeightTransferSender(ABC):
             weight_metadata: Optional pre-computed metadata (names, dtype_names, shapes).
                 When provided, allows the sender to avoid materializing all chunks
                 to collect metadata upfront.
+            full_distribution_version: Sender-owned weight-sync transaction ID for
+                full-distribution trace alignment.
         """
         ...
 

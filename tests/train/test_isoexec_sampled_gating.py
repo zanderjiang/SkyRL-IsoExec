@@ -14,11 +14,14 @@ they must not need a live trainer to decide anything.
 Run: uv run --isolated --extra dev python -m pytest tests/train/test_isoexec_sampled_gating.py -q
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
 
+from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+from skyrl.train.evaluate import evaluate, evaluate_step_wise
 from skyrl.train.trainer import RayPPOTrainer
 
 
@@ -37,6 +40,7 @@ def _cfg(**over):
                 },
             },
             "critic": {"model": {"path": None}},
+            "eval_interval": -1,
         }
     }
     cfg = OmegaConf.create(base)
@@ -124,3 +128,53 @@ def test_full_distribution_forces_real_policy_scoring(monkeypatch):
     vetoes = RayPPOTrainer._isoexec_sampled_gating_static_vetoes(self_)
     assert any("DEBUG_FULL_DISTRIBUTION" in reason for reason in vetoes)
     assert RayPPOTrainer._isoexec_sampled_gating_skip(self_, batch) is False
+
+
+def test_full_distribution_rejects_configured_evaluation(monkeypatch):
+    monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+    with pytest.raises(RuntimeError, match="eval_interval<=0"):
+        RayPPOTrainer._isoexec_full_distribution_eval_guard(_stub(_cfg(trainer__eval_interval=5)))
+    RayPPOTrainer._isoexec_full_distribution_eval_guard(_stub(_cfg(trainer__eval_interval=-1)))
+
+
+@pytest.mark.parametrize("eval_fn", [evaluate, evaluate_step_wise])
+def test_full_distribution_rejects_every_evaluation_entrypoint(monkeypatch, eval_fn):
+    monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+    with pytest.raises(RuntimeError, match="does not support evaluation traffic"):
+        asyncio.run(eval_fn(None, None, None, None, None))
+
+
+def test_worker_dispatch_mints_one_shared_version_per_completed_sync(monkeypatch):
+    class Client:
+        async def pause_generation(self):
+            return None
+
+        async def resume_generation(self):
+            return None
+
+        async def isoexec_reapply_cached_weights(self):
+            return None
+
+    dispatch = WorkerDispatch.__new__(WorkerDispatch)
+    dispatch._inference_engine_client = Client()
+    dispatch.colocate_all = False
+    dispatch.cfg = SimpleNamespace(
+        trainer=SimpleNamespace(
+            strategy="megatron",
+            policy=SimpleNamespace(model=SimpleNamespace(lora=SimpleNamespace(rank=0))),
+        )
+    )
+    dispatch._prepare_for_weight_sync = lambda: None
+    dispatch._finish_weight_sync = lambda: None
+    dispatch.ensure_active_adapter = lambda *args, **kwargs: None
+    versions = []
+    dispatch._broadcast_to_inference_engines = lambda *args, **kwargs: versions.append(
+        kwargs["full_distribution_version"]
+    )
+    monkeypatch.setenv("SKYRL_ISOEXEC", "1")
+    monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+
+    asyncio.run(dispatch.save_weights_for_sampler())
+    asyncio.run(dispatch.save_weights_for_sampler())
+
+    assert versions == [0, 1]

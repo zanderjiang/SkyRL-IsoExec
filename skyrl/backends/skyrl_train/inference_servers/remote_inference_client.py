@@ -1114,6 +1114,7 @@ class RemoteInferenceClient:
     async def start_weight_update(
         self,
         is_checkpoint_format: bool = True,
+        full_distribution_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Start a new chunked weight update via /collective_rpc.
@@ -1133,7 +1134,10 @@ class RemoteInferenceClient:
             "/collective_rpc",
             {
                 "method": "skyrl_start_weight_update",
-                "kwargs": {"is_checkpoint_format": is_checkpoint_format},
+                "kwargs": {
+                    "is_checkpoint_format": is_checkpoint_format,
+                    "full_distribution_version": full_distribution_version,
+                },
             },
         )
 

@@ -191,7 +191,11 @@ class MoeEngineActor:
     async def init_weight_update_communicator(self, init_info: bytes) -> None:
         await self.engine.collective_rpc("init_weight_update_communicator", args=(init_info,))
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+    async def start_weight_update(
+        self,
+        is_checkpoint_format: bool = True,
+        full_distribution_version: int | None = None,
+    ) -> None:
         # Call SkyRL's worker method, not vLLM's native Worker.start_weight_update
         # (added in vLLM 0.22.0+) which an unprefixed name now resolves to.
         await self.engine.collective_rpc("skyrl_start_weight_update", args=(is_checkpoint_format,))
@@ -231,7 +235,11 @@ async def _run_legacy_ipc_send(engine_actor, snapshot_path: str, init_info) -> N
     class _EngineActorInferenceClient:
         """Routes the sender's control plane to the colocated engine actor."""
 
-        async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+        async def start_weight_update(
+            self,
+            is_checkpoint_format: bool = True,
+            full_distribution_version: int | None = None,
+        ) -> None:
             await engine_actor.start_weight_update.remote(is_checkpoint_format)
 
         async def update_named_weights(self, request: object) -> None:

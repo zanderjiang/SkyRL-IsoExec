@@ -88,7 +88,11 @@ class LayerwiseReloadWorkerMixin:
     # defines no attribute already present on Worker, so same-named methods abort
     # engine init. The skyrl_-prefixed variants keep SkyRL's IPC weight-sync path
     # (and the MoE set_current_vllm_config wrapping) intact alongside vLLM's native API.
-    def skyrl_start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+    def skyrl_start_weight_update(
+        self,
+        is_checkpoint_format: bool = True,
+        full_distribution_version: int | None = None,
+    ) -> None:
         """
         Prepare the model for a new weight update.
 
@@ -102,6 +106,8 @@ class LayerwiseReloadWorkerMixin:
             is_checkpoint_format: True if incoming weights are in checkpoint
                 format (need layerwise processing). False if weights are
                 already in kernel format (direct copy).
+            full_distribution_version: Driver-owned transaction ID used to align
+                trainer and engine diagnostic rows after this sync completes.
         """
         if getattr(self, "_skyrl_weight_update_active", False):
             raise RuntimeError(
@@ -109,6 +115,21 @@ class LayerwiseReloadWorkerMixin:
                 "already active. Call skyrl_finish_weight_update first."
             )
 
+        full_distribution = _os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1"
+        if full_distribution:
+            if type(full_distribution_version) is not int or full_distribution_version < 0:
+                raise RuntimeError(
+                    "full-distribution weight sync requires a non-negative transaction ID, "
+                    f"got {full_distribution_version!r}"
+                )
+            from skyrl.backends.skyrl_train.isoexec.debug.full_distribution import (
+                clear_weight_version,
+            )
+
+            clear_weight_version()
+        elif full_distribution_version is not None:
+            raise RuntimeError("received a full-distribution transaction ID while the diagnostic is disabled")
+        self._skyrl_full_distribution_pending_weight_version = full_distribution_version
         self._ix_dstmap = None
 
         if _os.environ.get("SKYRL_ISOEXEC") == "1":
@@ -160,8 +181,18 @@ class LayerwiseReloadWorkerMixin:
             with set_current_vllm_config(self.vllm_config), torch.device(self.device):
                 finalize_layerwise_reload(model, self.model_config)
 
+        pending_weight_version = getattr(self, "_skyrl_full_distribution_pending_weight_version", None)
+        if _os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+            from skyrl.backends.skyrl_train.isoexec.debug.full_distribution import (
+                set_weight_version,
+            )
+
+            if pending_weight_version is None:
+                raise RuntimeError("full-distribution weight sync finished without a pending weight version")
+            set_weight_version(pending_weight_version)
         self._skyrl_weight_update_active = False
         self._skyrl_is_checkpoint_format = True
+        self._skyrl_full_distribution_pending_weight_version = None
         # The dest map is valid only inside a bracket: outside one, a colocate sleep/wake (cumem)
         # can re-allocate the weight storage, and copying into a freed tensor is the gibberish bug.
         self._ix_dstmap = None

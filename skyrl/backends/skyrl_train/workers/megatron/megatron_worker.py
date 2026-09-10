@@ -2202,7 +2202,22 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         inference_engine_client: "InferenceEngineInterface",
         inference_engine_cfg: "InferenceEngineConfig",
         model_id: Optional[str] = None,
+        full_distribution_version: Optional[int] = None,
     ):
+        full_distribution = os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1"
+        if full_distribution:
+            if type(full_distribution_version) is not int or full_distribution_version < 0:
+                raise RuntimeError(
+                    "full-distribution weight sync requires a non-negative sender transaction ID, "
+                    f"got {full_distribution_version!r}"
+                )
+            from skyrl.backends.skyrl_train.isoexec.debug.full_distribution import (
+                clear_weight_version,
+            )
+
+            clear_weight_version()
+        elif full_distribution_version is not None:
+            raise RuntimeError("received a full-distribution transaction ID while the diagnostic is disabled")
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
         cache_reset_task = None
@@ -2277,6 +2292,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     await self._weight_transfer_sender.send_chunks(
                         self.weight_extractor.extract_weights(generator_dtype),
                         weight_metadata=weight_metadata,
+                        full_distribution_version=full_distribution_version,
                     )
             finally:
                 if _ix_grads_parked:
@@ -2292,6 +2308,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         _ix_order.check_prefix_cache_flush_on_sync(use_prefix_cache, _ix_should_flush, cache_reset_task is not None)
         torch.cuda.empty_cache()
         torch.distributed.barrier()
+        if full_distribution:
+            from skyrl.backends.skyrl_train.isoexec.debug.full_distribution import (
+                set_weight_version,
+            )
+
+            set_weight_version(full_distribution_version)
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method

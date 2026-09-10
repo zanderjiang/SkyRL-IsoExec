@@ -122,6 +122,7 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
+        self._isoexec_full_distribution_eval_guard()
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -254,6 +255,16 @@ class RayPPOTrainer:
     def has_critic(self) -> bool:
         """Check if critic model is configured."""
         return bool(self.cfg.trainer.critic.model.path)
+
+    def _isoexec_full_distribution_eval_guard(self) -> None:
+        """Keep evaluation traffic out of the training-only full-distribution trace."""
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") != "1":
+            return
+        if self.cfg.trainer.eval_interval > 0:
+            raise RuntimeError(
+                "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 requires trainer.eval_interval<=0 so "
+                "baseline, periodic, and final evaluation cannot enter the training-only trace"
+            )
 
     def _build_train_dataloader_and_compute_training_steps(self):
         """

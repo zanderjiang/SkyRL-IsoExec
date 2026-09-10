@@ -525,7 +525,12 @@ class WorkerDispatch:
             )
         )
 
-    def _broadcast_to_inference_engines(self, inference_engine_client, model_id: Optional[str] = None) -> None:
+    def _broadcast_to_inference_engines(
+        self,
+        inference_engine_client,
+        model_id: Optional[str] = None,
+        full_distribution_version: Optional[int] = None,
+    ) -> None:
         """Broadcast policy weights to inference engines. Helper for save_weights_for_sampler.
 
         ``model_id`` is forwarded to the worker so that, on the LoRA path, the
@@ -540,6 +545,7 @@ class WorkerDispatch:
                 inference_engine_client,
                 self.cfg.generator.inference_engine,
                 model_id=model_id,
+                full_distribution_version=full_distribution_version,
             )
         )
 
@@ -573,6 +579,10 @@ class WorkerDispatch:
                 "Cannot save_weights_for_sampler: no inference_engine_client configured. "
                 "Pass inference_engine_client to WorkerDispatch constructor or call set_inference_engine_client()."
             )
+        full_distribution_version = None
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+            full_distribution_version = int(getattr(self, "_isoexec_full_distribution_weight_version", -1)) + 1
+            self._isoexec_full_distribution_weight_version = full_distribution_version
 
         # Sync weights to inference engine
         self._prepare_for_weight_sync()
@@ -596,7 +606,11 @@ class WorkerDispatch:
 
             await self._inference_engine_client.wake_up(tags=["weights"])
             _ix_order.mark_wake(["weights"])
-            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+            self._broadcast_to_inference_engines(
+                self._inference_engine_client,
+                model_id=model_id,
+                full_distribution_version=full_distribution_version,
+            )
             self._finish_weight_sync()
             # The policy must be off the GPU HERE, before the KV pool is mapped -- this ordering
             # is what lets the engine run at a native-class gpu_memory_utilization (the
@@ -613,14 +627,22 @@ class WorkerDispatch:
                 strategy == "megatron" and self.cfg.trainer.policy.megatron_config.lora_config.merge_lora
             ):
                 # in-place lora case (mostly for multi-tenant training) - no need to pause - can just rely on load_lora_adapter to swap adapter in place
-                self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+                self._broadcast_to_inference_engines(
+                    self._inference_engine_client,
+                    model_id=model_id,
+                    full_distribution_version=full_distribution_version,
+                )
                 self._finish_weight_sync()
             else:
                 # Non-colocated single tenant: pause generation to prevent in-flight requests from
                 # reading partially-updated weights during the NCCL broadcast.
                 await self._inference_engine_client.pause_generation()
                 try:
-                    self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+                    self._broadcast_to_inference_engines(
+                        self._inference_engine_client,
+                        model_id=model_id,
+                        full_distribution_version=full_distribution_version,
+                    )
                     self._finish_weight_sync()
                 finally:
                     await self._inference_engine_client.resume_generation()

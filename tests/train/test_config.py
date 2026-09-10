@@ -257,3 +257,34 @@ class TestMaxSeqLenValidation:
         cfg.trainer.algorithm.max_seq_len = 4096
 
         validate_cfg(cfg)
+
+
+class TestFullDistributionValidation:
+    def _cfg(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.strategy = "megatron"
+        cfg.trainer.eval_interval = -1
+        cfg.trainer.fully_async.enabled = False
+        return cfg
+
+    def test_rejects_any_configured_evaluation(self, monkeypatch):
+        monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+        cfg = self._cfg()
+        cfg.trainer.eval_interval = 5
+        cfg.trainer.eval_before_train = False
+        with pytest.raises(ValueError, match="eval_before_train=false alone"):
+            validate_cfg(cfg)
+
+    def test_rejects_non_megatron_backend(self, monkeypatch):
+        monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+        cfg = self._cfg()
+        cfg.trainer.strategy = "fsdp"
+        with pytest.raises(ValueError, match="strategy=megatron"):
+            validate_cfg(cfg)
+
+    def test_rejects_fully_async_training(self, monkeypatch):
+        monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+        cfg = self._cfg()
+        cfg.trainer.fully_async.enabled = True
+        with pytest.raises(ValueError, match="fully async"):
+            validate_cfg(cfg)

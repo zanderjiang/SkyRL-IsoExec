@@ -1,3 +1,7 @@
+import asyncio
+import importlib
+from unittest.mock import AsyncMock
+
 import pytest
 
 from skyrl.backends.skyrl_train.weight_sync import (
@@ -28,6 +32,36 @@ class TestGetTransferStrategyCls:
     def test_returns_correct_strategy(self, backend, colocate_all, expected_strategy):
         """Should return correct strategy based on backend and colocate_all."""
         assert get_transfer_strategy_cls(backend, colocate_all) is expected_strategy
+
+
+@pytest.mark.parametrize(
+    "module_name,sender_name",
+    [
+        ("skyrl.backends.skyrl_train.weight_sync.cuda_ipc_strategy", "CudaIpcWeightTransferSender"),
+        ("skyrl.backends.skyrl_train.weight_sync.broadcast_strategy", "BroadcastWeightTransferSender"),
+    ],
+)
+@pytest.mark.parametrize("new_inference", [False, True])
+def test_sender_forwards_full_distribution_transaction_to_every_branch(
+    monkeypatch,
+    module_name,
+    sender_name,
+    new_inference,
+):
+    module = importlib.import_module(module_name)
+    sender = getattr(module, sender_name).__new__(getattr(module, sender_name))
+    sender._send_chunks_legacy = AsyncMock()
+    sender._send_chunks_vllm_native = AsyncMock()
+    monkeypatch.setattr(module, "_SKYRL_USE_NEW_INFERENCE", new_inference)
+    chunks = []
+
+    asyncio.run(sender.send_chunks(chunks, full_distribution_version=7))
+
+    selected = sender._send_chunks_vllm_native if new_inference else sender._send_chunks_legacy
+    if new_inference:
+        selected.assert_awaited_once_with(chunks, None, 7)
+    else:
+        selected.assert_awaited_once_with(chunks, 7)
 
 
 class TestCreateInitInfo:

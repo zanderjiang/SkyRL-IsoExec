@@ -163,6 +163,8 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
+        *,
+        full_distribution_version: Optional[int] = None,
     ) -> None:
         """Send chunks via CUDA IPC.
 
@@ -173,14 +175,15 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
                 compatibility with the base class.
         """
         if _SKYRL_USE_NEW_INFERENCE:
-            await self._send_chunks_vllm_native(chunks, weight_metadata)
+            await self._send_chunks_vllm_native(chunks, weight_metadata, full_distribution_version)
         else:
-            await self._send_chunks_legacy(chunks)
+            await self._send_chunks_legacy(chunks, full_distribution_version)
 
     async def _send_chunks_vllm_native(
         self,
         chunks: Iterable[WeightChunk],
         weight_metadata: Optional[Dict[str, list]] = None,
+        full_distribution_version: Optional[int] = None,
     ) -> None:
         """Send weights chunk-by-chunk via vLLM native IPC (new inference path).
 
@@ -208,7 +211,10 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         dtype_name = self._init_info.model_dtype_str.split(".")[-1]
 
         if rank == 0:
-            await self._inference_client.start_weight_update(is_checkpoint_format=True)
+            await self._inference_client.start_weight_update(
+                is_checkpoint_format=True,
+                full_distribution_version=full_distribution_version,
+            )
         torch.distributed.barrier()
 
         for chunk in chunks:
@@ -274,7 +280,11 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
             await self._inference_client.finish_weight_update()
         torch.distributed.barrier()
 
-    async def _send_chunks_legacy(self, chunks: Iterable[WeightChunk]) -> None:
+    async def _send_chunks_legacy(
+        self,
+        chunks: Iterable[WeightChunk],
+        full_distribution_version: Optional[int] = None,
+    ) -> None:
         """Per-chunk CUDA IPC with packed tensors (legacy path)."""
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
@@ -284,7 +294,10 @@ class CudaIpcWeightTransferSender(WeightTransferSender):
         # Bracket the whole sync with one layerwise-reload initialize/finalize so
         # per-chunk reloads don't restore non-chunk layers; see `vllm_worker.py.WorkerWrap` docs
         if rank == 0:
-            await self._inference_client.start_weight_update(is_checkpoint_format=True)
+            await self._inference_client.start_weight_update(
+                is_checkpoint_format=True,
+                full_distribution_version=full_distribution_version,
+            )
         torch.distributed.barrier()
 
         import os as _os

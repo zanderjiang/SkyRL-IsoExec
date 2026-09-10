@@ -98,11 +98,15 @@ site in "Owed call-site changes" at the end. Original specification kept below.
    some rows from a whole-tensor round-off/reduction-order difference, which the k-ladder cannot.
    Unregistered, it works only for single-process runs.
 
-## Trace format version 4
+## Trace format version 5
 
-`trace.FORMAT_VERSION` / `compare.FORMAT_VERSION` is **4**. v4 adds history-keyed full-distribution
-rows, paired 64-bit fingerprints, and coverage-aware comparison. A v3 comparator would accept the
-region but misread those semantics, so older traces must be re-captured.
+`trace.FORMAT_VERSION` / `compare.FORMAT_VERSION` is **5**. v5 keys full-distribution rows by the
+driver-owned weight-sync transaction plus token history, ignores the unrelated local `step` field
+for those rows, and refuses within-side multi-valued duplicates. A v4 comparator would misread that
+identity, so older traces must be re-captured.
+
+What v4 added on top of v3: history-keyed full-distribution rows, paired 64-bit fingerprints, and
+coverage-aware comparison.
 
 What v3 added on top of v2:
 
@@ -131,14 +135,18 @@ What v2 added:
 
 `SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1` adds an opt-in diagnostic region named
 `logprobs.full_raw_distribution`. It hashes every fp32 vocabulary entry at the actual vLLM
-`Sampler.compute_logprobs` boundary and at trainer policy scoring. SHA-256 token-history keys align
-rows across different batches; only two 64-bit fingerprints per `[V]` row enter the trace. Trainer
-rows are processed four at a time. Matching fingerprints are diagnostic evidence, not a
+`Sampler.compute_logprobs` boundary and at trainer policy scoring. The driver mints one weight-sync
+transaction ID and delivers it through the shared start/update/finish protocol; rows align by that
+ID plus a SHA-256 token-history key, never by each process's local optimizer/load counter. Duplicate
+rows for one identity must be single-valued on each side before multiplicities compare as multisets.
+With ladder and segment diagnostics off, only two 64-bit fingerprints per `[V]` row enter the trace.
+Trainer rows are processed four at a time. Matching fingerprints are diagnostic evidence, not a
 collision-free proof.
 
 The MVP requires sm90, text-only base-model requests, rollout logprobs, `temperature=1`, vLLM
 `raw_logprobs`, `TP=PP=DP=1`, trainer `CP=1`, unpacked scoring, rowinv ownership, eager V1 sampling,
-`SKYRL_ISOEXEC_DEBUG_SAMPLE=1`, and no spec decode, async scheduling, grammar mask, or active LoRA.
+`SKYRL_ISOEXEC_DEBUG_SAMPLE=1`, `trainer.eval_interval<=0`, and no spec decode, async scheduling,
+grammar mask, active LoRA, evaluation, or unrelated external traffic on the same engine.
 Unsupported modes raise. A history observed on only one side makes the result `inconclusive`, never
 `clean`; use a short text-only run without post-generation retokenization or masked sampled tokens.
 

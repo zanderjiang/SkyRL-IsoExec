@@ -24,7 +24,14 @@ from skyrl.backends.skyrl_train.isoexec.debug import (  # noqa: E402
 
 
 @contextlib.contextmanager
-def _trace_env(path: str, side: str, *, sample: str = "1", arm: bool = True):
+def _trace_env(
+    path: str,
+    side: str,
+    *,
+    sample: str = "1",
+    arm: bool = True,
+    weight_version: int | None = 0,
+):
     names = (
         trace.ENV_TRACE,
         trace.ENV_SIDE,
@@ -48,22 +55,28 @@ def _trace_env(path: str, side: str, *, sample: str = "1", arm: bool = True):
         )
         os.environ.pop("LOCAL_RANK", None)
         trace._reset_for_tests()
+        full_distribution._reset_for_tests()
         tracer = trace.get_tracer()
         if arm:
             tracer.regions_hooked.add(full_distribution.REGION)
         tracer.write_manifest()
+        if weight_version is not None:
+            full_distribution.set_weight_version(weight_version)
         yield
         trace.flush()
     finally:
         trace._reset_for_tests()
+        full_distribution._reset_for_tests()
         for name, value in saved.items():
             os.environ.pop(name, None)
             if value is not None:
                 os.environ[name] = value
 
 
-def _record(path: str, side: str, rows: torch.Tensor, histories):
-    with _trace_env(path, side):
+def _record(path: str, side: str, rows: torch.Tensor, histories, *, weight_version: int = 0, step=None):
+    with _trace_env(path, side, weight_version=weight_version):
+        if step is not None:
+            trace.set_step(step)
         keys = [full_distribution.history_key(history) for history in histories]
         full_distribution._record_rows(rows, keys, case="trainer_score" if side == "trainer" else "engine")
 
@@ -111,7 +124,20 @@ def test_history_identity_survives_batch_permutation_and_duplicates():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_duplicate_history_is_compared_as_a_multiset():
+def test_identical_duplicate_history_is_compared_as_a_multiset():
+    root = tempfile.mkdtemp(prefix="isoexec-full-dist-")
+    try:
+        trainer_dir, engine_dir = os.path.join(root, "trainer"), os.path.join(root, "engine")
+        rows = torch.tensor([[-0.1, -2.0], [-0.1, -2.0]], dtype=torch.float32)
+        histories = [[1, 2], [1, 2]]
+        _record(trainer_dir, "trainer", rows, histories)
+        _record(engine_dir, "engine", rows.flip(0), histories)
+        assert _compare(trainer_dir, engine_dir)["status"] == "clean"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_duplicate_history_with_multiple_values_is_never_clean():
     root = tempfile.mkdtemp(prefix="isoexec-full-dist-")
     try:
         trainer_dir, engine_dir = os.path.join(root, "trainer"), os.path.join(root, "engine")
@@ -119,7 +145,55 @@ def test_duplicate_history_is_compared_as_a_multiset():
         histories = [[1, 2], [1, 2]]
         _record(trainer_dir, "trainer", rows, histories)
         _record(engine_dir, "engine", rows.flip(0), histories)
+        report = _compare(trainer_dir, engine_dir)
+        assert report["status"] == "divergent"
+        assert report["first_divergence"]["kind"] == "within-side-variation"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_weight_version_not_local_step_is_the_full_distribution_identity():
+    root = tempfile.mkdtemp(prefix="isoexec-full-dist-")
+    try:
+        trainer_dir, engine_dir = os.path.join(root, "trainer"), os.path.join(root, "engine")
+        row = torch.tensor([[-0.1, -2.0]], dtype=torch.float32)
+        _record(trainer_dir, "trainer", row, [[1]], weight_version=3, step=9)
+        _record(engine_dir, "engine", row, [[1]], weight_version=3, step=1)
         assert _compare(trainer_dir, engine_dir)["status"] == "clean"
+
+        shutil.rmtree(engine_dir)
+        _record(engine_dir, "engine", row, [[1]], weight_version=4, step=9)
+        report = _compare(trainer_dir, engine_dir)
+        assert report["status"] == "inconclusive"
+        assert report["full_distribution_coverage_gap"] is True
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_capture_requires_an_active_completed_weight_sync():
+    root = tempfile.mkdtemp(prefix="isoexec-full-dist-")
+    try:
+        with _trace_env(root, "trainer", weight_version=None):
+            with pytest.raises(RuntimeError, match="no active completed weight-sync transaction"):
+                full_distribution._record_rows(torch.zeros(1, 4), ["history"], case="trainer_score")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_receiver_activates_weight_version_only_after_finish():
+    from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+        LayerwiseReloadWorkerMixin,
+    )
+
+    root = tempfile.mkdtemp(prefix="isoexec-full-dist-")
+    try:
+        with _trace_env(root, "engine", weight_version=0):
+            worker = LayerwiseReloadWorkerMixin()
+            worker.skyrl_start_weight_update(is_checkpoint_format=False, full_distribution_version=1)
+            with pytest.raises(RuntimeError, match="no active completed weight-sync transaction"):
+                full_distribution._record_rows(torch.zeros(1, 4), ["history"], case="engine")
+            worker.skyrl_finish_weight_update()
+            assert full_distribution._record_rows(torch.zeros(1, 4), ["history"], case="engine") == 1
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -1,3 +1,4 @@
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -34,6 +35,15 @@ if TYPE_CHECKING:
     from skyrl.train.utils.vllm_metrics_scraper import VLLMMetricsScraper
 
 
+def reject_full_distribution_evaluation() -> None:
+    """Refuse eval before its engine-only rows can contaminate a training trace."""
+    if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+        raise RuntimeError(
+            "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 does not support evaluation traffic: "
+            "engine eval rows have no trainer policy-scoring counterpart"
+        )
+
+
 @torch.no_grad()
 async def evaluate(
     eval_dataloader: StatefulDataLoader,
@@ -59,6 +69,8 @@ async def evaluate(
     Returns:
         Dict[str, float]: evaluation metrics
     """
+
+    reject_full_distribution_evaluation()
 
     # 1. Get all generator outputs
     generator_outputs: List[GeneratorOutput] = []
@@ -173,6 +185,8 @@ async def evaluate_step_wise(
     Returns:
         Dict[str, float]: evaluation metrics
     """
+
+    reject_full_distribution_evaluation()
 
     # 1. Get all generator outputs
     generator_outputs: List[GeneratorOutput] = []

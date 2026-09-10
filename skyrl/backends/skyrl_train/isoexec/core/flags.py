@@ -1838,8 +1838,9 @@ FLAGS: List[Flag] = [
         "record complete fp32 raw-model logprob rows under batching-independent token-history identities",
         DIAGNOSTIC,
         (TRAIN, ENGINE),
-        notes="Opt-in extension of DEBUG_TRACE. It writes two 64-bit fingerprints per active [V] row. The initial "
-        "domain is sm90, text-only, base-model, logprobs-enabled, single-rank, unpacked, eager vLLM V1 without "
+        notes="Opt-in extension of DEBUG_TRACE. By default it writes two 64-bit fingerprints per active [V] row, "
+        "keyed by the driver-owned weight-sync transaction plus token history. The initial domain is sm90, "
+        "text-only, base-model, logprobs-enabled, single-rank, unpacked, eager vLLM V1 without evaluation or "
         "speculation; unsupported modes refuse.",
     ),
     Flag(
