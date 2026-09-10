@@ -65,6 +65,14 @@ def test_partial_regions_declare_why():
             assert entry["note"], region
 
 
+def test_logprob_doors_do_not_bind_different_semantic_outputs():
+    logprob_doors = [
+        (module, attr) for region, module, attr, _ok, _kw in install.DOORS if region == "logprobs.log_softmax"
+    ]
+    assert logprob_doors == []
+    assert "target-selected" in install.NOT_HOOKED["logprobs.log_softmax"]
+
+
 def test_doors_are_unique_and_well_formed():
     seen = set()
     for region, mod, attr, import_ok, kw in install.DOORS:

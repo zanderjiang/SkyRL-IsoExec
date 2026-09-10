@@ -39,6 +39,7 @@ class TestDebugFlagsRegistered(unittest.TestCase):
         for name in (
             "SKYRL_ISOEXEC_DEBUG_TRACE",
             "SKYRL_ISOEXEC_DEBUG_SIDE",
+            "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION",
             "SKYRL_ISOEXEC_DEBUG_SAMPLE",
             "SKYRL_ISOEXEC_DEBUG_LADDER",
             "SKYRL_ISOEXEC_DEBUG_RING",
@@ -49,6 +50,8 @@ class TestDebugFlagsRegistered(unittest.TestCase):
     def test_trace_forwarded_to_both_actors(self):
         flag = next(f for f in flags_mod.FLAGS if f.name == "SKYRL_ISOEXEC_DEBUG_TRACE")
         self.assertEqual(set(flag.forwarded_by), {flags_mod.TRAIN, flags_mod.ENGINE})
+        full = next(f for f in flags_mod.FLAGS if f.name == "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION")
+        self.assertEqual(set(full.forwarded_by), {flags_mod.TRAIN, flags_mod.ENGINE})
 
 
 class TestHandshakeDemotion(unittest.TestCase):
@@ -149,8 +152,60 @@ class TestRealCallSiteDemotion(unittest.TestCase):
                 self.assertIs(engine.run_install(), True)
             self.assertIn(("engine", enforce.INSTALL), enforce.ledger().closed)
 
+    def test_requested_full_distribution_hook_failure_refuses(self):
+        with _fresh():
+            os.environ.update(
+                _armed(
+                    {
+                        "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION": "1",
+                    }
+                )
+            )
+            engine = _mk_engine(install_fn=_stub_install("engine"))
+            with mock.patch(
+                "skyrl.backends.skyrl_train.isoexec.debug.install.install_debug_hooks",
+                side_effect=RuntimeError("full distribution hook missing"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "full-distribution tracing"):
+                    engine.run_install()
+
 
 class TestAdapterArmsHooks(unittest.TestCase):
+    def test_full_distribution_requires_debug_trace(self):
+        from skyrl.backends.skyrl_train.isoexec.core.adapter import ContractAdapter
+
+        adapter = ContractAdapter.__new__(ContractAdapter)
+        adapter.side = "trainer"
+        with mock.patch.dict(
+            os.environ,
+            {"SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION": "1"},
+            clear=False,
+        ):
+            os.environ.pop("SKYRL_ISOEXEC_DEBUG_TRACE", None)
+            with self.assertRaisesRegex(RuntimeError, "requires SKYRL_ISOEXEC_DEBUG_TRACE"):
+                adapter._install_debug_trace()
+
+    def test_full_distribution_splits_colocated_trace_by_side(self):
+        from skyrl.backends.skyrl_train.isoexec.core.adapter import ContractAdapter
+
+        adapter = ContractAdapter.__new__(ContractAdapter)
+        adapter.side = "engine"
+        env = {
+            "SKYRL_ISOEXEC_DEBUG_TRACE": "/tmp/engine",
+            "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch(
+                "skyrl.backends.skyrl_train.isoexec.debug.install.install_debug_hooks",
+                return_value=3,
+            ):
+                adapter._install_debug_trace()
+                adapter._install_debug_trace()
+            self.assertEqual(
+                os.environ["SKYRL_ISOEXEC_DEBUG_TRACE"],
+                "/tmp/engine/engine",
+            )
+
     def test_install_debug_trace_stamps_side_and_installs(self):
         from skyrl.backends.skyrl_train.isoexec.core.adapter import ContractAdapter
 

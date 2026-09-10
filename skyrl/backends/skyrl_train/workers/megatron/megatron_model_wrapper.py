@@ -188,6 +188,7 @@ class MegatronModelWrapper:
         seq_len: int,
         micro_batch_size: int,
         temperature: float = 1.0,
+        capture_full_distribution: bool = False,
     ) -> torch.Tensor:
         """
         Forward-only inference to compute log-probs over a full mini-batch consisting of multiple micro-batches.
@@ -198,6 +199,7 @@ class MegatronModelWrapper:
             seq_len: Padded sequence length per sample.
             micro_batch_size: Per-micro-batch size.
             temperature: Optional temperature scaling for logits.
+            capture_full_distribution: Record the opt-in full-distribution debug trace.
 
         Returns:
             torch.Tensor of concatenated log-probs across micro-batches (valid on pipeline last stage only).
@@ -228,6 +230,14 @@ class MegatronModelWrapper:
             if temperature != 1.0:
                 logits.div_(temperature)
 
+            full_distribution_rowinv_before = None
+            if capture_full_distribution:
+                from skyrl.backends.skyrl_train.isoexec.ops.logprobs.rowinv import (
+                    stats as rowinv_stats,
+                )
+
+                full_distribution_rowinv_before = rowinv_stats()
+
             if packed_seq_params is not None and packed_targets is not None:
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     logits,
@@ -253,6 +263,25 @@ class MegatronModelWrapper:
                     inference_only=True,
                     cp_group=None,
                     chunk_size=self.cfg.logprobs_chunk_size,  # chunk seq dim to bound peak memory
+                )
+            if capture_full_distribution:
+                from skyrl.backends.skyrl_train.isoexec.debug.full_distribution import (
+                    record_trainer_action_distributions,
+                )
+
+                record_trainer_action_distributions(
+                    logits=logits,
+                    sequences=sequences,
+                    attention_mask=data["attention_mask"],
+                    loss_mask=data.get("loss_mask"),
+                    num_actions=data["num_actions"],
+                    temperature=temperature,
+                    packed=packed_seq_params is not None or self.remove_microbatch_padding,
+                    tp_size=mpu.get_tensor_model_parallel_world_size(),
+                    pp_size=mpu.get_pipeline_model_parallel_world_size(),
+                    cp_size=mpu.get_context_parallel_world_size(),
+                    dp_size=mpu.get_data_parallel_world_size(),
+                    rowinv_before=full_distribution_rowinv_before,
                 )
             return torch.tensor(0.0, device=token_logprobs.device), {"log_probs": token_logprobs}
 

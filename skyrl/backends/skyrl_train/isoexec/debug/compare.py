@@ -19,9 +19,10 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 # Must match trace.FORMAT_VERSION. Duplicated rather than imported: trace.py pulls in torch.
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 MAX_LOCATIONS = 10  # per list, in the rendered text; --json carries up to --json-max-per-region
+FULL_DISTRIBUTION_REGION = "logprobs.full_raw_distribution"
 
 
 # -- loading -------------------------------------------------------------------------------
@@ -31,6 +32,8 @@ def load_dir(path: str) -> List[dict]:
     recs: List[dict] = []
     files = sorted(glob.glob(os.path.join(path, "*.jsonl")))
     if not files:
+        if glob.glob(os.path.join(path, "manifest-*.json")):
+            return recs
         raise SystemExit(f"no *.jsonl trace files in {path!r}")
     stale = set()
     for fp in files:
@@ -115,6 +118,54 @@ def _align(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple[Optional[dict], O
             return [(da.get(k), db.get(k)) for k in sorted(set(ka) | set(kb))], field
     n = max(len(va), len(vb))
     return [(va[i] if i < len(va) else None, vb[i] if i < len(vb) else None) for i in range(n)], "position"
+
+
+def _align_full_distribution(va: List[dict], vb: List[dict]) -> Tuple[List[Tuple[Optional[dict], Optional[dict]]], str]:
+    """Align duplicate histories as multisets, independently for each optimizer step."""
+
+    def signature(record: dict) -> tuple:
+        return (
+            tuple(record.get("shape") or ()),
+            str(record.get("dtype") or ""),
+            str(record.get("digest") or ""),
+            str(record.get("unrecordable") or ""),
+        )
+
+    def align_bucket(a_bucket: List[dict], b_bucket: List[dict]):
+        by_signature_a: Dict[tuple, List[dict]] = {}
+        by_signature_b: Dict[tuple, List[dict]] = {}
+        for record in a_bucket:
+            by_signature_a.setdefault(signature(record), []).append(record)
+        for record in b_bucket:
+            by_signature_b.setdefault(signature(record), []).append(record)
+
+        pairs = []
+        for sig in sorted(set(by_signature_a) & set(by_signature_b)):
+            left, right = by_signature_a[sig], by_signature_b[sig]
+            for _ in range(min(len(left), len(right))):
+                pairs.append((left.pop(), right.pop()))
+        remaining_a = sorted((record for values in by_signature_a.values() for record in values), key=signature)
+        remaining_b = sorted((record for values in by_signature_b.values() for record in values), key=signature)
+        count = max(len(remaining_a), len(remaining_b))
+        pairs.extend(
+            (
+                remaining_a[i] if i < len(remaining_a) else None,
+                remaining_b[i] if i < len(remaining_b) else None,
+            )
+            for i in range(count)
+        )
+        return pairs
+
+    steps = {record.get("step") for record in va + vb}
+    pairs = []
+    for step in sorted(steps, key=lambda value: (value is not None, value if value is not None else -1)):
+        pairs.extend(
+            align_bucket(
+                [record for record in va if record.get("step") == step],
+                [record for record in vb if record.get("step") == step],
+            )
+        )
+    return pairs, "step+multiset"
 
 
 # -- magnitude -----------------------------------------------------------------------------
@@ -213,11 +264,13 @@ def _sampling(recs: List[dict], man: List[dict]) -> dict:
     seen, recorded = set(), {r.get("step") for r in recs if r.get("step") is not None}
     sample = 1
     step_signal = any(r.get("step") is not None for r in recs)
+    regions_hooked = set()
     for m in man:
         sample = max(sample, int(m.get("sample", 1)))
         step_signal = step_signal or bool(m.get("step_signal"))
         seen.update(m.get("steps_seen") or [])
         recorded.update(m.get("steps_recorded") or [])
+        regions_hooked.update(m.get("regions_hooked") or [])
     return {
         "sample": sample,
         "step_signal": step_signal,
@@ -228,6 +281,7 @@ def _sampling(recs: List[dict], man: List[dict]) -> dict:
         "segment_rows": max((int(m.get("segment_rows") or 0) for m in man), default=0),
         "layer_src": sorted({r.get("layer_src") for r in recs if r.get("layer_src")}),
         "capture_skipped": sum(int(m.get("capture_skipped") or 0) for m in man),
+        "regions_hooked": sorted(regions_hooked),
         "records": len(recs),
     }
 
@@ -333,7 +387,7 @@ def compare(
         region, layer, out_idx, rank = key
         st = per_region.setdefault(region, _new_stat())
         va, vb = ga.get(key), gb.get(key)
-        if va is None or vb is None:
+        if (va is None or vb is None) and region != FULL_DISTRIBUTION_REGION:
             present, absent_in = (va, "B") if vb is None else (vb, "A")
             n = len(present)
             where = dict(_loc(present[0], key), step=None, call=None, records=n)
@@ -367,7 +421,8 @@ def compare(
             )
             continue
 
-        pairs, how = _align(va, vb)
+        va, vb = va or [], vb or []
+        pairs, how = _align_full_distribution(va, vb) if region == FULL_DISTRIBUTION_REGION else _align(va, vb)
         for i, (ra, rb) in enumerate(pairs):
             if ra is None or rb is None:
                 present = ra or rb
@@ -457,23 +512,53 @@ def compare(
 
     # Causal ordering: earliest execution timestamp wins, per rank and overall.
     divs.sort(key=_order_key)
+
+    def is_full_coverage_gap(item: dict) -> bool:
+        return item.get("region") == FULL_DISTRIBUTION_REGION and item.get("kind") in ("absent", "unrecordable")
+
     origins: Dict[object, dict] = {}
-    for mm in divs:
+    for mm in (item for item in divs if not is_full_coverage_gap(item)):
         origins.setdefault(mm.get("rank"), mm)
     for mm in divs:
-        mm["contaminated"] = mm is not origins.get(mm.get("rank"))
-    for mm in divs:
+        mm["contaminated"] = False if is_full_coverage_gap(mm) else mm is not origins.get(mm.get("rank"))
+    for mm in (item for item in divs if not is_full_coverage_gap(item)):
         st = per_region[mm["region"]] if mm["region"] in per_region else None
         if st is not None and (st["first_mismatch"] is None or _order_key(mm) < _order_key(st["first_mismatch"])):
             st["first_mismatch"] = mm
 
     disjoint = _disjoint_sampling(samp_a, samp_b)
     layer_src = _layer_src_mismatch(samp_a, samp_b)
-    first_div = rank_div if rank_div is not None else (divs[0] if divs else None)
+    first_recorded_gap = rank_div if rank_div is not None else (divs[0] if divs else None)
+    full_region_selected = not regions or FULL_DISTRIBUTION_REGION in regions
+    full_armed_a = full_region_selected and FULL_DISTRIBUTION_REGION in samp_a["regions_hooked"]
+    full_armed_b = full_region_selected and FULL_DISTRIBUTION_REGION in samp_b["regions_hooked"]
+    full_arming_mismatch = full_armed_a != full_armed_b
+    full_records_a = any(record.get("region") == FULL_DISTRIBUTION_REGION for record in recs_a)
+    full_records_b = any(record.get("region") == FULL_DISTRIBUTION_REGION for record in recs_b)
+    full_side_unobserved = full_armed_a and full_armed_b and full_records_a != full_records_b
+    required_observation = None
+    if full_armed_a or full_armed_b:
+        if full_arming_mismatch:
+            required_observation = "full-distribution tracing was armed on only one side"
+        elif per_region.get(FULL_DISTRIBUTION_REGION, {}).get("compared", 0) == 0:
+            required_observation = "no active trainer history had a matching engine full-distribution row"
+    no_observations = not recs_a and not recs_b and bool(man_a or man_b)
+    full_stats = per_region.get(FULL_DISTRIBUTION_REGION, {})
+    full_coverage_gap = bool(full_stats.get("unrecordable")) or any(
+        is_full_coverage_gap(divergence) for divergence in divs
+    )
+    numeric_divergences = [divergence for divergence in divs if not is_full_coverage_gap(divergence)]
+    first_div = (
+        rank_div if rank_div is not None else (numeric_divergences[0] if numeric_divergences else first_recorded_gap)
+    )
     if disjoint:
         status = "inconclusive"
-    elif first_div is not None:
+    elif numeric_divergences or (rank_div is not None and not full_side_unobserved and not full_arming_mismatch):
         status = "divergent"
+    elif full_arming_mismatch or no_observations or full_side_unobserved or full_coverage_gap:
+        status = "inconclusive"
+    elif required_observation:
+        status = "inconclusive"
     else:
         status = "clean"
 
@@ -487,6 +572,11 @@ def compare(
         "rank_mismatch": rank_div,
         "disjoint_sampling": disjoint,
         "layer_src_mismatch": layer_src,
+        "full_distribution_arming_mismatch": full_arming_mismatch,
+        "full_distribution_side_unobserved": full_side_unobserved,
+        "full_distribution_coverage_gap": full_coverage_gap,
+        "no_observations": no_observations,
+        "required_observation": required_observation,
         "regions": per_region,
         "first_divergence": first_div,
         "origins": [origins[r] for r in sorted(origins, key=str)],
@@ -557,12 +647,25 @@ def render_text(rep: dict) -> str:
                 f"WARNING: side {side.upper()} skipped {skipped} record(s) reached under CUDA-graph "
                 "capture; that part of the forward is unobserved (run the engine eager)."
             )
+    if rep.get("required_observation"):
+        lines.append(f"FULL-DISTRIBUTION COVERAGE: {rep['required_observation']}.")
     if rep["disjoint_sampling"]:
         lines.append("COMPARISON INCONCLUSIVE: side-disjoint sampling.")
         lines.append(f"  {rep['disjoint_sampling']}")
         lines.append("  The two sides did not observe the same forwards, so nothing below is")
         lines.append("  evidence of agreement or of divergence. Wire set_step on both sides, or")
         lines.append("  re-run with SKYRL_ISOEXEC_DEBUG_SAMPLE=1.")
+    elif rep.get("full_distribution_arming_mismatch") and rep["status"] == "inconclusive":
+        lines.append("COMPARISON INCONCLUSIVE: full-distribution tracing was not armed on both sides.")
+    elif rep.get("no_observations") and rep["status"] == "inconclusive":
+        lines.append("COMPARISON INCONCLUSIVE: manifests exist but neither side recorded a tensor.")
+    elif rep.get("full_distribution_side_unobserved") and rep["status"] == "inconclusive":
+        lines.append("COMPARISON INCONCLUSIVE: one side recorded no full-distribution rows.")
+    elif rep.get("full_distribution_coverage_gap") and rep["status"] == "inconclusive":
+        lines.append("COMPARISON INCONCLUSIVE: some full-distribution histories exist on only one side.")
+    elif rep.get("required_observation") and fd is None:
+        lines.append("COMPARISON INCONCLUSIVE: required full-distribution observations are missing.")
+        lines.append(f"  {rep['required_observation']}")
     elif fd is None:
         lines.append("NO DIVERGENCE: every compared pair matched bitwise.")
     elif fd["kind"] == "rank_mismatch":

@@ -1355,6 +1355,8 @@ class RayPPOTrainer:
         old logprobs: rollout logprobs are present (these losses fall back to old logprobs
         without them), the KL reward penalty is off, and off-policy correction is disabled.
         """
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+            return False
         algorithm = self.cfg.trainer.algorithm
         return (
             algorithm.policy_loss_type in LOSSES_WITHOUT_OLD_LOGPROBS
@@ -1381,6 +1383,9 @@ class RayPPOTrainer:
                 "SKYRL_ISOEXEC != 1 -- substituting rollout logprobs is only defensible when the "
                 "IsoExec stack is the thing producing them"
             )
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+            vetoes.append("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 requires policy scoring")
+
         algorithm = self.cfg.trainer.algorithm
         if algorithm.use_kl_in_reward:
             vetoes.append("trainer.algorithm.use_kl_in_reward=true")
@@ -1459,6 +1464,8 @@ class RayPPOTrainer:
             - `["values"]`: Float[torch.Tensor, "batch_size seqlen"]
         """
         fwd_keys = ["sequences", "attention_mask"]
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+            fwd_keys.append("loss_mask")
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
         if training_input.get("pixel_values") is not None:

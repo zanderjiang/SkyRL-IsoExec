@@ -793,6 +793,36 @@ def _full_row_fused(x_wide: torch.Tensor, g_leaves: int) -> torch.Tensor:
     return out
 
 
+@torch.no_grad()
+def diagnostic_full_logprobs(logits: torch.Tensor) -> torch.Tensor:
+    """Evaluate the full-row contract letter without mutating production admission state."""
+    if os.environ.get("SKYRL_ISOEXEC") != "1":
+        raise RuntimeError("diagnostic full logprobs require SKYRL_ISOEXEC=1")
+    if logits.ndim != 2 or logits.numel() == 0 or not logits.is_contiguous():
+        raise RuntimeError(f"diagnostic full logprobs require contiguous non-empty [N,V], got {tuple(logits.shape)}")
+    if not logits.is_cuda or logits.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise RuntimeError(
+            f"diagnostic full logprobs require CUDA fp32/bf16/fp16 logits, got {logits.device}/{logits.dtype}"
+        )
+    if torch.cuda.get_device_capability(logits.device) != (9, 0):
+        raise RuntimeError("diagnostic full logprobs are currently validated only on sm90")
+    try:
+        g_leaves = int(os.environ.get(LEAVES_ENV, "8"))
+    except ValueError as error:
+        raise RuntimeError(f"invalid {LEAVES_ENV}") from error
+    if g_leaves < 1 or (g_leaves & (g_leaves - 1)) or logits.shape[1] % g_leaves:
+        raise RuntimeError(
+            f"diagnostic full logprobs require V divisible by power-of-two G, got V={logits.shape[1]} G={g_leaves}"
+        )
+    if _KERNEL is None:
+        raise RuntimeError(f"diagnostic full logprobs require an already-served rowinv kernel: {_KERNEL_ERROR}")
+
+    x_wide = logits if logits.dtype is torch.float32 else logits.to(torch.float32)
+    target = torch.zeros(logits.shape[0], dtype=torch.int64, device=logits.device)
+    full, _row_max, _leaf_sums = _full_row_eager(x_wide, target, g_leaves)
+    return full
+
+
 def rowinv_full_logprobs(
     logits: torch.Tensor,
     *,

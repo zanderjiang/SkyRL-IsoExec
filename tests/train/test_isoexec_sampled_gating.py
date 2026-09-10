@@ -112,3 +112,15 @@ def test_dynamic_guards_still_refuse_without_a_static_veto(field, value, monkeyp
     self_ = _stub(_cfg(), **kw)
     assert RayPPOTrainer._isoexec_sampled_gating_static_vetoes(self_) == []
     assert RayPPOTrainer._isoexec_sampled_gating_skip(self_, batch) is False
+
+
+def test_full_distribution_forces_real_policy_scoring(monkeypatch):
+    monkeypatch.setenv("SKYRL_ISOEXEC", "1")
+    monkeypatch.setenv("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION", "1")
+    self_ = _stub(_cfg(trainer__algorithm__policy_loss_type="rollout_is"))
+    batch = _Batch(object())
+
+    assert RayPPOTrainer._skip_policy_forward(self_, batch) is False
+    vetoes = RayPPOTrainer._isoexec_sampled_gating_static_vetoes(self_)
+    assert any("DEBUG_FULL_DISTRIBUTION" in reason for reason in vetoes)
+    assert RayPPOTrainer._isoexec_sampled_gating_skip(self_, batch) is False

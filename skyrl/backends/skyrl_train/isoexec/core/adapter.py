@@ -354,6 +354,8 @@ class ContractAdapter:
         """
         from ..debug.trace import enabled
 
+        if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1" and not enabled():
+            raise RuntimeError("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1 requires SKYRL_ISOEXEC_DEBUG_TRACE")
         if not enabled():
             return
         if self.side == "engine" and os.environ.get("SKYRL_ISOEXEC_ENABLE_CUDAGRAPH") == "1":
@@ -362,13 +364,22 @@ class ContractAdapter:
             )
         try:
             os.environ["SKYRL_ISOEXEC_DEBUG_SIDE"] = self.side
+            if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+                trace_base = getattr(self, "_isoexec_debug_trace_base", os.environ["SKYRL_ISOEXEC_DEBUG_TRACE"])
+                self._isoexec_debug_trace_base = trace_base
+                os.environ["SKYRL_ISOEXEC_DEBUG_TRACE"] = os.path.join(trace_base, self.side)
             from ..debug import install_debug_hooks
 
             # With a GPTModel handle the records are layer-indexed; without one the trainer falls
             # back to layer_src="call_order".
             mf = getattr(self, "model_fn", None)
             n = install_debug_hooks(mf() if mf is not None else None)
-        except Exception as e:  # noqa: BLE001 -- diagnostics never fail a run
+        except Exception as e:  # noqa: BLE001 -- ordinary tracing is fail-soft
+            if os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1":
+                raise RuntimeError(
+                    "[ISOEXEC-DEBUG] full-distribution tracing was requested but could not be armed; "
+                    "refusing instead of producing an incomplete trace"
+                ) from e
             logger.warning("[ISOEXEC-DEBUG] %s tracing NOT armed: %s: %s", self.side, type(e).__name__, e)
             return
         logger.warning("[ISOEXEC-DEBUG] %s tracing armed: %d region hooks (enforcement demoted)", self.side, n)

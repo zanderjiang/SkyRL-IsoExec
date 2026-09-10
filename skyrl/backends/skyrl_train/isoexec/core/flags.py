@@ -1832,6 +1832,17 @@ FLAGS: List[Flag] = [
         "latent split-brain entry.",
     ),
     Flag(
+        "SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION",
+        "0",
+        ("both",),
+        "record complete fp32 raw-model logprob rows under batching-independent token-history identities",
+        DIAGNOSTIC,
+        (TRAIN, ENGINE),
+        notes="Opt-in extension of DEBUG_TRACE. It writes two 64-bit fingerprints per active [V] row. The initial "
+        "domain is sm90, text-only, base-model, logprobs-enabled, single-rank, unpacked, eager vLLM V1 without "
+        "speculation; unsupported modes refuse.",
+    ),
+    Flag(
         "SKYRL_ISOEXEC_DEBUG_SAMPLE",
         "",
         ("both",),

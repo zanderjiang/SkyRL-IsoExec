@@ -826,7 +826,7 @@ class MegatronWorker:
         )
         return model
 
-    def _forward_logprobs(self, data: TrainingInputBatch) -> torch.Tensor:
+    def _forward_logprobs(self, data: TrainingInputBatch, *, capture_full_distribution: bool = False) -> torch.Tensor:
         """Run a Megatron inference forward over ``data`` and return per-sample logprobs.
 
         Passes the full mini batch to ``MegatronModelWrapper.forward``. Supports token-based
@@ -877,6 +877,7 @@ class MegatronWorker:
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 "num_actions": micro.metadata["response_length"],
+                "loss_mask": micro.get("loss_mask"),
                 "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
                 "sub_seq_lengths": micro.get("sub_seq_lengths"),
             }
@@ -923,6 +924,7 @@ class MegatronWorker:
                 seq_len=seq_len,
                 micro_batch_size=mbs,
                 temperature=self.cfg.algorithm.temperature,
+                capture_full_distribution=capture_full_distribution,
             )
 
         # This boundary counts only real scoring traffic: capability counters arm after prewarm,
@@ -1392,7 +1394,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # Megatron inference forward path: emit per-sample logprobs. Token-based
             # micro-batching (when `max_tokens_per_microbatch > 0`) is handled inside
             # `_forward_logprobs`, which also reorders back to the original sample order.
-            log_probs = self._forward_logprobs(data)
+            log_probs = self._forward_logprobs(
+                data,
+                capture_full_distribution=os.environ.get("SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION") == "1",
+            )
             loss_fn_outputs = [{"logprobs": log_probs[i].tolist()} for i in range(log_probs.shape[0])]
             return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 

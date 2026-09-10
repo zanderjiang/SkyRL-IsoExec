@@ -29,7 +29,7 @@ import torch
 
 from . import thash
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 ENV_TRACE = "SKYRL_ISOEXEC_DEBUG_TRACE"
 ENV_SIDE = "SKYRL_ISOEXEC_DEBUG_SIDE"
@@ -209,7 +209,7 @@ class Tracer:
             "ts": round(time.time(), 6),
         }
 
-    def _digest_record(self, rec: dict, t: torch.Tensor) -> dict:
+    def _digest_record(self, rec: dict, t: torch.Tensor, *, extra_seeds=()) -> dict:
         """Fill ``rec`` with shape/dtype/digest, or with an ``unrecordable`` reason."""
         rec["shape"] = list(t.shape)
         rec["dtype"] = str(t.dtype).replace("torch.", "")
@@ -220,6 +220,8 @@ class Tracer:
                 rec["ladder"] = lad
             else:
                 rec["digest"] = f"{thash.tensor_digest(t):016x}"
+            if extra_seeds:
+                rec["digest"] += "".join(f":{thash.tensor_digest(t, seed=seed):016x}" for seed in extra_seeds)
             if self.segment_rows and t.dim() > 0:
                 rec["segments"] = thash.segment_digests(t, rows_per_segment=self.segment_rows)
                 rec["seg_rows"] = self.segment_rows
@@ -229,6 +231,19 @@ class Tracer:
             rec.pop("ladder", None)
             rec["unrecordable"] = f"{type(e).__name__}: {e}"
         return rec
+
+    def _append(self, recs: List[dict]) -> None:
+        """Append already-built records while preserving one process's execution order."""
+        with _lock:
+            for rec in recs:
+                self._seq += 1
+                rec["seq"] = self._seq
+            self._buf.extend(recs)
+            self.n_records += len(recs)
+            self.steps_recorded.add(self.step)
+            full = len(self._buf) >= self.ring
+        if full:
+            self.flush()
 
     def record(self, region: str, case: str, out, *, layer: Optional[int], layer_src, call: int) -> None:
         recs: List[dict] = []
@@ -243,16 +258,34 @@ class Tracer:
             rec = self._base(region, case, "0", layer, layer_src, call)
             rec["unrecordable"] = f"no tensor outputs (got {type(out).__name__})"
             recs.append(rec)
-        with _lock:
-            for rec in recs:  # per-process execution order, exact where the clock is not
-                self._seq += 1
-                rec["seq"] = self._seq
-            self._buf.extend(recs)
-            self.n_records += len(recs)
-            self.steps_recorded.add(self.step)
-            full = len(self._buf) >= self.ring
-        if full:
-            self.flush()
+        self._append(recs)
+
+    def record_named_tensors(
+        self,
+        region: str,
+        case: str,
+        tensors,
+        *,
+        layer: Optional[int],
+        layer_src,
+        call: int,
+        extra_seeds=(),
+    ) -> None:
+        """Record ``(logical identity, tensor)`` pairs without encoding batch position.
+
+        Multiple pairs may have the same identity. The comparator then treats them as a
+        multiset, which is required when two trajectories have identical token histories.
+        """
+        recs: List[dict] = []
+        for path, tensor in tensors:
+            if not isinstance(path, str) or not path:
+                raise ValueError("logical tensor identity must be a non-empty string")
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"logical tensor {path!r} is not a torch.Tensor")
+            rec = self._base(region, case, path, layer, layer_src, call)
+            recs.append(self._digest_record(rec, tensor, extra_seeds=extra_seeds))
+        if recs:
+            self._append(recs)
 
     def write_manifest(self) -> None:
         """Per-process sidecar: what this trace covers, so the comparator can be honest about it."""
@@ -321,6 +354,46 @@ def set_step(step: int) -> None:
 def flush() -> None:
     if _tracer is not None:
         _tracer.flush()
+
+
+def record_named_tensors(
+    region: str,
+    tensors,
+    *,
+    case: Optional[str] = None,
+    extra_seeds=(),
+) -> int:
+    """Record tensors under stable logical identities instead of batch-local indices.
+
+    Returns the number of tensors submitted. The call follows the same region filtering,
+    sampling and CUDA-capture rules as :func:`wrap_region`.
+    """
+    tr = get_tracer()
+    if tr is None or not tr.wants(region):
+        return 0
+    items = list(tensors)
+    if not items or not tr.enter(region):
+        return 0
+    try:
+        call = tr.bump(region)
+        if not tr.sampled(call):
+            return 0
+        if _capturing():
+            with _lock:
+                tr.capture_skipped += len(items)
+            return 0
+        tr.record_named_tensors(
+            region,
+            case or tr.default_case(),
+            items,
+            layer=None,
+            layer_src=None,
+            call=call,
+            extra_seeds=extra_seeds,
+        )
+        return len(items)
+    finally:
+        tr.exit(region)
 
 
 def _reset_for_tests() -> None:

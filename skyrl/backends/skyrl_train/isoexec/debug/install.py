@@ -151,14 +151,6 @@ DOORS: Tuple[Tuple[str, str, str, bool, dict], ...] = (
         False,
         {},
     ),
-    (
-        "logprobs.log_softmax",
-        "skyrl.backends.skyrl_train.distributed.megatron.model_utils",
-        "_ix_logprobs_apply",
-        True,
-        {},
-    ),
-    ("logprobs.log_softmax", "vllm.v1.sample.sampler", "Sampler.compute_logprobs", False, {}),
     # -- mm (allow-listed off by default: fires on every projection of every layer) ---------
     ("mm", "vllm.model_executor.layers.batch_invariant", "matmul_persistent", False, {}),
     # -- moe -------------------------------------------------------------------------------
@@ -200,6 +192,10 @@ NOT_HOOKED: Dict[str, str] = {
         "MAX_NCHANNELS, ops/collectives/nccl_identity.py) read by NCCL itself. The only nearby "
         "rebinds are side-effect-only c10d collectives that return None, so there is nothing "
         "whose output could be digested."
+    ),
+    "logprobs.log_softmax": (
+        "the trainer door returns target-selected [B,S] logprobs while the engine door returns full [N,V] rows. "
+        "Those are different semantic quantities; use the opt-in logprobs.full_raw_distribution diagnostic."
     ),
 }
 
@@ -363,6 +359,12 @@ def install_debug_hooks(model=None) -> int:
         if _install_door(region, mod, attr, import_ok, kw):
             n += 1
             hooked[region] = hooked.get(region, 0) + 1
+    from . import full_distribution
+
+    full_hooks = full_distribution.arm(tr.side)
+    if full_distribution.enabled():
+        hooked[full_distribution.REGION] = max(1, full_hooks)
+        n += full_hooks
     tr.regions_hooked.update(hooked)
     nlayer = install_layer_context_hooks(model) if model is not None else 0
     from . import thash

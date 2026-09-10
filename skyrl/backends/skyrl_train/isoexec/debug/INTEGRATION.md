@@ -98,13 +98,13 @@ site in "Owed call-site changes" at the end. Original specification kept below.
    some rows from a whole-tensor round-off/reduction-order difference, which the k-ladder cannot.
    Unregistered, it works only for single-process runs.
 
-## Trace format version 3
+## Trace format version 4
 
-`trace.FORMAT_VERSION` / `compare.FORMAT_VERSION` is **3**. `compare.load_dir` refuses records of
-any other version with an explicit message rather than mis-reading them, so traces captured before
-this change must be re-captured — and they must be, because v3 also changes the DIGEST: the
-position weight is now one splitmix64 per group of 8 positions (see `thash`), so v2 digests and
-v3 digests of the same tensor differ. What v3 adds on top of v2:
+`trace.FORMAT_VERSION` / `compare.FORMAT_VERSION` is **4**. v4 adds history-keyed full-distribution
+rows, paired 64-bit fingerprints, and coverage-aware comparison. A v3 comparator would accept the
+region but misread those semantics, so older traces must be re-captured.
+
+What v3 added on top of v2:
 
 | field | why |
 |---|---|
@@ -127,6 +127,33 @@ What v2 added:
 
 ## Running the comparator offline
 
+### Full raw-logprob distribution diagnostic
+
+`SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1` adds an opt-in diagnostic region named
+`logprobs.full_raw_distribution`. It hashes every fp32 vocabulary entry at the actual vLLM
+`Sampler.compute_logprobs` boundary and at trainer policy scoring. SHA-256 token-history keys align
+rows across different batches; only two 64-bit fingerprints per `[V]` row enter the trace. Trainer
+rows are processed four at a time. Matching fingerprints are diagnostic evidence, not a
+collision-free proof.
+
+The MVP requires sm90, text-only base-model requests, rollout logprobs, `temperature=1`, vLLM
+`raw_logprobs`, `TP=PP=DP=1`, trainer `CP=1`, unpacked scoring, rowinv ownership, eager V1 sampling,
+`SKYRL_ISOEXEC_DEBUG_SAMPLE=1`, and no spec decode, async scheduling, grammar mask, or active LoRA.
+Unsupported modes raise. A history observed on only one side makes the result `inconclusive`, never
+`clean`; use a short text-only run without post-generation retokenization or masked sampled tokens.
+
+Set both debug flags and keep the region in any explicit allow list:
+
+```bash
+export SKYRL_ISOEXEC_DEBUG_TRACE=/path/to/trace
+export SKYRL_ISOEXEC_DEBUG_FULL_DISTRIBUTION=1
+export SKYRL_ISOEXEC_DEBUG_REGIONS=logprobs.full_raw_distribution
+```
+
+With a base trace path `/path/to/trace`, the adapter writes `/path/to/trace/trainer` and
+`/path/to/trace/engine`. The ordinary `policy/rollout_train_logprobs_abs_diff_*` gate remains
+sampled-token-only.
+
 The comparator is stdlib-only and is meant to run where there is no torch, no CUDA and no
 TransformerEngine. Supported invocations:
 
@@ -146,8 +173,8 @@ fully qualified form should work, the one-line fix belongs to `isoexec/__init__.
 propagating. APPLIED in `runtimes/megatron/no_te_guard.py`, so the fully qualified `-m` form
 works on a machine with no CUDA/TE stack.
 
-Exit codes: `0` clean, `2` divergence (value, shape/dtype, absent record/region, rank-set
-mismatch, one-sided unrecordable), `3` inconclusive (side-disjoint sampling), `1` bad input
+Exit codes: `0` clean, `2` divergence (value, shape/dtype, absent ordinary region, rank-set
+mismatch, one-sided unrecordable), `3` inconclusive (sampling or required-observation gap), `1` bad input
 (no traces, or a refused format version).
 
 `--json` is capped: `--json-max-per-region N` (default 200, `0` = uncapped) keeps the first N
